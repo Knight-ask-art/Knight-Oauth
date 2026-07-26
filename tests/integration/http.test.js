@@ -193,6 +193,25 @@ describe("the HTTP surface", () => {
     }
   });
 
+  it("advertises the capabilities it actually exercises", async () => {
+    // A capability the server uses but does not advertise is the harder failure
+    // to find: `iss` is added to every authorization response (RFC 9207), and a
+    // relying party is only told to expect and validate it by this flag. Without
+    // it a strict client sees an unadvertised parameter, and a lenient one never
+    // performs the mix-up check the parameter exists for.
+    const { body } = await request(app).get("/.well-known/openid-configuration").expect(200);
+    assert.equal(body.authorization_response_iss_parameter_supported, true);
+
+    // Conversely, nothing may be advertised that is not implemented. Only S256
+    // is accepted, so `plain` must not appear however permissive the config is.
+    assert.deepEqual(body.code_challenge_methods_supported, ["S256"]);
+    assert.deepEqual(body.response_types_supported, ["code"]);
+    // HS256 would let any client holding its own secret mint a token this server
+    // accepts as its own; `none` would remove signatures altogether.
+    assert.ok(!body.id_token_signing_alg_values_supported.includes("HS256"));
+    assert.ok(!body.id_token_signing_alg_values_supported.includes("none"));
+  });
+
   it("serves the key set at both paths, with the registered media type", async () => {
     for (const path of ["/oauth2/jwks", "/.well-known/jwks.json"]) {
       const response = await request(app).get(path).expect(200);

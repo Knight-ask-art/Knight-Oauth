@@ -147,6 +147,11 @@ function createProviderService({
       // RFC 7636. Only S256: `plain` provides no protection against an
       // interception attack, so it is not offered.
       code_challenge_methods_supported: CODE_CHALLENGE_METHODS,
+      // RFC 9207. The authorization response carries `iss`, and a client that
+      // validates it needs to be told so: an RP that sees an unadvertised
+      // parameter may reject the response, and one that is never told cannot
+      // detect a mix-up attack it would otherwise catch.
+      authorization_response_iss_parameter_supported: true,
       backchannel_logout_supported: true,
       backchannel_logout_session_supported: true,
       frontchannel_logout_supported: false,
