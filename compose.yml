@@ -40,6 +40,24 @@ services:
       # first when putting the service behind a domain.
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:3010}
       NODE_ENV: ${NODE_ENV:-production}
+      # The two settings below are what make `docker compose up` work with no
+      # configuration, and both are safety defaults that NODE_ENV=production
+      # deliberately turns off. They are set here, explicitly and overridably,
+      # rather than by weakening the defaults themselves — a deployment that does
+      # not go through this file should still have to opt in.
+      #
+      # Change both when putting this on a real domain: serve HTTPS and set
+      # PUBLIC_BASE_URL to the https address, then supply a key through
+      # OAUTH_SIGNING_KEYS_JSON from a secret manager and set these to false.
+      #
+      # http is only tolerable because the port above is bound to loopback. On a
+      # reachable address it exposes every token in transit.
+      OAUTH_ALLOW_INSECURE_HTTP: ${OAUTH_ALLOW_INSECURE_HTTP:-true}
+      # Lets the issuer generate a signing key on first boot and store it in the
+      # database on the volume. Fine for one container; for several replicas, or
+      # anywhere the key should be rotatable independently of the data, configure
+      # OAUTH_SIGNING_KEYS_JSON instead.
+      OAUTH_ALLOW_GENERATED_KEYS: ${OAUTH_ALLOW_GENERATED_KEYS:-true}
       # Behind a reverse proxy that terminates TLS, set TRUST_PROXY=true and
       # PUBLIC_BASE_URL to the https address. Leave it false when the port below
       # is exposed directly: with no proxy in front, a client can spoof its own

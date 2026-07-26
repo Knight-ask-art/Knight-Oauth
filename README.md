@@ -1,5 +1,7 @@
 # Knight OAuth
 
+[![CI](https://github.com/Knight-ask-art/Knight-Oauth/actions/workflows/ci.yml/badge.svg)](https://github.com/Knight-ask-art/Knight-Oauth/actions/workflows/ci.yml)
+
 A standalone, self-hostable **OAuth 2.0 authorization server and OpenID Connect
 provider**. One Node process, one database, no Redis, no queue, no sidecar.
 
@@ -399,6 +401,14 @@ capabilities dropped, and `no-new-privileges`. The compose file binds to
 `127.0.0.1` on purpose: put a TLS-terminating reverse proxy in front of it rather
 than exposing the process.
 
+Two settings in `compose.yml` are what make that zero-config boot work, and both
+have to change for a real deployment. `NODE_ENV=production` normally refuses a
+plaintext `http` issuer and refuses to generate a signing key; `compose.yml` sets
+`OAUTH_ALLOW_INSECURE_HTTP=true` and `OAUTH_ALLOW_GENERATED_KEYS=true` to override
+that for a loopback-only container. Once the service has a domain, serve HTTPS and
+set `PUBLIC_BASE_URL` to the `https` address, supply a key through
+`OAUTH_SIGNING_KEYS_JSON` from a secret manager, and set both back to `false`.
+
 For PostgreSQL, uncomment the marked lines in `compose.yml`, set
 `POSTGRES_PASSWORD`, rebuild with `--build-arg DATABASE_PROVIDER=postgresql`, and
 run the migration once by hand before starting the service:
@@ -459,6 +469,17 @@ Prisma double, and drives the app over HTTP with real session cookies and real
 CSRF tokens. A double can prove the code called the method the author expected;
 it cannot prove that a unique constraint fires, that a scoped `updateMany`
 actually makes a single-use token single-use, or that a template renders at all.
+
+CI covers what a single machine does not: the suite on Linux and Windows across
+Node 22 and 24, the PostgreSQL migration applied to a real server with the issuer
+booted against it, and a `docker compose up` that asserts the signing key survives
+the container being destroyed and recreated. `.github/scripts/probe.js` is the
+piece that runs against a live server over real HTTP — point it at any running
+instance to check it the way a client library would:
+
+```bash
+node .github/scripts/probe.js http://127.0.0.1:3010
+```
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -634,6 +655,13 @@ docker compose up --build -d
 `no-new-privileges`。compose 文件故意只绑定 `127.0.0.1`：请在前面放一个负责 TLS
 终止的反向代理，而不是直接把进程暴露出去。
 
+上面这种"零配置即可启动"依赖 `compose.yml` 里的两个设置，正式部署时两者都必须修改。
+`NODE_ENV=production` 默认会拒绝明文 `http` 的 issuer，也拒绝自动生成签名密钥；
+`compose.yml` 通过 `OAUTH_ALLOW_INSECURE_HTTP=true` 和
+`OAUTH_ALLOW_GENERATED_KEYS=true` 为仅监听回环地址的容器放开这两项。一旦服务有了正式
+域名，请启用 HTTPS 并把 `PUBLIC_BASE_URL` 改为 `https` 地址，通过
+`OAUTH_SIGNING_KEYS_JSON` 从密钥管理服务注入密钥，然后把这两项改回 `false`。
+
 切换到 PostgreSQL 时，取消 `compose.yml` 中标注行的注释，设置
 `POSTGRES_PASSWORD`，用 `--build-arg DATABASE_PROVIDER=postgresql` 重新构建，并在
 启动服务前手动执行一次迁移：
@@ -658,6 +686,16 @@ npm test               # 单元 + 集成测试
 和真实 CSRF 令牌驱动整个应用，而不是用 Prisma 替身。替身只能证明代码调用了作者
 预期的方法，无法证明唯一约束真的生效、带条件的 `updateMany` 真的让一次性令牌只
 能用一次，或者模板真的能渲染出来。
+
+CI 覆盖单台机器覆盖不到的部分：Linux 与 Windows 上分别跑 Node 22 和 24 的测试；把
+PostgreSQL 迁移应用到真实数据库并在其上启动 issuer；以及执行一次
+`docker compose up`，验证容器被销毁重建后签名密钥依然有效。其中
+`.github/scripts/probe.js` 是通过真实 HTTP 探测运行中服务的部分，可以指向任意实例，
+用第三方客户端库的视角检查它：
+
+```bash
+node .github/scripts/probe.js http://127.0.0.1:3010
+```
 
 欢迎贡献代码，见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 

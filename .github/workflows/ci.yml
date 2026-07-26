@@ -1,0 +1,266 @@
+# Continuous integration.
+#
+# Three things are verified here that a developer's machine does not cover:
+#
+#   1. The suite on Linux as well as Windows. `scripts/setup.js` once failed only
+#      on Windows, because `process.execPath` is `C:\Program Files\nodejs\node.exe`
+#      and running it through a shell split the path at the space. A Linux-only
+#      matrix would not have caught it.
+#   2. PostgreSQL against a real server. The test suite runs on SQLite by design —
+#      tests/helpers/database.js replays prisma/sqlite/migrations directly — so the
+#      other half of the dual-database support is only exercised by applying the
+#      generated migration to a live PostgreSQL and booting against it.
+#   3. Docker, including that the signing key survives the container being
+#      replaced. That is the regression test for the worst bug found in this
+#      project: Prisma resolves a relative `file:` URL against the schema's
+#      directory, so the database and the generated key landed outside the mounted
+#      volume, and every issued token stopped verifying on restart.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # So a dependency or base-image change is caught without a commit.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# Read-only. Nothing here publishes, comments, or writes to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# NODE_ENV is deliberately not set here.
+#
+# compose.yml reads `${NODE_ENV:-production}` from the host environment, so a
+# workflow-level NODE_ENV would silently propagate into the container and the
+# docker job would stop testing the production defaults it exists to test. It
+# would also change `npm ci`, which omits devDependencies when NODE_ENV is
+# production. Each job sets what it needs and nothing more.
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      # One platform failing should still report the other, not cancel it.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: 22
+          - os: ubuntu-latest
+            node: 24
+          - os: windows-latest
+            node: 22
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      # Before anything else: if the committed schemas do not match the template
+      # they are generated from, every result after this point is about code that
+      # will not be what a clone gets.
+      - name: verify the committed schemas match the template
+        run: npm run db:schema:check
+
+      # The documented first command in the README. It renders the schema,
+      # generates the client, and applies migrations, so it failing is the
+      # first-run experience failing.
+      - name: npm run setup
+        run: npm run setup
+
+      - run: npm test
+
+      # A generated database or signing key reaching a commit would publish
+      # accounts and private key material. .gitignore covers it; this asserts the
+      # coverage is real after a full setup-and-test run has written those files.
+      - name: nothing generated is committable
+        shell: bash
+        run: |
+          untracked="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$untracked" ]; then
+            echo "setup or the test run left files git would commit:"
+            echo "$untracked"
+            exit 1
+          fi
+
+  postgres:
+    name: postgresql
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: knight_oauth
+          POSTGRES_USER: knight_oauth
+          # A throwaway credential for a database that exists for the length of
+          # this job and is not reachable from outside the runner.
+          POSTGRES_PASSWORD: ci-only-not-a-real-credential
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U knight_oauth -d knight_oauth"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_PROVIDER: postgresql
+      DATABASE_URL: postgresql://knight_oauth:ci-only-not-a-real-credential@127.0.0.1:5432/knight_oauth
+      PUBLIC_BASE_URL: http://127.0.0.1:3010
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: render and generate for postgresql
+        run: |
+          npm run db:schema
+          npm run db:generate
+
+      - name: apply migrations
+        run: npm run db:migrate
+
+      # Idempotence matters because the Docker entrypoint may run this on every
+      # start. A second run must be a no-op, not an error.
+      - name: migrations are idempotent
+        run: npm run db:migrate
+
+      # The point of the job. A rendered schema that applies is not proof the
+      # service runs on it: the boot path connects, resolves a signing key, and
+      # imports static clients, all of which touch the database.
+      - name: boot and probe
+        run: |
+          npm start > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:3010/healthz > /dev/null 2>&1; then break; fi
+            if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
+              echo "the server exited before it answered:"; cat server.log; exit 1
+            fi
+            sleep 1
+          done
+
+          # Without this the job would still pass if DATABASE_PROVIDER were
+          # ignored and the server quietly fell back to SQLite — which is exactly
+          # the failure this job exists to detect.
+          if ! grep -q "database    postgresql" server.log; then
+            echo "the server did not report running on postgresql:"
+            cat server.log
+            exit 1
+          fi
+
+          node .github/scripts/probe.js http://127.0.0.1:3010
+
+      - name: server log
+        if: always()
+        run: cat server.log || true
+
+      - name: stop
+        if: always()
+        run: kill "$(cat server.pid)" 2>/dev/null || true
+
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The README's claim is that this needs no configuration at all, so no .env
+      # is written and no build argument is passed.
+      - name: docker compose up --build
+        run: docker compose up --build -d
+
+      - name: wait for healthy
+        run: |
+          for i in $(seq 1 90); do
+            state="$(docker inspect --format '{{ .State.Health.Status }}' "$(docker compose ps -q knight-oauth)" 2>/dev/null || echo missing)"
+            if [ "$state" = "healthy" ]; then exit 0; fi
+            if [ "$state" = "unhealthy" ]; then break; fi
+            sleep 2
+          done
+          echo "the container never became healthy"
+          docker compose logs
+          exit 1
+
+      - name: probe the container
+        run: node .github/scripts/probe.js http://127.0.0.1:3010
+
+      # The regression test this job exists for.
+      #
+      # The signing key is generated on first boot and stored in the database. If
+      # the database is not on the mounted volume, replacing the container
+      # generates a new key, and every token issued by the previous container
+      # stops verifying. The kid is the visible symptom, so it is what is asserted
+      # — before and after the container is destroyed and recreated.
+      - name: the signing key survives the container being replaced
+        run: |
+          before="$(curl -fsS http://127.0.0.1:3010/oauth2/jwks | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);if(!j.keys?.length){console.error("no keys in JWKS");process.exit(1)}process.stdout.write(j.keys[0].kid)})')"
+          echo "kid before: $before"
+
+          # `down` without -v: the bind mount at ./data is the thing under test,
+          # and the container is genuinely destroyed rather than restarted.
+          docker compose down
+          docker compose up -d
+
+          for i in $(seq 1 90); do
+            state="$(docker inspect --format '{{ .State.Health.Status }}' "$(docker compose ps -q knight-oauth)" 2>/dev/null || echo missing)"
+            if [ "$state" = "healthy" ]; then break; fi
+            sleep 2
+          done
+
+          after="$(curl -fsS http://127.0.0.1:3010/oauth2/jwks | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);process.stdout.write(j.keys?.[0]?.kid||"")})')"
+          echo "kid after:  $after"
+
+          if [ -z "$after" ] || [ "$before" != "$after" ]; then
+            echo "the signing key did not survive: every token issued before the restart would now fail to verify."
+            echo "usually this means the database is not on the volume — check DATABASE_URL and the ./data mount."
+            docker compose logs
+            exit 1
+          fi
+
+      # A read-only root filesystem turns a stray write into an error rather than
+      # a change that persists invisibly. Asserted because compose.yml claims it.
+      - name: the root filesystem is read-only and the user is not root
+        run: |
+          id="$(docker compose ps -q knight-oauth)"
+          ro="$(docker inspect --format '{{ .HostConfig.ReadonlyRootfs }}' "$id")"
+          user="$(docker compose exec -T knight-oauth id -un)"
+          echo "read_only=$ro user=$user"
+          [ "$ro" = "true" ] || { echo "the root filesystem is writable"; exit 1; }
+          [ "$user" != "root" ] || { echo "the container runs as root"; exit 1; }
+
+      - name: container logs
+        if: always()
+        run: docker compose logs || true
+
+      - name: tear down
+        if: always()
+        run: docker compose down -v || true

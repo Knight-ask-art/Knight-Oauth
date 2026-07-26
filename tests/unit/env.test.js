@@ -261,3 +261,47 @@ test("nothing in a loaded config carries a Knight-specific default", () => {
   assert.equal(env.branding.logoUrl, "");
   assert.equal(env.branding.supportUrl, "");
 });
+
+test("the environment compose.yml sets actually boots", () => {
+  // compose.yml promises that `docker compose up --build` works with no .env at
+  // all. It also sets NODE_ENV=production, which turns off two defaults that a
+  // zero-config boot depends on: http is rejected, and the issuer refuses to
+  // generate a signing key. Both had to be re-enabled explicitly in compose.yml,
+  // and this is what catches it if either is dropped — otherwise the failure
+  // appears only as a container that will not start, which nobody sees until
+  // they try the documented command.
+  //
+  // Keep in sync with the `environment:` block in compose.yml.
+  const compose = {
+    NODE_ENV: "production",
+    DATABASE_URL: "file:/app/data/knight-oauth.db",
+    PUBLIC_BASE_URL: "http://127.0.0.1:3010",
+    OAUTH_ALLOW_INSECURE_HTTP: "true",
+    OAUTH_ALLOW_GENERATED_KEYS: "true",
+    TRUST_PROXY: "false"
+  };
+
+  const env = loadEnv(compose);
+  assert.equal(env.isProduction, true);
+  assert.equal(env.issuer, "http://127.0.0.1:3010");
+  assert.equal(
+    env.signing.allowGeneratedKeys,
+    true,
+    "the container has no key configured, so it must be allowed to generate one or it cannot serve a single token"
+  );
+
+  // The other half of the guarantee: the permissiveness above must come from
+  // compose.yml, never from the defaults. A production deployment that does not
+  // go through that file still has to opt in.
+  assert.throws(
+    () => loadEnv({ NODE_ENV: "production", PUBLIC_BASE_URL: "http://id.example.com" }),
+    /must use HTTPS/,
+    "plaintext http must not become acceptable in production by default"
+  );
+  assert.equal(
+    loadEnv({ NODE_ENV: "production", PUBLIC_BASE_URL: "https://id.example.com" }).signing
+      .allowGeneratedKeys,
+    false,
+    "a real production deployment must supply its own key rather than generate one"
+  );
+});
