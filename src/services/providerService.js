@@ -646,9 +646,26 @@ function createProviderService({
       throw invalidGrant("The authorization code is not valid");
     }
 
-    if (record.usedAt) {
-      // Replay. The code is gone, but a token issued from its first use may still
-      // be live, so every token descended from it is revoked.
+    // A code is discovered spent in two places, and both mean the same thing.
+    //
+    // This one is the pre-read: the row already had `usedAt` before we touched
+    // it. The other is the conditional update further down, which is what
+    // actually makes redemption single-use. Only this branch used to revoke and
+    // audit, and the two are reached by different callers: a client redeeming a
+    // code twice in sequence arrives here, while an attacker racing the real
+    // client with a stolen code arrives at the other one — both requests read
+    // `usedAt: null`, one update wins, and the loser used to get a bare
+    // `invalid_grant`. Racing is the natural way to use a stolen code, so the
+    // detection was absent from exactly the case it exists for.
+    //
+    // The cost of treating a client's own duplicate submission as theft is
+    // accepted here for the same reason it is accepted for refresh-token
+    // families: a code presented twice cannot be told apart from a code that
+    // leaked, and guessing wrong in the other direction leaves the attacker
+    // holding live tokens.
+    const refuseAsReplay = async () => {
+      // The code is gone, but a token issued from its first use may still be
+      // live, so every token descended from it is revoked.
       await revokeTokensForSession({ sessionId: record.sessionId, clientId: client.clientId, reason: "code_replay" });
       await auditLog?.record({
         action: "oauth.code.replayed",
@@ -656,7 +673,11 @@ function createProviderService({
         targetType: "client",
         targetId: client.clientId
       });
-      throw invalidGrant("The authorization code has already been used");
+      return invalidGrant("The authorization code has already been used");
+    };
+
+    if (record.usedAt) {
+      throw await refuseAsReplay();
     }
 
     if (record.expiresAt <= now()) throw invalidGrant("The authorization code has expired");
@@ -670,11 +691,16 @@ function createProviderService({
 
     verifyPkce({ record, body, client });
 
+    // The conditional update is what makes redemption single-use: the database
+    // decides which of two concurrent requests gets the row, not a read we
+    // performed earlier.
     const claimed = await prisma.authorizationCode.updateMany({
       where: { id: record.id, usedAt: null },
       data: { usedAt: now() }
     });
-    if (!claimed.count) throw invalidGrant("The authorization code has already been used");
+    if (!claimed.count) {
+      throw await refuseAsReplay();
+    }
 
     const account = await accounts.findById(record.userId);
     if (!account || account.status === accounts.STATUS.DISABLED) {
@@ -1000,6 +1026,23 @@ function createProviderService({
     if (!account || account.status === accounts.STATUS.DISABLED) {
       throw invalidToken("That account is no longer available");
     }
+
+    // The same three lines introspection already had.
+    //
+    // An access token is a self-contained JWT, so a resource server validating
+    // it offline cannot know it was revoked — that is an honest trade-off and
+    // the README says so. This endpoint is not that: it belongs to the issuer,
+    // it is already reading the database for the account, and `sid` is sitting
+    // in the claims it just verified. Without the check, a user who ends a
+    // session from /account is told the device is signed out while the token
+    // taken from it keeps returning their email, name, and picture for the rest
+    // of its lifetime — up to 24 hours, configurable. Worse, the same token
+    // handed to /oauth2/introspect correctly came back `{active: false}`, so
+    // the issuer contradicted itself about whether it was still valid.
+    const session = verified.claims.sid
+      ? await prisma.oidcSession.findUnique({ where: { id: verified.claims.sid } })
+      : null;
+    if (session?.revokedAt) throw invalidToken("That session has been ended");
 
     const scopes = decodeScopes(verified.claims.scope);
     return {

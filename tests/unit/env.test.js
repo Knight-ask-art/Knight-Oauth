@@ -187,6 +187,32 @@ test("a custom scope may not shadow a standard one or forge a reserved claim", (
   assert.throws(() => loadEnv(custom([{ description: "no name" }])), /requires a name/);
 });
 
+test("a custom scope may not assert a claim the issuer makes from the account", () => {
+  const custom = (entries) => ({ OAUTH_CUSTOM_SCOPES: JSON.stringify(entries) });
+
+  // A custom scope's values are read from the account's `attributes` map, which
+  // an external identity provider rewrites on every sign-in — and claimsFor
+  // applies them after the standard claims, so the upstream value won. An
+  // upstream sending `{ email_verified: true, email: "ceo@corp.com" }` would put
+  // a verified address nobody verified into every relying party's ID token,
+  // straight past the issuer's own rule that a synthesised `@external.invalid`
+  // address must always report `email_verified: false`.
+  for (const claim of ["email", "email_verified", "name", "preferred_username", "picture", "phone_number_verified"]) {
+    assert.throws(
+      () => loadEnv(custom([{ name: "billing", claims: [claim] }])),
+      /asserted from the account record/,
+      `a custom scope was allowed to define ${claim}`
+    );
+  }
+
+  // The distinction that makes this safe to enforce: these are refused to
+  // *custom* scopes, not reserved outright. Reserving them would stop the
+  // standard `email` and `profile` scopes releasing them at all, which is the
+  // mechanism they exist to be.
+  const env = loadEnv(custom([{ name: "billing", claims: ["billing_tier"] }]));
+  assert.equal(env.customScopes[0].claims[0], "billing_tier");
+});
+
 test("a custom scope reads its claims from the account's attributes", () => {
   // This is the whole of the private-extension mechanism: the core has no
   // knowledge of `credits.read` or `knight_uid`, and a deployment that wants

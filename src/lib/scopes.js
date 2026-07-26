@@ -78,6 +78,35 @@ const RESERVED_CLAIMS = new Set([
   "token_use"
 ]);
 
+// Claims the issuer asserts from the account record, as opposed to the ones it
+// asserts about the token itself.
+//
+// These are deliberately NOT in RESERVED_CLAIMS, and the difference is
+// load-bearing: claimsFor skips a reserved claim in both of its loops, so
+// reserving `email` would stop the standard `email` scope from releasing one at
+// all — the standard scopes are exactly the mechanism for handing these out.
+// What must not happen is a *deployment-defined* scope asserting them, because
+// a custom scope's values come from the account's `attributes` map, which an
+// upstream identity provider rewrites on every login.
+//
+// The concrete failure: a custom scope declaring `email_verified` reads it from
+// `attributes`, and claimsFor applies claimsFrom after the standard claims, so
+// the upstream value wins. An upstream sending
+// `{ email_verified: true, email: "ceo@corp.com" }` would put a verified email
+// nobody verified into every relying party's ID token — including past
+// providerService's explicit defence that a synthesised `@external.invalid`
+// address must always report `email_verified: false`.
+const ACCOUNT_CLAIMS = new Set([
+  "email",
+  "email_verified",
+  "name",
+  "preferred_username",
+  "picture",
+  "updated_at",
+  "phone_number",
+  "phone_number_verified"
+]);
+
 const SCOPE_TOKEN = /^[\x21\x23-\x5b\x5d-\x7e]+$/; // RFC 6749 appendix A.4
 const MAX_SCOPE_LENGTH = 1024;
 
@@ -244,8 +273,10 @@ function createScopeRegistry({ customScopes = [] } = {}) {
         const produced = definition.claimsFrom(user, context) || {};
         for (const [claim, value] of Object.entries(produced)) {
           // A deployment cannot overwrite an issuer-controlled claim, even by
-          // mistake in its own configuration.
-          if (RESERVED_CLAIMS.has(claim)) continue;
+          // mistake in its own configuration — nor one the issuer asserts from
+          // the account record, which this loop runs after and would otherwise
+          // silently win against.
+          if (RESERVED_CLAIMS.has(claim) || ACCOUNT_CLAIMS.has(claim)) continue;
           if (value !== undefined && value !== null) result[claim] = value;
         }
       }
@@ -279,6 +310,7 @@ function createScopeRegistry({ customScopes = [] } = {}) {
 }
 
 module.exports = {
+  ACCOUNT_CLAIMS,
   RESERVED_CLAIMS,
   STANDARD_SCOPES,
   createScopeRegistry
