@@ -375,6 +375,14 @@ off the other.
 - **`TRUST_PROXY=true` only behind a proxy you control.** It makes the app trust
   `X-Forwarded-*`, and a directly exposed process would let a caller spoof its
   own address past the rate limiter and into the audit log.
+- **Upgrading to a release that adds the `__Host-` cookie prefix signs everyone
+  out once.** On an https issuer the session and CSRF cookies are named
+  `__Host-koauth_session` and `__Host-koauth_csrf`, which browsers only accept
+  with `Secure`, `Path=/`, and no `Domain`. The old names are deliberately not
+  read as a fallback: a signed-out visitor has no prefixed cookie, so a fallback
+  would still let a sibling host under the same registrable domain plant one and
+  have the visitor browse — and consent — as somebody else. One sign-out is the
+  price of closing that.
 - **Never change `OAUTH_ISSUER` on a live deployment.** Clients compare `iss`
   byte for byte; changing it invalidates every token already issued.
 - **Back up the database.** It holds the accounts, the grants, and — unless you

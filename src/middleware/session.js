@@ -16,7 +16,10 @@ const { SESSION_COOKIE } = require("../services/sessionService");
 function createSessionMiddleware({ sessions, accounts, provider }) {
   return async (req, res, next) => {
     try {
-      req.sid = req.cookies?.[SESSION_COOKIE] || null;
+      // The name comes from the service, because it depends on the scheme: an
+      // https issuer uses the `__Host-` prefixed spelling. Deliberately no
+      // fallback to the unprefixed one — see the note on the constants.
+      req.sid = req.cookies?.[sessions.cookieName] || null;
       req.session = req.sid ? await sessions.find(req.sid) : null;
       req.currentUser = null;
 
