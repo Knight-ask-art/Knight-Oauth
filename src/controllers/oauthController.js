@@ -485,6 +485,17 @@ function createOAuthController({ config, provider, clients, scopeRegistry, accou
   /** Health check. Reports the signing key source, which is what usually breaks. */
   async function health(req, res) {
     try {
+      // The database, first, and not because it is the more likely failure.
+      //
+      // `provider.jwks()` resolves from a key ring that ensureKeyRing caches on
+      // first use, and verifyBoot fills it before the port opens — so after boot
+      // this function returned a constant from memory. A deployment whose
+      // database had gone answered every real request with a 500 while
+      // /healthz stayed 200: the compose healthcheck stayed green, no restart
+      // was triggered, and a load balancer kept sending traffic to it. The
+      // check reported that the process was running, which was never the
+      // question.
+      await provider.ping();
       const jwksDocument = await provider.jwks();
       return res.json({
         status: "ok",

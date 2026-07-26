@@ -1256,6 +1256,49 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
 
   // --- Logout -------------------------------------------------------------
 
+  it("merges two consents that arrive at the same moment instead of losing one", async () => {
+    // Two halves, and they fail on different engines.
+    //
+    // The quiet one — two widenings that both read the same row and each write
+    // their own merge over it, so one scope is silently dropped — interleaves in
+    // the event loop at the awaits, so it shows on SQLite too. Verified: with
+    // the fix reverted, this test fails on SQLite.
+    //
+    // The loud one needs PostgreSQL. `grants` carries
+    // @@unique([userId, clientId]), and two inserts racing means an unhandled
+    // P2002 reaching oauthController, which only redirects errors it recognises
+    // as protocol errors — so a raw {"error":"server_error"} appears in the
+    // browser. Prisma opens one connection to SQLite and the application is a
+    // single writer, so that insert race cannot happen there. It is the postgres
+    // job that exercises it.
+    const client = await clients.create(
+      {
+        name: "Two Tabs",
+        clientType: "confidential",
+        redirectUris: ["https://tabs.example/callback"],
+        scopes: ["openid", "profile", "email"],
+        grantTypes: ["authorization_code"],
+        tokenEndpointAuthMethod: "client_secret_basic"
+      },
+      { status: "APPROVED" }
+    );
+
+    const [first, second] = await Promise.all([
+      provider.upsertGrant({ userId: account.id, clientId: client.client.clientId, scopes: ["openid", "profile"] }),
+      provider.upsertGrant({ userId: account.id, clientId: client.client.clientId, scopes: ["openid", "email"] })
+    ]);
+    assert.ok(first && second, "neither call may fail; the loser used to reach the browser as server_error");
+
+    const rows = await prisma.grant.findMany({
+      where: { userId: account.id, clientId: client.client.clientId }
+    });
+    assert.equal(rows.length, 1, "the unique constraint means one row, so two inserts is the bug");
+
+    const stored = rows[0].scopes;
+    assert.match(stored, /\bprofile\b/, "the first consent was dropped");
+    assert.match(stored, /\bemail\b/, "the second consent was dropped");
+  });
+
   it("will not end a session that belongs to someone else", async () => {
     // `sessionId` reaches endSessions from `req.body.session_id`. With the
     // queries matching on it alone, any signed-in user could end another user's

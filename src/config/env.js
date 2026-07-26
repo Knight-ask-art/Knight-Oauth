@@ -414,6 +414,22 @@ function loadEnv(source = process.env) {
       )
     },
 
+    audit: {
+      // How long an audit record is kept. 0 keeps everything.
+      //
+      // This table had no cleanup path at all — auditService.prune existed with
+      // no caller, there is no admin page and no CLI — so it grew for the life
+      // of the deployment at one row per sign-in, token, consent, and
+      // revocation, and the volume filling is the point at which this issuer
+      // stops being able to sign anything. A year is the default the prune
+      // function itself already carried; a deployment that must retain longer,
+      // or forever, says so.
+      retentionDays: integer(source.OAUTH_AUDIT_LOG_RETENTION_DAYS, 365, "OAUTH_AUDIT_LOG_RETENTION_DAYS", {
+        min: 0,
+        max: 3650
+      })
+    },
+
     backchannel: {
       retrySeconds: integer(source.OAUTH_BACKCHANNEL_RETRY_SECONDS, 60, "OAUTH_BACKCHANNEL_RETRY_SECONDS", {
         min: 15,
