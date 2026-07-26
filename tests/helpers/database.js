@@ -5,8 +5,8 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { execFileSync } = require("node:child_process");
 
-// Integration tests run against a real SQLite database rather than a hand-rolled
-// Prisma double.
+// Integration tests run against a real database rather than a hand-rolled Prisma
+// double.
 //
 // A double proves the code calls the methods the author expected. It cannot prove
 // a unique constraint fires, that a scoped `updateMany` actually makes a
@@ -14,14 +14,48 @@ const { execFileSync } = require("node:child_process");
 // are exactly the properties this service depends on, so they are tested against
 // the real engine.
 //
-// Each suite gets its own file, deleted afterwards, so tests do not share state.
+// *Which* real engine is the point of this file.
+//
+// It used to be SQLite and only SQLite: the sqlite migration was replayed
+// directly, so every integration test ran on one of the two databases this
+// project claims to support, and the CI job that has a live PostgreSQL never ran
+// `npm test` against it. That is not a gap in coverage so much as a gap in the
+// shape of it — the failures it hides are the ones where the two engines
+// disagree, and SQLite is the forgiving one. Prisma opens a single connection to
+// SQLite and the whole application is one writer, so a check-then-act that races
+// on PostgreSQL is serialised into correctness here and passes.
+//
+// DATABASE_PROVIDER selects. Each suite still gets its own isolated database:
+// a file on SQLite, a schema on PostgreSQL. Both are needed, because
+// `node --test` runs test files concurrently and three of them use a database.
 
 const ROOT = path.resolve(__dirname, "..", "..");
 const TEST_DIR = path.join(ROOT, "data", "test");
-const MIGRATION = path.join(ROOT, "prisma", "sqlite", "migrations", "0000000000000_init", "migration.sql");
+
+const PROVIDER = String(process.env.DATABASE_PROVIDER || "sqlite")
+  .trim()
+  .toLowerCase();
+
+/** The single generated migration for a provider, found rather than hardcoded. */
+function migrationFor(provider) {
+  const dir = path.join(ROOT, "prisma", provider, "migrations");
+  if (!fs.existsSync(dir)) {
+    throw new Error(`prisma/${provider}/migrations is missing. Run: npm run db:schema && npm run db:migrate`);
+  }
+  const entries = fs
+    .readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(dir, entry.name, "migration.sql"))
+    .filter((file) => fs.existsSync(file))
+    .sort();
+  if (!entries.length) {
+    throw new Error(`no migration.sql under prisma/${provider}/migrations`);
+  }
+  return entries;
+}
 
 /**
- * Splits the migration into statements. The generated SQL contains no string
+ * Splits a migration into statements. The generated SQL contains no string
  * literals with semicolons and no triggers or procedures, so splitting on `;` is
  * sound here — it would not be for arbitrary SQL.
  *
@@ -41,30 +75,36 @@ function statements(sql) {
     .filter(Boolean);
 }
 
-async function withDatabase() {
-  if (!fs.existsSync(MIGRATION)) {
-    throw new Error("prisma/sqlite migrations are missing. Run: npm run db:schema && npm run db:migrate");
+function loadPrisma() {
+  // The generated client matches whichever provider `db:generate` last ran for,
+  // so a mismatch here is a configuration error rather than something to paper
+  // over.
+  // eslint-disable-next-line global-require
+  return require("@prisma/client").PrismaClient;
+}
+
+async function applyMigrations(prisma, files) {
+  for (const file of files) {
+    for (const statement of statements(fs.readFileSync(file, "utf8"))) {
+      await prisma.$executeRawUnsafe(statement);
+    }
   }
+}
+
+async function withSqlite() {
+  const files = migrationFor("sqlite");
   fs.mkdirSync(TEST_DIR, { recursive: true });
 
   const file = path.join(TEST_DIR, `${crypto.randomUUID()}.db`);
   const url = `file:${file.replaceAll("\\", "/")}`;
 
-  // The client is generated from the sqlite schema; `db:generate` must have run.
   process.env.DATABASE_URL = url;
-  // eslint-disable-next-line global-require
-  const { PrismaClient } = require("@prisma/client");
+  const PrismaClient = loadPrisma();
   // Logging is off: several tests assert that a unique constraint fires, and
   // Prisma prints those expected violations, which buries a real failure.
-  const prisma = new PrismaClient({
-    datasources: { db: { url } },
-    log: []
-  });
+  const prisma = new PrismaClient({ datasources: { db: { url } }, log: [] });
 
-  const sql = fs.readFileSync(MIGRATION, "utf8");
-  for (const statement of statements(sql)) {
-    await prisma.$executeRawUnsafe(statement);
-  }
+  await applyMigrations(prisma, files);
 
   async function close() {
     await prisma.$disconnect();
@@ -78,7 +118,53 @@ async function withDatabase() {
     }
   }
 
-  return { prisma, close, url, file };
+  return { prisma, close, url, file, provider: "sqlite" };
 }
 
-module.exports = { withDatabase, statements, execFileSync };
+async function withPostgres() {
+  const files = migrationFor("postgresql");
+  const base = String(process.env.DATABASE_URL || "").trim();
+  if (!base) {
+    throw new Error("DATABASE_URL is required when DATABASE_PROVIDER=postgresql");
+  }
+
+  // A schema per suite, because `node --test` runs the files concurrently and
+  // they would otherwise create the same tables in the same place.
+  const schema = `test_${crypto.randomUUID().replaceAll("-", "")}`;
+  const scoped = new URL(base);
+  scoped.searchParams.set("schema", schema);
+  const url = scoped.toString();
+
+  const PrismaClient = loadPrisma();
+
+  // Created over a separate connection, before the scoped one is opened.
+  // Prisma turns `?schema=` into a search_path, and an unqualified CREATE TABLE
+  // against a search_path naming a schema that does not exist yet fails with
+  // "no schema has been selected to create in" — so the schema has to be there
+  // first.
+  const bootstrap = new PrismaClient({ datasources: { db: { url: base } }, log: [] });
+  await bootstrap.$executeRawUnsafe(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
+  await bootstrap.$disconnect();
+
+  process.env.DATABASE_URL = url;
+  const prisma = new PrismaClient({ datasources: { db: { url } }, log: [] });
+  await applyMigrations(prisma, files);
+
+  async function close() {
+    await prisma.$disconnect();
+    const cleanup = new PrismaClient({ datasources: { db: { url: base } }, log: [] });
+    try {
+      await cleanup.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } finally {
+      await cleanup.$disconnect();
+    }
+  }
+
+  return { prisma, close, url, schema, provider: "postgresql" };
+}
+
+async function withDatabase() {
+  return PROVIDER === "postgresql" ? withPostgres() : withSqlite();
+}
+
+module.exports = { withDatabase, statements, execFileSync, PROVIDER };
