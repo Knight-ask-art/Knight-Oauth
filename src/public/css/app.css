@@ -1,0 +1,345 @@
+/*
+ * One stylesheet for the whole server.
+ *
+ * No build step, no framework, no web font: this is a handful of pages an
+ * operator self-hosts, and a dependency chain to style them would be a larger
+ * liability than the CSS it saved. It is also why the CSP needs no unsafe-inline
+ * — there is no inline style or script anywhere in the views.
+ *
+ * `--brand` is set per page from the operator's configuration.
+ */
+
+:root {
+  --brand: #2b6cb0;
+  --ink: #16191d;
+  --ink-soft: #5a6472;
+  --line: #dfe3e8;
+  --surface: #ffffff;
+  --canvas: #f4f6f8;
+  --danger: #b42318;
+  --danger-soft: #fef3f2;
+  --ok: #027a48;
+  --ok-soft: #ecfdf3;
+  --warn: #b54708;
+  --warn-soft: #fffaeb;
+  --radius: 10px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #e7eaee;
+    --ink-soft: #9aa4b2;
+    --line: #2c313a;
+    --surface: #1a1e24;
+    --canvas: #12151a;
+    --danger: #fda29b;
+    --danger-soft: #2d1614;
+    --ok: #6ce9a6;
+    --ok-soft: #10261c;
+    --warn: #fec84b;
+    --warn-soft: #2b2011;
+    --shadow: none;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--canvas);
+  color: var(--ink);
+  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--brand); }
+a:hover { text-decoration: none; }
+
+/* --- Shell ---------------------------------------------------------------- */
+
+.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 14px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 650;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.brand-logo { border-radius: 6px; object-fit: contain; }
+
+.site-nav {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  font-size: 14px;
+}
+
+.site-nav a { color: var(--ink-soft); text-decoration: none; }
+.site-nav a:hover { color: var(--brand); }
+
+.site-main {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 32px 20px 56px;
+}
+
+.site-footer {
+  display: flex;
+  justify-content: center;
+  gap: 16px;
+  padding: 24px 20px 40px;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.site-footer a { color: var(--ink-soft); }
+
+/* --- Structure ------------------------------------------------------------ */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 24px;
+  margin-bottom: 20px;
+}
+
+.card--narrow { max-width: 460px; margin-inline: auto; }
+.card--tight { padding: 18px; }
+
+h1 { font-size: 24px; margin: 0 0 6px; letter-spacing: -0.01em; }
+h2 { font-size: 17px; margin: 0 0 14px; }
+h3 { font-size: 15px; margin: 0 0 6px; }
+
+.lede { color: var(--ink-soft); margin: 0 0 20px; }
+.muted { color: var(--ink-soft); }
+.small { font-size: 13px; }
+
+.stack > * + * { margin-top: 16px; }
+.row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.row--between { justify-content: space-between; }
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+hr { border: 0; border-top: 1px solid var(--line); margin: 24px 0; }
+
+/* --- Forms --------------------------------------------------------------- */
+
+label { display: block; font-size: 14px; font-weight: 550; margin-bottom: 6px; }
+
+input[type="text"],
+input[type="email"],
+input[type="password"],
+input[type="url"],
+select,
+textarea {
+  width: 100%;
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 15px;
+  color: var(--ink);
+  background: var(--canvas);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+textarea { min-height: 84px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+
+.field + .field { margin-top: 16px; }
+.hint { display: block; margin-top: 6px; color: var(--ink-soft); font-size: 13px; }
+
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-weight: 400;
+  margin-bottom: 0;
+}
+
+.check input { width: auto; margin-top: 3px; flex: none; }
+
+button,
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 16px;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 550;
+  color: #fff;
+  background: var(--brand);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+button:hover, .button:hover { filter: brightness(0.94); }
+
+.button--secondary {
+  color: var(--ink);
+  background: var(--surface);
+  border-color: var(--line);
+}
+
+.button--danger { color: var(--danger); background: var(--danger-soft); border-color: currentColor; }
+.button--small { padding: 6px 12px; font-size: 13px; }
+.button--block { width: 100%; }
+
+.inline-form { display: inline; margin: 0; }
+
+.link-button {
+  padding: 0;
+  color: var(--ink-soft);
+  background: none;
+  border: 0;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.link-button:hover { color: var(--brand); filter: none; }
+
+.form-actions { display: flex; align-items: center; gap: 12px; margin-top: 20px; flex-wrap: wrap; }
+
+/* --- Messages ------------------------------------------------------------ */
+
+.alert {
+  padding: 12px 14px;
+  border: 1px solid;
+  border-radius: 8px;
+  font-size: 14px;
+  margin-bottom: 18px;
+}
+
+.alert--error { color: var(--danger); background: var(--danger-soft); border-color: currentColor; }
+.alert--ok { color: var(--ok); background: var(--ok-soft); border-color: currentColor; }
+.alert--warn { color: var(--warn); background: var(--warn-soft); border-color: currentColor; }
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--canvas);
+  color: var(--ink-soft);
+  border: 1px solid var(--line);
+}
+
+.badge--ok { color: var(--ok); background: var(--ok-soft); border-color: currentColor; }
+.badge--warn { color: var(--warn); background: var(--warn-soft); border-color: currentColor; }
+.badge--danger { color: var(--danger); background: var(--danger-soft); border-color: currentColor; }
+
+/* --- Lists and tables ---------------------------------------------------- */
+
+.list { list-style: none; margin: 0; padding: 0; }
+
+.list > li {
+  padding: 16px 0;
+  border-top: 1px solid var(--line);
+}
+
+.list > li:first-child { border-top: 0; padding-top: 0; }
+
+.permissions { list-style: none; margin: 0; padding: 0; }
+
+.permissions > li {
+  display: flex;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.permissions > li:last-child { border-bottom: 0; }
+.permissions .tick { color: var(--brand); flex: none; font-weight: 700; }
+.permissions .scope-name {
+  display: block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.table-scroll { overflow-x: auto; }
+
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-soft); }
+
+code, .mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+
+code {
+  padding: 2px 5px;
+  background: var(--canvas);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
+.secret {
+  display: block;
+  padding: 12px;
+  margin: 10px 0 0;
+  overflow-wrap: anywhere;
+  background: var(--canvas);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+
+/* --- Consent ------------------------------------------------------------- */
+
+.consent-client { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+.consent-logo { width: 44px; height: 44px; border-radius: 10px; object-fit: contain; border: 1px solid var(--line); }
+.consent-target { overflow-wrap: anywhere; }
+
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 22px 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--line);
+}
+
+.provider-list { display: grid; gap: 10px; }

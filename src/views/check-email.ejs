@@ -1,0 +1,27 @@
+<%- include("partials/head", { title, branding, hideNav: true }) %>
+<%
+// Shown after registering, after asking for a new confirmation link, and after
+// trying to sign in to an unconfirmed account.
+//
+// The wording is deliberately conditional — "if that account needs confirming" —
+// because this page is also what a caller sees when the address was already
+// registered. Saying "we sent you a message" there would confirm the address
+// exists, which is the account-enumeration oracle the whole registration flow is
+// written to avoid.
+%>
+<div class="card card--narrow">
+  <h1><%= heading %></h1>
+  <p class="lede"><%= message %></p>
+
+  <% if (typeof resend !== "undefined" && resend) { %>
+    <form method="post" action="/verify-email/resend" class="stack">
+      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+      <input type="hidden" name="identifier" value="<%= typeof identifier !== "undefined" ? identifier : "" %>" />
+      <button type="submit" class="button--secondary button--block">Send a new link</button>
+    </form>
+  <% } %>
+
+  <hr />
+  <p class="small"><a href="/login">Back to sign in</a></p>
+</div>
+<%- include("partials/foot", { branding }) %>

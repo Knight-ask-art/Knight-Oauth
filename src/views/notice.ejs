@@ -1,0 +1,16 @@
+<%- include("partials/head", { title, branding, currentUser: locals.currentUser, csrfToken }) %>
+<%
+// A single-message page with one way onward. Used for the outcomes that are not
+// errors but do not belong on a form either: an email confirmed, a password
+// changed, an action refused for a reason the user can act on.
+%>
+<div class="card card--narrow">
+  <h1><%= heading %></h1>
+  <p class="lede"><%= message %></p>
+  <% if (typeof actionUrl !== "undefined" && actionUrl) { %>
+    <div class="form-actions">
+      <a class="button" href="<%= actionUrl %>"><%= actionLabel %></a>
+    </div>
+  <% } %>
+</div>
+<%- include("partials/foot", { branding }) %>

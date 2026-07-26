@@ -1,0 +1,24 @@
+<%- include("partials/head", { title, branding, currentUser: locals.currentUser, csrfToken }) %>
+<%
+// The error page.
+//
+// The message is chosen by the caller, and app.js only ever passes a fixed string
+// for a 5xx: an internal error's text can name a table, a file path, or a value,
+// and an authorization server should not narrate its internals to whoever
+// triggered the failure.
+//
+// `code` is the OAuth error code when there is one. It is shown because a
+// developer integrating a client needs it, and it is not sensitive — the same
+// code goes to the client in the redirect.
+%>
+<div class="card card--narrow">
+  <h1><%= heading %></h1>
+  <p class="lede"><%= message %></p>
+  <% if (typeof code !== "undefined" && code) { %>
+    <p class="small muted">Error code: <code><%= code %></code></p>
+  <% } %>
+  <div class="form-actions">
+    <a class="button button--secondary" href="/">Go to <%= branding.serviceName %></a>
+  </div>
+</div>
+<%- include("partials/foot", { branding }) %>

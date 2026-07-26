@@ -1,0 +1,110 @@
+<%- include("partials/head", { title, branding, currentUser: locals.currentUser, csrfToken }) %>
+<%
+const NOTICES = {
+  "status-changed": "That account's status has been changed.",
+  "role-changed": "That account's role has been changed."
+};
+const STATUS_BADGE = { ACTIVE: "badge--ok", PENDING: "badge--warn", DISABLED: "badge--danger" };
+%>
+<h1>Accounts</h1>
+<p class="lede">Every account on this server.</p>
+
+<% if (notice && NOTICES[notice]) { %><div class="alert alert--ok"><%= NOTICES[notice] %></div><% } %>
+
+<form method="get" action="/admin/users" class="row">
+  <%
+  // A GET form, so the search is in the URL and can be linked or reloaded. There
+  // is nothing secret in a search term for an address an operator can already
+  // read on the page.
+  %>
+  <input type="search" name="q" value="<%= query %>" placeholder="Email, username, or name" aria-label="Search accounts" />
+  <button type="submit" class="button--secondary">Search</button>
+  <% if (query) { %><a href="/admin/users" class="small">Clear</a><% } %>
+  <span class="muted small"><%= total %> total</span>
+</form>
+
+<section class="card">
+  <% if (!users.length) { %>
+    <p class="muted"><% if (query) { %>Nothing matched that search.<% } else { %>No accounts yet.<% } %></p>
+  <% } else { %>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Account</th>
+            <th>Email</th>
+            <th>Role</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <% users.forEach((user) => { %>
+            <%
+            // The operator's own row gets no controls at all. The controller
+            // refuses these changes on your own account anyway — being able to
+            // demote or disable yourself out of the only administrative surface
+            // is not recoverable through the UI — so the buttons would only be
+            // there to be refused.
+            const isSelf = locals.currentUser && user.id === locals.currentUser.id;
+            %>
+            <tr>
+              <td>
+                <strong><%= user.name || user.username || "(no name)" %></strong>
+                <% if (isSelf) { %><span class="badge">you</span><% } %><br />
+                <span class="small muted mono"><%= user.id %></span>
+              </td>
+              <td>
+                <%= user.email %><br />
+                <span class="small muted">
+                  <% if (user.emailVerified) { %>confirmed<% } else { %>not confirmed<% } %>
+                  <% if (!user.hasPassword) { %> · no password<% } %>
+                </span>
+              </td>
+              <td><span class="badge"><%= user.role.toLowerCase() %></span></td>
+              <td>
+                <span class="badge <%= STATUS_BADGE[user.status] || "" %>"><%= user.status.toLowerCase() %></span>
+              </td>
+              <td>
+                <% if (isSelf) { %>
+                  <span class="small muted">&mdash;</span>
+                <% } else { %>
+                  <div class="row">
+                    <form method="post" action="/admin/users/role" class="inline-form">
+                      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                      <input type="hidden" name="user_id" value="<%= user.id %>" />
+                      <input type="hidden" name="role" value="<%= user.role === "ADMIN" ? "USER" : "ADMIN" %>" />
+                      <button type="submit" class="button--secondary button--small">
+                        <% if (user.role === "ADMIN") { %>Make user<% } else { %>Make admin<% } %>
+                      </button>
+                    </form>
+                    <% if (user.status === "DISABLED") { %>
+                      <form method="post" action="/admin/users/status" class="inline-form">
+                        <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                        <input type="hidden" name="user_id" value="<%= user.id %>" />
+                        <input type="hidden" name="status" value="ACTIVE" />
+                        <button type="submit" class="button--secondary button--small">Enable</button>
+                      </form>
+                    <% } else { %>
+                      <%
+                      // Disabling signs the account out everywhere and stops its
+                      // tokens refreshing, rather than waiting for them to expire.
+                      %>
+                      <form method="post" action="/admin/users/status" class="inline-form">
+                        <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                        <input type="hidden" name="user_id" value="<%= user.id %>" />
+                        <input type="hidden" name="status" value="DISABLED" />
+                        <button type="submit" class="button--danger button--small">Disable</button>
+                      </form>
+                    <% } %>
+                  </div>
+                <% } %>
+              </td>
+            </tr>
+          <% }) %>
+        </tbody>
+      </table>
+    </div>
+  <% } %>
+</section>
+<%- include("partials/foot", { branding }) %>

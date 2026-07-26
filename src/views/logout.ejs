@@ -1,0 +1,42 @@
+<%- include("partials/head", { title, branding, hideNav: true }) %>
+<%
+// The sign-out confirmation.
+//
+// RP-Initiated Logout arrives as a GET, and a GET that ends a session can be
+// triggered by any page that can make the browser navigate. The specification
+// allows an interstitial for exactly that reason, so this page is shown unless
+// the request carried a valid `id_token_hint` — which proves the client really
+// had a session with this user and is the spec's own basis for skipping it.
+//
+// `redirectTarget` is already validated against what the client registered, so
+// where the button sends the user is not attacker-chosen.
+%>
+<div class="card card--narrow">
+  <h1>Sign out</h1>
+  <% if (clientName) { %>
+    <p class="lede"><%= clientName %> is asking to sign you out of <%= branding.serviceName %>.</p>
+  <% } else { %>
+    <p class="lede">Sign out of <%= branding.serviceName %>?</p>
+  <% } %>
+
+  <p class="small muted">
+    Signed in as <strong><%= account.email %></strong>. Applications you have authorized will be told your
+    session ended.
+  </p>
+
+  <form method="post" action="/oauth2/logout" class="form-actions">
+    <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+    <% if (redirectTarget) { %>
+      <%
+      // Passed back so the POST honours the same destination this page was
+      // shown for. It is re-validated on submission rather than trusted.
+      %>
+      <input type="hidden" name="post_logout_redirect_uri" value="<%= postLogoutRedirectUri || "" %>" />
+      <input type="hidden" name="client_id" value="<%= clientId || "" %>" />
+      <input type="hidden" name="state" value="<%= state || "" %>" />
+    <% } %>
+    <button type="submit">Sign out</button>
+    <a class="button button--secondary" href="/account">Stay signed in</a>
+  </form>
+</div>
+<%- include("partials/foot", { branding }) %>

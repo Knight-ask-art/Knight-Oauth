@@ -1,0 +1,98 @@
+<%- include("partials/head", { title, branding, hideNav: true }) %>
+<%
+// The consent screen.
+//
+// This is the only page in the product a third party's users are guaranteed to
+// see, and it is where a user makes a security decision, so it says three things
+// plainly: who is asking, what they get, and where the result goes.
+//
+// `redirectOrigin` is shown because it is the answer to "who am I actually
+// giving this to". It is the registered, validated redirect URI's origin — never
+// raw input — so what is displayed is what will be used.
+//
+// Every scope is a checkbox the user can clear. The server intersects what comes
+// back with what was requested, so unticking one narrows the grant rather than
+// failing the request. `openid` is not listed: it is not a permission, it only
+// means "issue an ID token", and it rides along whenever it was asked for.
+%>
+<div class="card card--narrow">
+  <div class="consent-client">
+    <% if (client.logoUri) { %>
+      <img class="consent-logo" src="<%= client.logoUri %>" alt="" width="44" height="44" />
+    <% } %>
+    <div>
+      <h1><%= client.name %></h1>
+      <p class="muted small">wants access to your account</p>
+    </div>
+  </div>
+
+  <% if (previouslyGranted) { %>
+    <div class="alert alert--ok">
+      You have authorized this application before. It is asking for something new, or asking again.
+    </div>
+  <% } %>
+
+  <% if (!client.isFirstParty) { %>
+    <p class="small muted">
+      This application was registered by a third party. <%= branding.serviceName %> does not vouch for it.
+    </p>
+  <% } %>
+
+  <h2>It will be able to</h2>
+  <% if (permissions.length) { %>
+    <ul class="permissions">
+      <% permissions.forEach((permission) => { %>
+        <li>
+          <span class="tick" aria-hidden="true">✓</span>
+          <label class="check">
+            <input type="checkbox" name="scope" value="<%= permission.name %>" form="consent-form" checked />
+            <span>
+              <%= permission.description %>
+              <span class="scope-name"><%= permission.name %></span>
+            </span>
+          </label>
+        </li>
+      <% }) %>
+    </ul>
+  <% } else { %>
+    <p class="muted">
+      Confirm who you are. It is not asking for access to anything in your account.
+    </p>
+  <% } %>
+
+  <p class="small muted consent-target">
+    Signed in as <strong><%= account.email %></strong>. You will be returned to
+    <code><%= redirectOrigin %></code>.
+  </p>
+
+  <%
+  // Both buttons submit the same form. Refusing is a POST like approving is,
+  // because a GET that decides an authorization can be triggered cross-site.
+  %>
+  <form id="consent-form" method="post" action="/oauth2/consent" class="form-actions">
+    <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+    <input type="hidden" name="request" value="<%= requestToken %>" />
+    <%
+    // Unticked checkboxes are simply absent from a form submission, so without
+    // this marker "the user cleared every box" and "this form had no boxes"
+    // arrive identically — and the server would read the first as "approve
+    // everything requested". The marker says the choice was made here.
+    %>
+    <input type="hidden" name="scope_selection" value="1" />
+    <button type="submit" name="decision" value="allow">Allow access</button>
+    <button type="submit" name="decision" value="deny" class="button--secondary">Cancel</button>
+  </form>
+
+  <% if (client.policyUri || client.tosUri) { %>
+    <p class="small muted">
+      <% if (client.policyUri) { %>
+        <a href="<%= client.policyUri %>" rel="noopener noreferrer nofollow" target="_blank">Privacy policy</a>
+      <% } %>
+      <% if (client.policyUri && client.tosUri) { %>·<% } %>
+      <% if (client.tosUri) { %>
+        <a href="<%= client.tosUri %>" rel="noopener noreferrer nofollow" target="_blank">Terms of service</a>
+      <% } %>
+    </p>
+  <% } %>
+</div>
+<%- include("partials/foot", { branding }) %>

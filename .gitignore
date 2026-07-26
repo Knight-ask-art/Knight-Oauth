@@ -1,0 +1,24 @@
+node_modules/
+
+# Configuration, which holds secrets by definition. `.env.example` is the
+# template and is the only one of these that is committed.
+.env
+.env.*
+!.env.example
+
+# SQLite lives on disk next to the code. `data/` is the default location and
+# `prisma/sqlite/data/` is where the Prisma CLI resolves a relative `file:` URL
+# from; the test suite writes a database per run into the first. None of them
+# belong in the repository — they contain accounts, sessions, and the generated
+# signing key.
+data/
+prisma/*/data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+npm-debug.log*
+*.log
+coverage/
+dist/

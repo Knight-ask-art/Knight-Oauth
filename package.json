@@ -1,0 +1,57 @@
+{
+  "name": "knight-oauth",
+  "version": "1.0.0",
+  "private": false,
+  "description": "A standalone, self-hostable OAuth 2.0 and OpenID Connect provider.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Knight-ask-art/Knight-Oauth.git"
+  },
+  "homepage": "https://github.com/Knight-ask-art/Knight-Oauth#readme",
+  "bugs": {
+    "url": "https://github.com/Knight-ask-art/Knight-Oauth/issues"
+  },
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "setup": "node scripts/setup.js",
+    "test": "node --test \"tests/unit/*.test.js\" \"tests/integration/*.test.js\"",
+    "test:unit": "node --test \"tests/unit/*.test.js\"",
+    "test:integration": "node --test \"tests/integration/*.test.js\"",
+    "db:schema": "node scripts/build-schema.js",
+    "db:schema:check": "node scripts/build-schema.js --check",
+    "db:generate": "node scripts/prisma.js generate",
+    "db:migrate": "node scripts/prisma.js migrate deploy",
+    "db:migrate:dev": "node scripts/prisma.js migrate dev",
+    "db:validate": "node scripts/prisma.js validate",
+    "db:studio": "node scripts/prisma.js studio",
+    "keys:generate": "node scripts/generate-keys.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.19.3",
+    "ejs": "^3.1.10",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "nodemailer": "^7.0.9",
+    "prisma": "^6.19.3"
+  },
+  "devDependencies": {
+    "supertest": "^7.1.4"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "oauth",
+    "oauth2",
+    "openid-connect",
+    "oidc",
+    "sso",
+    "identity-provider",
+    "authorization-server",
+    "pkce",
+    "self-hosted"
+  ]
+}

@@ -1,0 +1,11 @@
+<%
+const footBrand = (typeof branding === "object" && branding) || {};
+%>    </main>
+    <footer class="site-footer">
+      <span><%= footBrand.serviceName || "OAuth" %></span>
+      <% if (footBrand.supportUrl) { %>
+        <a href="<%= footBrand.supportUrl %>" rel="noopener noreferrer">Support</a>
+      <% } %>
+    </footer>
+  </body>
+</html>

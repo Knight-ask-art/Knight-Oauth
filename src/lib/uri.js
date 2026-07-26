@@ -1,0 +1,183 @@
+"use strict";
+
+const { invalidRequest } = require("./errors");
+
+// Redirect URI rules, per RFC 6749 section 3.1.2, RFC 8252, and OIDC Core.
+//
+// The previous Knight-internal issuer required every redirect URI to be HTTPS.
+// That is correct for a confidential web client and wrong for everything else:
+// RFC 8252 section 7.3 explicitly provides for http on the loopback interface
+// for native apps, and section 7.1 for private-use URI schemes. Rejecting those
+// makes the issuer unusable for a desktop or mobile client and blocks local
+// development, so the rule is per-URI rather than global.
+//
+// What is never allowed, on any scheme:
+//   * a fragment      — the authorization response appends to the query/fragment
+//   * userinfo        — credentials in a redirect target are a phishing vector
+//   * a relative URI  — the comparison below is exact string matching
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "[::1]", "::1", "localhost"]);
+
+/** Loopback per RFC 8252 section 7.3. `localhost` is accepted for developer ergonomics. */
+function isLoopbackHost(hostname) {
+  return LOOPBACK_HOSTS.has(String(hostname || "").toLowerCase());
+}
+
+/**
+ * A private-use URI scheme for a native app, per RFC 8252 section 7.1
+ * (e.g. `com.example.app:/oauth2redirect`). The spec recommends a scheme based
+ * on a domain name the app controls, so a dot is required: this keeps the rule
+ * from accepting bare schemes like `javascript:` or `data:`.
+ */
+function isPrivateUseScheme(protocol) {
+  const scheme = String(protocol || "").replace(/:$/, "").toLowerCase();
+  if (!scheme || !scheme.includes(".")) return false;
+  return /^[a-z][a-z0-9+.-]*$/.test(scheme);
+}
+
+const FORBIDDEN_SCHEMES = new Set([
+  "javascript:",
+  "data:",
+  "vbscript:",
+  "file:",
+  "blob:",
+  "about:"
+]);
+
+/**
+ * Parses and validates a redirect URI.
+ *
+ * @param {string} value
+ * @param {object} [options]
+ * @param {boolean} [options.allowInsecureHttp] permit http on a non-loopback host.
+ *   Off by default. A deployment behind a trusted proxy during development can
+ *   enable it; production should not.
+ * @returns {string} the normalized URI to store and compare against
+ */
+function parseRedirectUri(value, { allowInsecureHttp = false, name = "redirect_uri" } = {}) {
+  const text = String(value || "").trim();
+  if (!text) throw invalidRequest(`${name} is required`);
+  if (text.length > 2000) throw invalidRequest(`${name} is too long`);
+
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    throw invalidRequest(`${name} must be an absolute URI`);
+  }
+
+  if (FORBIDDEN_SCHEMES.has(url.protocol)) {
+    throw invalidRequest(`${name} uses a forbidden scheme`);
+  }
+  if (url.hash) {
+    throw invalidRequest(`${name} must not contain a fragment`);
+  }
+  if (url.username || url.password) {
+    throw invalidRequest(`${name} must not contain userinfo`);
+  }
+
+  if (url.protocol === "https:") return url.toString();
+
+  if (url.protocol === "http:") {
+    if (isLoopbackHost(url.hostname) || allowInsecureHttp) return url.toString();
+    throw invalidRequest(`${name} must use HTTPS unless it targets the loopback interface`);
+  }
+
+  if (isPrivateUseScheme(url.protocol)) return url.toString();
+
+  throw invalidRequest(`${name} scheme is not supported`);
+}
+
+/**
+ * Exact match, per RFC 6749 section 3.1.2.3 — no prefix, wildcard, or
+ * subdomain matching, which is how redirect-based account takeover happens.
+ *
+ * The one carve-out is RFC 8252 section 7.3: a native app on loopback cannot
+ * predict the port the OS will hand it, so a registered loopback URI matches a
+ * request that differs only in port. Scheme, host, path, and query must still
+ * match exactly.
+ */
+function redirectUriMatches(registered, requested) {
+  if (registered === requested) return true;
+
+  let left;
+  let right;
+  try {
+    left = new URL(registered);
+    right = new URL(requested);
+  } catch {
+    return false;
+  }
+
+  if (left.protocol !== "http:" || right.protocol !== "http:") return false;
+  if (!isLoopbackHost(left.hostname) || !isLoopbackHost(right.hostname)) return false;
+  // `localhost` and `127.0.0.1` are different hosts for this comparison; only
+  // the port is allowed to float.
+  return (
+    left.hostname.toLowerCase() === right.hostname.toLowerCase() &&
+    left.pathname === right.pathname &&
+    left.search === right.search
+  );
+}
+
+/** Finds the registered URI a request matches, or null. */
+function findMatchingRedirectUri(registeredUris, requested) {
+  const text = String(requested || "").trim();
+  if (!text) return null;
+  return (registeredUris || []).find((registered) => redirectUriMatches(registered, text)) || null;
+}
+
+/**
+ * Validates an absolute HTTPS URL for a non-redirect purpose (issuer base URL,
+ * back-channel logout endpoint, logo URI). These are server-to-server or
+ * display URLs where there is no native-app carve-out to make.
+ */
+function parseHttpsUrl(value, name, { required = false, allowHttp = false } = {}) {
+  const text = String(value || "").trim();
+  if (!text) {
+    if (required) throw invalidRequest(`${name} is required`);
+    return "";
+  }
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    throw invalidRequest(`${name} must be an absolute URL`);
+  }
+  const httpAllowed = allowHttp || isLoopbackHost(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && httpAllowed)) {
+    throw invalidRequest(`${name} must use HTTPS`);
+  }
+  if (url.hash || url.username || url.password) {
+    throw invalidRequest(`${name} must not contain userinfo or a fragment`);
+  }
+  return url.toString();
+}
+
+/** Strips trailing slashes so an issuer identifier compares byte-for-byte. */
+function normalizeIssuer(value) {
+  return String(value || "").replace(/\/+$/, "");
+}
+
+/**
+ * Builds an authorization error redirect (RFC 6749 section 4.1.2.1). `state` is
+ * echoed only when the client sent it.
+ */
+function buildErrorRedirect(redirectUri, { error, errorDescription, state }) {
+  const target = new URL(redirectUri);
+  target.searchParams.set("error", error);
+  if (errorDescription) target.searchParams.set("error_description", errorDescription);
+  if (state) target.searchParams.set("state", state);
+  return target.toString();
+}
+
+module.exports = {
+  buildErrorRedirect,
+  findMatchingRedirectUri,
+  isLoopbackHost,
+  isPrivateUseScheme,
+  normalizeIssuer,
+  parseHttpsUrl,
+  parseRedirectUri,
+  redirectUriMatches
+};

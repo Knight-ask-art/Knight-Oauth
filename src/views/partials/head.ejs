@@ -1,0 +1,60 @@
+<%
+// The top half of every page.
+//
+// EJS has no layout mechanism, so the shell is two partials a template includes
+// around its own content. That is why this file opens tags it does not close —
+// `foot.ejs` closes them.
+//
+// Everything interpolated below goes through EJS's escaping tag. Nothing on this
+// server renders user or client text unescaped: a client's name is
+// attacker-chosen and is displayed on the page where a user approves access to
+// their account, so an injected tag there would be a genuine attack rather than
+// a theoretical one.
+//
+// (Note for anyone editing these comments: an EJS opening tag written literally
+// inside a code block ends the block early, because EJS tokenizes the file
+// before it parses any JavaScript. Describe a tag, do not spell one.)
+//
+// `branding.primaryColor` is the only value that reaches CSS, and it is served
+// as a stylesheet from /static/css/brand.css rather than written inline here.
+// That is deliberate: the CSP sets styleSrc to 'self' with no unsafe-inline, and
+// a browser drops an inline <style> under that policy without saying so.
+const brand = (typeof branding === "object" && branding) || {};
+const serviceName = brand.serviceName || "OAuth";
+const pageTitle = (typeof title === "string" && title) || serviceName;
+const user = typeof currentUser !== "undefined" ? currentUser : null;
+const csrf = typeof csrfToken === "string" ? csrfToken : "";
+const bare = typeof hideNav !== "undefined" && hideNav;
+%><!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="same-origin" />
+    <title><%= pageTitle %> · <%= serviceName %></title>
+    <link rel="stylesheet" href="/static/css/app.css" />
+    <link rel="stylesheet" href="/static/css/brand.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/">
+        <% if (brand.logoUrl) { %><img class="brand-logo" src="<%= brand.logoUrl %>" alt="" width="28" height="28" /><% } %>
+        <span><%= serviceName %></span>
+      </a>
+      <% if (!bare) { %>
+        <nav class="site-nav">
+          <% if (user) { %>
+            <a href="/account">Account</a>
+            <a href="/account/applications">Applications</a>
+            <% if (user.role === "ADMIN") { %><a href="/admin/applications">Admin</a><% } %>
+            <form method="post" action="/logout" class="inline-form">
+              <input type="hidden" name="_csrf" value="<%= csrf %>" />
+              <button type="submit" class="link-button">Sign out</button>
+            </form>
+          <% } else { %>
+            <a href="/login">Sign in</a>
+          <% } %>
+        </nav>
+      <% } %>
+    </header>
+    <main class="site-main">

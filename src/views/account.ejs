@@ -1,0 +1,178 @@
+<%- include("partials/head", { title, branding, currentUser: account, csrfToken }) %>
+<%
+const NOTICES = {
+  "profile-updated": "Your profile has been updated.",
+  "password-changed": "Your password has been changed. You were signed out everywhere else.",
+  "access-revoked": "That application no longer has access to your account.",
+  "sessions-ended": "That session has been signed out.",
+  "provider-unlinked": "That sign-in provider has been unlinked."
+};
+%>
+<h1>Your account</h1>
+<p class="lede"><%= account.email %></p>
+
+<% if (notice && NOTICES[notice]) { %><div class="alert alert--ok"><%= NOTICES[notice] %></div><% } %>
+<% if (error) { %><div class="alert alert--error"><%= error %></div><% } %>
+
+<% if (!account.emailVerified) { %>
+  <div class="card card--tight">
+    <div class="row row--between">
+      <div>
+        <h3>Your email address is not confirmed</h3>
+        <p class="small muted">Confirm it so you can recover your account if you lose your password.</p>
+      </div>
+      <form method="post" action="/verify-email/resend" class="inline-form">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+        <button type="submit" class="button--secondary button--small">Send a new link</button>
+      </form>
+    </div>
+  </div>
+<% } %>
+
+<%
+// --- Applications the user has authorized ---------------------------------
+//
+// This is the list the whole self-service story turns on: a user who granted
+// access needs to be able to take it back without asking an operator.
+%>
+<section class="card">
+  <div class="section-head">
+    <h2>Applications with access</h2>
+    <span class="muted small"><%= grants.length %></span>
+  </div>
+
+  <% if (!grants.length) { %>
+    <p class="muted">Nothing has access to your account.</p>
+  <% } else { %>
+    <ul class="list">
+      <% grants.forEach((grant) => { %>
+        <li>
+          <div class="row row--between">
+            <div>
+              <h3>
+                <% if (grant.clientUri) { %>
+                  <a href="<%= grant.clientUri %>" rel="noopener noreferrer nofollow"><%= grant.clientName %></a>
+                <% } else { %>
+                  <%= grant.clientName %>
+                <% } %>
+              </h3>
+              <p class="small muted">
+                Authorized <%= grant.grantedAt.toISOString().slice(0, 10) %>
+                <% if (grant.hasOfflineAccess) { %>
+                  · <span class="badge badge--warn">can access while you are signed out</span>
+                <% } %>
+              </p>
+            </div>
+            <form method="post" action="/account/grants/revoke" class="inline-form">
+              <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+              <input type="hidden" name="client_id" value="<%= grant.clientId %>" />
+              <button type="submit" class="button--danger button--small">Remove access</button>
+            </form>
+          </div>
+          <% if (grant.permissions.length) { %>
+            <ul class="permissions small">
+              <% grant.permissions.forEach((permission) => { %>
+                <li><span class="tick" aria-hidden="true">✓</span><span><%= permission.description %></span></li>
+              <% }) %>
+            </ul>
+          <% } %>
+        </li>
+      <% }) %>
+    </ul>
+  <% } %>
+</section>
+
+<%
+// --- Where the account is signed in ---------------------------------------
+//
+// The current session is marked and has no sign-out button of its own: ending it
+// here would be indistinguishable from a bug. Signing out is in the header.
+%>
+<section class="card">
+  <div class="section-head">
+    <h2>Where you are signed in</h2>
+    <% if (sessions.length > 1) { %>
+      <form method="post" action="/account/sessions/revoke" class="inline-form">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+        <input type="hidden" name="session_id" value="all" />
+        <button type="submit" class="link-button">Sign out everywhere else</button>
+      </form>
+    <% } %>
+  </div>
+
+  <ul class="list">
+    <% sessions.forEach((session) => { %>
+      <li>
+        <div class="row row--between">
+          <div>
+            <h3>
+              <%= session.ipAddress || "Unknown address" %>
+              <% if (session.current) { %><span class="badge badge--ok">this device</span><% } %>
+            </h3>
+            <p class="small muted">
+              <%= session.userAgent || "Unknown browser" %><br />
+              Started <%= session.createdAt.toISOString().replace("T", " ").slice(0, 16) %> UTC
+            </p>
+          </div>
+          <% if (!session.current) { %>
+            <form method="post" action="/account/sessions/revoke" class="inline-form">
+              <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+              <input type="hidden" name="session_id" value="<%= session.id %>" />
+              <button type="submit" class="button--secondary button--small">Sign out</button>
+            </form>
+          <% } %>
+        </div>
+      </li>
+    <% }) %>
+  </ul>
+</section>
+
+<section class="card">
+  <h2>Profile</h2>
+  <form method="post" action="/account/profile" class="stack">
+    <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+    <div class="field">
+      <label for="name">Display name</label>
+      <input id="name" name="name" type="text" value="<%= account.name || "" %>" autocomplete="name" />
+    </div>
+    <div class="field">
+      <label for="username">Username</label>
+      <input
+        id="username"
+        name="username"
+        type="text"
+        value="<%= account.username || "" %>"
+        autocomplete="username"
+        autocapitalize="none"
+        spellcheck="false"
+      />
+    </div>
+    <div class="form-actions"><button type="submit">Save profile</button></div>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Password</h2>
+  <% if (!account.hasPassword) { %>
+    <p class="muted small">
+      You sign in through an external provider and have no password on this account.
+    </p>
+  <% } %>
+  <form method="post" action="/account/password" class="stack">
+    <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+    <% if (account.hasPassword) { %>
+      <div class="field">
+        <label for="current_password">Current password</label>
+        <input id="current_password" name="current_password" type="password" autocomplete="current-password" required />
+      </div>
+    <% } %>
+    <div class="field">
+      <label for="new_password">New password</label>
+      <input id="new_password" name="new_password" type="password" autocomplete="new-password" required />
+      <span class="hint">At least <%= minPasswordLength %> characters.</span>
+    </div>
+    <p class="small muted">Changing your password signs you out of every device.</p>
+    <div class="form-actions"><button type="submit">Change password</button></div>
+  </form>
+</section>
+<%- include("partials/foot", { branding }) %>

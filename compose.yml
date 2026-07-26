@@ -1,0 +1,136 @@
+# Knight OAuth, self-contained.
+#
+#   docker compose up --build
+#
+# That is the whole thing: SQLite, a signing key generated on first boot, and a
+# working issuer on http://127.0.0.1:3010. No .env is required.
+#
+# For PostgreSQL, uncomment the `postgres` service at the bottom and the four
+# marked lines in this one.
+
+services:
+  knight-oauth:
+    build:
+      context: .
+      # The Prisma client is generated for one provider at build time, because
+      # Prisma cannot read the datasource provider from the environment. Switching
+      # to PostgreSQL means rebuilding with this set to postgresql.
+      args:
+        DATABASE_PROVIDER: sqlite
+    image: knight-oauth:local
+    restart: unless-stopped
+
+    # Optional: the service boots with no configuration at all, so a clone with
+    # no .env still comes up. Without `required: false` this fails before it
+    # starts, which is a poor first experience for a file the README calls
+    # optional.
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      # In the container the database lives on the volume below, not next to the
+      # code, so it survives the container being replaced. This is the setting
+      # that keeps the generated signing key — and therefore every token already
+      # issued — valid across a rebuild.
+      DATABASE_URL: file:/app/data/knight-oauth.db
+      # What browsers and clients use to reach the issuer. Every URL in the
+      # discovery document is built from it, so it has to be the address a client
+      # actually resolves, not the container's own view of itself. Change this
+      # first when putting the service behind a domain.
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:3010}
+      NODE_ENV: ${NODE_ENV:-production}
+      # Behind a reverse proxy that terminates TLS, set TRUST_PROXY=true and
+      # PUBLIC_BASE_URL to the https address. Leave it false when the port below
+      # is exposed directly: with no proxy in front, a client can spoof its own
+      # address past the rate limiter.
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      # --- PostgreSQL: uncomment these two, comment out DATABASE_URL above -----
+      # DATABASE_PROVIDER: postgresql
+      # DATABASE_URL: postgresql://knight_oauth:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/knight_oauth
+
+    ports:
+      # Bound to the loopback address deliberately. OAuth over plaintext http
+      # exposes tokens in transit, so nothing here should be reachable off the
+      # host until there is a TLS terminator in front of it. Publish on 0.0.0.0
+      # only once that is true.
+      - "127.0.0.1:3010:3010"
+
+    volumes:
+      # SQLite's file, and the signing key stored in the same database. Without
+      # this the issuer generates a new key every time the container is recreated
+      # and every token already issued stops verifying.
+      #
+      # Not needed for PostgreSQL, where the data lives in the database service.
+      - ./data:/app/data
+
+    # The image writes nowhere except the volume above, so the root filesystem is
+    # read-only. That turns a file-write bug into an error instead of a
+    # persistent change.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: 1.0
+
+    # /healthz reports unavailable when the signing key cannot be resolved, which
+    # is the failure that otherwise looks like a healthy container serving 500s.
+    # Run through node rather than curl: the image has no curl, and adding one to
+    # a minimal runtime image for a health check is the wrong trade.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3010/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      # Generous, because a first boot applies migrations and generates a key
+      # before the port opens. A short window here would restart the container
+      # in the middle of its own setup.
+      start_period: 40s
+      retries: 3
+
+    # --- PostgreSQL: uncomment to wait for the database -----------------------
+    # depends_on:
+    #   postgres:
+    #     condition: service_healthy
+
+# --- PostgreSQL ------------------------------------------------------------
+# Uncomment this service, uncomment the marked lines above, set POSTGRES_PASSWORD
+# in .env, then rebuild with:
+#
+#   docker compose build --build-arg DATABASE_PROVIDER=postgresql
+#   docker compose run --rm knight-oauth node scripts/prisma.js migrate deploy
+#   docker compose up -d
+#
+# The migration step is explicit rather than part of startup: applying schema
+# changes automatically on boot means several replicas racing to migrate the same
+# database.
+#
+# volumes:
+#   postgres-data:
+#
+# services:
+#   postgres:
+#     image: postgres:17-alpine
+#     restart: unless-stopped
+#     environment:
+#       POSTGRES_DB: knight_oauth
+#       POSTGRES_USER: knight_oauth
+#       # No default. A database holding password hashes and signing keys must not
+#       # come up with a password that is published in this file.
+#       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+#     volumes:
+#       - postgres-data:/var/lib/postgresql/data
+#     # Not published. Only the service above needs to reach it, and exposing a
+#     # database port to the host is how one ends up reachable from the network.
+#     healthcheck:
+#       test: ["CMD-SHELL", "pg_isready -U knight_oauth -d knight_oauth"]
+#       interval: 10s
+#       timeout: 5s
+#       retries: 5

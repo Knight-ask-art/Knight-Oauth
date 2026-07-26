@@ -1,0 +1,114 @@
+<%- include("partials/head", { title, branding, currentUser: locals.currentUser, csrfToken }) %>
+<%
+const NOTICES = {
+  "status-changed": "That application's status has been changed.",
+  "application-deleted": "That application has been deleted."
+};
+const STATUS_BADGE = { APPROVED: "badge--ok", PENDING: "badge--warn", REJECTED: "badge--danger", DISABLED: "badge--danger" };
+%>
+<h1>Applications</h1>
+<p class="lede">Every client registered on this server.</p>
+
+<% if (notice && NOTICES[notice]) { %><div class="alert alert--ok"><%= NOTICES[notice] %></div><% } %>
+
+<% if (created) { %>
+  <%
+  // Approving a confidential client mints its secret, and this is the only time
+  // it is shown: only a hash is stored. An operator who loses it rotates it.
+  %>
+  <div class="card">
+    <h2><%= created.client.name %> is approved</h2>
+    <p class="small muted">
+      Give the secret to whoever operates this application. It is stored only as a hash and cannot be shown again.
+    </p>
+    <label class="small">Client ID</label>
+    <code class="secret"><%= created.client.clientId %></code>
+    <label class="small">Client secret</label>
+    <code class="secret"><%= created.clientSecret %></code>
+  </div>
+<% } %>
+
+<nav class="row small">
+  <a href="/admin/applications">All</a>
+  <% statuses.forEach((value) => { %>
+    <a href="/admin/applications?status=<%= value %>"><%= value.toLowerCase() %></a>
+  <% }) %>
+  <span class="muted"><%= total %> total</span>
+</nav>
+
+<section class="card">
+  <% if (!clients.length) { %>
+    <p class="muted">Nothing to show.</p>
+  <% } else { %>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Application</th>
+            <th>Redirect URIs</th>
+            <th>Scopes</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <% clients.forEach((client) => { %>
+            <tr>
+              <td>
+                <strong><%= client.name %></strong><br />
+                <span class="small muted mono"><%= client.clientId %></span><br />
+                <span class="small muted">
+                  <%= client.clientType %><% if (client.isFirstParty) { %> · first-party<% } %><% if (!client.requireConsent) { %> · skips consent<% } %>
+                </span>
+              </td>
+              <td class="small muted">
+                <% client.redirectUris.forEach((uri) => { %><%= uri %><br /><% }) %>
+              </td>
+              <td class="small muted"><%= client.allowedScopes.join(" ") %></td>
+              <td>
+                <span class="badge <%= STATUS_BADGE[client.status] || "" %>"><%= client.status.toLowerCase() %></span>
+              </td>
+              <td>
+                <div class="row">
+                  <% if (client.status === "PENDING") { %>
+                    <form method="post" action="/admin/applications/approve" class="inline-form">
+                      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                      <input type="hidden" name="client_id" value="<%= client.clientId %>" />
+                      <button type="submit" class="button--small">Approve</button>
+                    </form>
+                  <% } %>
+                  <%
+                  // Disabling revokes the client's refresh tokens and per-client
+                  // sessions, so it stops working now rather than whenever its
+                  // last refresh token happens to expire.
+                  %>
+                  <% if (client.status !== "DISABLED") { %>
+                    <form method="post" action="/admin/applications/status" class="inline-form">
+                      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                      <input type="hidden" name="client_id" value="<%= client.clientId %>" />
+                      <input type="hidden" name="status" value="DISABLED" />
+                      <button type="submit" class="button--secondary button--small">Disable</button>
+                    </form>
+                  <% } else { %>
+                    <form method="post" action="/admin/applications/status" class="inline-form">
+                      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                      <input type="hidden" name="client_id" value="<%= client.clientId %>" />
+                      <input type="hidden" name="status" value="APPROVED" />
+                      <button type="submit" class="button--secondary button--small">Enable</button>
+                    </form>
+                  <% } %>
+                  <form method="post" action="/admin/applications/delete" class="inline-form">
+                    <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                    <input type="hidden" name="client_id" value="<%= client.clientId %>" />
+                    <button type="submit" class="button--danger button--small">Delete</button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+          <% }) %>
+        </tbody>
+      </table>
+    </div>
+  <% } %>
+</section>
+<%- include("partials/foot", { branding }) %>

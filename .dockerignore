@@ -1,0 +1,25 @@
+# Anything not needed to build or run the image. Keeping this tight matters for
+# more than image size: a file copied in is a file that can leak.
+.env
+.env.*
+.git
+.github
+node_modules
+
+# A local database must never be baked into an image — it would ship real
+# accounts and the generated signing key to whoever pulls it.
+data/
+prisma/*/data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+tests
+coverage
+npm-debug.log*
+*.log
+
+# Documentation, which does not affect the build.
+*.md
+compose.yml

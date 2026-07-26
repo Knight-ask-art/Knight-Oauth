@@ -1,0 +1,77 @@
+<%- include("partials/head", { title, branding, hideNav: true }) %>
+<div class="card card--narrow">
+  <h1>Sign in</h1>
+  <% if (reauthenticate) { %>
+    <%
+    // prompt=login or an expired max_age. The application asked for a fresh
+    // authentication, so saying why avoids looking like a bug to someone who
+    // knows they are already signed in.
+    %>
+    <p class="lede">The application you came from asked you to sign in again.</p>
+  <% } else { %>
+    <p class="lede">Use your <%= branding.serviceName %> account.</p>
+  <% } %>
+
+  <% if (error) { %><div class="alert alert--error"><%= error %></div><% } %>
+
+  <form method="post" action="/login" class="stack">
+    <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+    <input type="hidden" name="next" value="<%= next %>" />
+
+    <div class="field">
+      <label for="identifier">Email or username</label>
+      <%
+      // `login_hint` from the authorization request lands here, which is what
+      // lets a client pre-fill the address it already knows.
+      %>
+      <input
+        id="identifier"
+        name="identifier"
+        type="text"
+        value="<%= identifier %>"
+        autocomplete="username"
+        autocapitalize="none"
+        spellcheck="false"
+        required
+        autofocus
+      />
+    </div>
+
+    <div class="field">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required />
+    </div>
+
+    <label class="check">
+      <input type="checkbox" name="remember" />
+      <span>Keep me signed in on this device</span>
+    </label>
+
+    <button type="submit" class="button--block">Sign in</button>
+  </form>
+
+  <% if (providers.length) { %>
+    <div class="divider"><span>or</span></div>
+    <div class="provider-list">
+      <% providers.forEach((provider) => { %>
+        <%
+        // A GET, and safe as one: nothing has changed yet, and the state that
+        // binds the return trip is minted server-side when this is followed.
+        %>
+        <a class="button button--secondary button--block"
+           href="/login/external/<%= encodeURIComponent(provider.name) %>?next=<%= encodeURIComponent(next) %>">
+          Continue with <%= provider.displayName %>
+        </a>
+      <% }) %>
+    </div>
+  <% } %>
+
+  <hr />
+  <p class="small">
+    <a href="/forgot-password">Forgot your password?</a>
+    <% if (registrationEnabled) { %>
+      · <a href="/register?next=<%= encodeURIComponent(next) %>">Create an account</a>
+    <% } %>
+  </p>
+</div>
+<%- include("partials/foot", { branding }) %>

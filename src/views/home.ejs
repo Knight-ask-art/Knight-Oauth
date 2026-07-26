@@ -1,0 +1,50 @@
+<%- include("partials/head", { title, branding, currentUser: account, csrfToken }) %>
+<%
+// The landing page.
+//
+// It exists for two visitors: a person who followed a link here and wonders what
+// this is, and a developer about to point a client library at it. The second one
+// needs exactly one thing — the issuer URL — because every conformant library
+// takes that and discovers the rest.
+%>
+<h1><%= branding.serviceName %></h1>
+<p class="lede">
+  A standalone OAuth 2.0 and OpenID Connect provider. Applications use it to let people sign in with an
+  account on this server.
+</p>
+
+<section class="card">
+  <h2>For developers</h2>
+  <p class="small muted">
+    This is a standard issuer. Point any conformant OAuth 2.0 or OpenID Connect client library at the
+    issuer URL and it will configure itself.
+  </p>
+  <label class="small">Issuer</label>
+  <code class="secret"><%= issuer %></code>
+  <p class="small muted">
+    Discovery: <a href="/.well-known/openid-configuration"><code>/.well-known/openid-configuration</code></a>
+    · <a href="/.well-known/oauth-authorization-server"><code>/.well-known/oauth-authorization-server</code></a>
+    · <a href="/oauth2/jwks"><code>/oauth2/jwks</code></a>
+  </p>
+</section>
+
+<section class="card">
+  <% if (account) { %>
+    <h2>Your account</h2>
+    <p class="small muted">Signed in as <%= account.email %>.</p>
+    <div class="form-actions">
+      <a class="button" href="/account">Manage your account</a>
+      <a class="button button--secondary" href="/account/applications">Your applications</a>
+    </div>
+  <% } else { %>
+    <h2>Your account</h2>
+    <p class="small muted">Sign in to see which applications have access to your account, and to withdraw it.</p>
+    <div class="form-actions">
+      <a class="button" href="/login">Sign in</a>
+      <% if (registrationEnabled) { %>
+        <a class="button button--secondary" href="/register">Create an account</a>
+      <% } %>
+    </div>
+  <% } %>
+</section>
+<%- include("partials/foot", { branding }) %>

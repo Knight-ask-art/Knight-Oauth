@@ -1,0 +1,401 @@
+// Knight OAuth data model — single source of truth.
+//
+// Do not edit prisma/postgresql/schema.prisma or prisma/sqlite/schema.prisma by
+// hand. Edit this template and run `npm run db:schema`.
+//
+// Portability rules, because this model must run unchanged on both PostgreSQL
+// and SQLite:
+//   * No enums          -> String with application-level validation.
+//   * No scalar lists   -> delimited TEXT. Scopes are space-delimited (RFC 6749
+//                          forbids spaces inside a scope token) and URIs are
+//                          newline-delimited (a URI cannot contain a newline).
+//                          See src/lib/lists.js for the only encoder/decoder.
+//   * No Json           -> TEXT holding JSON, parsed at the edge.
+//   * No native types    -> plain String. PostgreSQL gets TEXT, which is neither
+//                          slower nor less safe than VARCHAR(n) here; length is
+//                          enforced in the application so both databases agree.
+//   * No @default(uuid()) reliance for cross-db determinism -> ids are generated
+//                          by the application via crypto.randomUUID().
+
+generator client {
+  provider = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "__PROVIDER__"
+  url      = env("DATABASE_URL")
+}
+
+/// A human account. `id` is the OIDC `sub` claim: opaque, immutable, and never
+/// derived from an email address or any authorization request parameter.
+model User {
+  id              String    @id
+  email           String    @unique
+  emailVerifiedAt DateTime? @map("email_verified_at")
+  username        String?   @unique
+  /// Null for accounts that authenticate only through an external identity
+  /// provider. A null hash must never be treated as "any password matches".
+  passwordHash    String?   @map("password_hash")
+  name            String?
+  picture         String?
+  /// TEXT holding JSON. Deployment-specific attributes an identity adapter
+  /// writes and a custom scope releases as a claim (see OAUTH_CUSTOM_SCOPES).
+  /// The core never interprets the contents, and a reserved claim can never be
+  /// sourced from here.
+  attributesJson  String?   @map("attributes_json")
+  /// "USER" | "ADMIN"
+  role            String    @default("USER")
+  /// "PENDING" | "ACTIVE" | "DISABLED"
+  status          String    @default("PENDING")
+  disabledAt      DateTime? @map("disabled_at")
+  disabledReason  String?   @map("disabled_reason")
+  lastLoginAt     DateTime? @map("last_login_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  externalIdentities      ExternalIdentity[]
+  sessions                Session[]
+  emailVerificationTokens EmailVerificationToken[]
+  passwordResetTokens     PasswordResetToken[]
+  authorizationCodes      AuthorizationCode[]
+  refreshTokens           RefreshToken[]
+  grants                  Grant[]
+  oidcSessions            OidcSession[]
+  ownedClients            OAuthClient[]            @relation("OAuthClientOwner")
+
+  @@index([status])
+  @@index([role])
+  @@index([createdAt])
+  @@map("users")
+}
+
+/// Links a local account to a subject at an upstream identity provider, so an
+/// existing user directory can be reused without copying passwords.
+model ExternalIdentity {
+  id          String   @id
+  userId      String   @map("user_id")
+  /// Adapter name, e.g. "handoff" or "oidc:acme".
+  provider    String
+  /// The upstream subject. Opaque; never assumed to be an email.
+  subject     String
+  /// TEXT holding JSON with non-authoritative upstream profile hints.
+  profileJson String?  @map("profile_json")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, subject])
+  @@index([userId])
+  @@map("external_identities")
+}
+
+/// A browser session at this issuer. This is the authentication that an
+/// authorization request is measured against for `auth_time` and `max_age`.
+model Session {
+  id         String   @id
+  /// Hash of the session cookie value, never the value itself.
+  sidHash    String   @unique @map("sid_hash")
+  userId     String?  @map("user_id")
+  /// TEXT holding JSON for small, non-secret session state.
+  dataJson   String?  @map("data_json")
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent")
+  expiresAt  DateTime @map("expires_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model EmailVerificationToken {
+  id        String    @id
+  userId    String    @map("user_id")
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("email_verification_tokens")
+}
+
+model PasswordResetToken {
+  id        String    @id
+  userId    String    @map("user_id")
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("password_reset_tokens")
+}
+
+/// A registered relying party. Covers statically configured clients, clients
+/// submitted through the UI, and clients created by RFC 7591 dynamic
+/// registration.
+model OAuthClient {
+  id                          String    @id
+  clientId                    String    @unique @map("client_id")
+  /// Null for public clients, which authenticate with PKCE alone.
+  clientSecretHash            String?   @map("client_secret_hash")
+  /// "confidential" | "public"
+  clientType                  String    @default("confidential") @map("client_type")
+  name                        String
+  description                 String?
+  logoUri                     String?   @map("logo_uri")
+  clientUri                   String?   @map("client_uri")
+  tosUri                      String?   @map("tos_uri")
+  policyUri                   String?   @map("policy_uri")
+  contacts                    String?
+  /// Newline-delimited absolute URIs.
+  redirectUris                String    @map("redirect_uris")
+  postLogoutRedirectUris      String    @default("") @map("post_logout_redirect_uris")
+  backchannelLogoutUri        String?   @map("backchannel_logout_uri")
+  /// Space-delimited scope tokens.
+  allowedScopes               String    @map("allowed_scopes")
+  /// Space-delimited grant types, e.g. "authorization_code refresh_token".
+  allowedGrantTypes           String    @default("authorization_code refresh_token") @map("allowed_grant_types")
+  /// "client_secret_basic" | "client_secret_post" | "none"
+  tokenEndpointAuthMethod     String    @default("client_secret_basic") @map("token_endpoint_auth_method")
+  /// "PENDING" | "APPROVED" | "REJECTED" | "DISABLED"
+  status                      String    @default("PENDING")
+  /// A first-party client may skip the consent screen. Never set this for a
+  /// client an untrusted party controls.
+  isFirstParty                Boolean   @default(false) @map("is_first_party")
+  /// Force the consent screen on every authorization, ignoring a stored grant.
+  requireConsent              Boolean   @default(true) @map("require_consent")
+  /// RFC 7592 configuration access token, hashed.
+  registrationAccessTokenHash String?   @map("registration_access_token_hash")
+  ownerUserId                 String?   @map("owner_user_id")
+  reviewedByUserId            String?   @map("reviewed_by_user_id")
+  reviewedAt                  DateTime? @map("reviewed_at")
+  createdAt                   DateTime  @default(now()) @map("created_at")
+  updatedAt                   DateTime  @updatedAt @map("updated_at")
+
+  owner User? @relation("OAuthClientOwner", fields: [ownerUserId], references: [id], onDelete: SetNull)
+
+  authorizationCodes AuthorizationCode[]
+  refreshTokens      RefreshToken[]
+  grants             Grant[]
+  oidcSessions       OidcSession[]
+
+  @@index([ownerUserId, status])
+  @@index([status, createdAt])
+  @@map("oauth_clients")
+}
+
+/// An authorization request parked while the user authenticates or consents.
+/// It holds no credential: the lookup key is a hash and the record is
+/// single-use.
+model AuthorizationRequest {
+  id                  String    @id
+  requestTokenHash    String    @unique @map("request_token_hash")
+  clientId            String    @map("client_id")
+  redirectUri         String    @map("redirect_uri")
+  responseType        String    @map("response_type")
+  /// Optional per RFC 6749; stored verbatim when present.
+  state               String?
+  nonce               String?
+  codeChallenge       String?   @map("code_challenge")
+  codeChallengeMethod String?   @map("code_challenge_method")
+  scopes              String
+  prompt              String    @default("")
+  maxAge              Int?      @map("max_age")
+  loginHint           String?   @map("login_hint")
+  expiresAt           DateTime  @map("expires_at")
+  consumedAt          DateTime? @map("consumed_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  @@index([expiresAt])
+  @@index([clientId, consumedAt])
+  @@map("authorization_requests")
+}
+
+model AuthorizationCode {
+  id                  String    @id
+  codeHash            String    @unique @map("code_hash")
+  clientId            String    @map("client_id")
+  redirectUri         String    @map("redirect_uri")
+  nonce               String?
+  codeChallenge       String?   @map("code_challenge")
+  codeChallengeMethod String?   @map("code_challenge_method")
+  scopes              String
+  userId              String    @map("user_id")
+  sessionId           String    @map("session_id")
+  authTime            DateTime  @map("auth_time")
+  expiresAt           DateTime  @map("expires_at")
+  usedAt              DateTime? @map("used_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  user   User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client OAuthClient @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([sessionId])
+  @@index([expiresAt])
+  @@map("authorization_codes")
+}
+
+/// Rotating refresh token. `familyId` groups every descendant of one issuance so
+/// a replayed token can revoke the whole family.
+model RefreshToken {
+  id            String    @id
+  tokenHash     String    @unique @map("token_hash")
+  familyId      String    @map("family_id")
+  parentTokenId String?   @map("parent_token_id")
+  clientId      String    @map("client_id")
+  userId        String    @map("user_id")
+  sessionId     String    @map("session_id")
+  scopes        String
+  authTime      DateTime  @map("auth_time")
+  expiresAt     DateTime  @map("expires_at")
+  usedAt        DateTime? @map("used_at")
+  revokedAt     DateTime? @map("revoked_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  user   User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client OAuthClient @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+
+  @@index([familyId, revokedAt])
+  @@index([userId, clientId, revokedAt])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+/// Durable record of what a user authorized a client to do. This is not a token
+/// store: no codes, cookies, state, nonce, PKCE verifiers, or secrets belong
+/// here.
+model Grant {
+  id        String    @id
+  userId    String    @map("user_id")
+  clientId  String    @map("client_id")
+  scopes    String
+  grantedAt DateTime  @default(now()) @map("granted_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  revokedAt DateTime? @map("revoked_at")
+  version   Int       @default(1)
+
+  user   User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client OAuthClient @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+
+  @@unique([userId, clientId])
+  @@index([userId, revokedAt])
+  @@index([clientId, revokedAt])
+  @@map("grants")
+}
+
+/// Per-client view of a browser session, used for `sid`, session status, and
+/// back-channel logout fan-out.
+model OidcSession {
+  id               String    @id
+  sessionId        String    @map("session_id")
+  clientId         String    @map("client_id")
+  userId           String    @map("user_id")
+  authTime         DateTime  @map("auth_time")
+  revokedAt        DateTime? @map("revoked_at")
+  revocationReason String?   @map("revocation_reason")
+  lastSeenAt       DateTime  @map("last_seen_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  user   User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client OAuthClient @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+
+  @@unique([sessionId, clientId])
+  @@index([userId, revokedAt])
+  @@index([sessionId, revokedAt])
+  @@map("oidc_sessions")
+}
+
+/// Outbox for back-channel logout. A row is retried until delivered so a logout
+/// is not lost when a relying party is briefly unreachable.
+model BackchannelLogout {
+  id            String    @id
+  clientId      String    @map("client_id")
+  sessionId     String    @map("session_id")
+  userId        String    @map("user_id")
+  subject       String
+  reason        String
+  jti           String    @unique
+  attempts      Int       @default(0)
+  lastAttemptAt DateTime? @map("last_attempt_at")
+  deliveredAt   DateTime? @map("delivered_at")
+  lastError     String?   @map("last_error")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  @@index([deliveredAt, createdAt])
+  @@index([sessionId])
+  @@map("backchannel_logouts")
+}
+
+/// Spent external-handoff ticket identifiers. A handoff ticket is a signed
+/// assertion the issuer does not mint, so signature and expiry checks alone
+/// cannot stop a replay: this table is what makes a ticket single-use. Rows are
+/// pruned once past `expiresAt`.
+model ConsumedTicket {
+  id        String   @id
+  provider  String
+  jti       String
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([provider, jti])
+  @@index([expiresAt])
+  @@map("consumed_tickets")
+}
+
+/// Token signing keys. A key set supplied through the environment always wins;
+/// this table exists so a fresh self-hosted deployment can generate a key on
+/// first boot and keep issuing verifiable tokens across restarts.
+model SigningKey {
+  id            String    @id
+  kid           String    @unique
+  /// "RS256" | "ES256" | "EdDSA"
+  alg           String
+  privateJwkJson String   @map("private_jwk_json")
+  publicJwkJson  String   @map("public_jwk_json")
+  isActive      Boolean   @default(false) @map("is_active")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  rotatedAt     DateTime? @map("rotated_at")
+  /// Retired keys stay published in JWKS until this moment so tokens signed
+  /// before a rotation remain verifiable.
+  expiresAt     DateTime? @map("expires_at")
+
+  @@index([isActive])
+  @@map("signing_keys")
+}
+
+/// Append-only security log. Values that could authenticate a request are
+/// stored as hashes; nothing here is a credential.
+model AuditLog {
+  id           String   @id
+  action       String
+  actorUserId  String?  @map("actor_user_id")
+  targetUserId String?  @map("target_user_id")
+  targetType   String   @map("target_type")
+  targetId     String?  @map("target_id")
+  /// TEXT holding JSON.
+  metadataJson String?  @map("metadata_json")
+  ipAddress    String?  @map("ip_address")
+  userAgent    String?  @map("user_agent")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([actorUserId])
+  @@index([targetUserId])
+  @@index([action, createdAt])
+  @@index([createdAt])
+  @@map("audit_logs")
+}

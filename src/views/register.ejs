@@ -1,0 +1,77 @@
+<%- include("partials/head", { title, branding, hideNav: true }) %>
+<div class="card card--narrow">
+  <h1>Create an account</h1>
+  <p class="lede">One account for every application that signs in through <%= branding.serviceName %>.</p>
+
+  <% if (error) { %><div class="alert alert--error"><%= error %></div><% } %>
+
+  <form method="post" action="/register" class="stack">
+    <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+    <input type="hidden" name="next" value="<%= next %>" />
+
+    <div class="field">
+      <label for="email">Email address</label>
+      <input
+        id="email"
+        name="email"
+        type="email"
+        value="<%= values.email || "" %>"
+        autocomplete="email"
+        autocapitalize="none"
+        spellcheck="false"
+        required
+        autofocus
+      />
+    </div>
+
+    <div class="field">
+      <label for="username">Username <span class="muted">(optional)</span></label>
+      <input
+        id="username"
+        name="username"
+        type="text"
+        value="<%= values.username || "" %>"
+        autocomplete="username"
+        autocapitalize="none"
+        spellcheck="false"
+      />
+      <span class="hint">Letters, numbers, dots, dashes, and underscores.</span>
+    </div>
+
+    <div class="field">
+      <label for="name">Display name <span class="muted">(optional)</span></label>
+      <input id="name" name="name" type="text" value="<%= values.name || "" %>" autocomplete="name" />
+      <span class="hint">Shown to applications that ask for your profile.</span>
+    </div>
+
+    <div class="field">
+      <label for="password">Password</label>
+      <%
+      // No maxlength and no composition rules. Length is what makes a password
+      // hard to guess; a pattern requirement mostly makes it hard to remember.
+      // The minimum comes from the server's configuration, which is the same
+      // value that will be enforced.
+      %>
+      <input id="password" name="password" type="password" autocomplete="new-password" required />
+      <span class="hint">At least <%= minPasswordLength %> characters. A phrase works well.</span>
+    </div>
+
+    <button type="submit" class="button--block">Create account</button>
+  </form>
+
+  <% if (providers.length) { %>
+    <div class="divider"><span>or</span></div>
+    <div class="provider-list">
+      <% providers.forEach((provider) => { %>
+        <a class="button button--secondary button--block"
+           href="/login/external/<%= encodeURIComponent(provider.name) %>?next=<%= encodeURIComponent(next) %>">
+          Continue with <%= provider.displayName %>
+        </a>
+      <% }) %>
+    </div>
+  <% } %>
+
+  <hr />
+  <p class="small">Already have an account? <a href="/login?next=<%= encodeURIComponent(next) %>">Sign in</a></p>
+</div>
+<%- include("partials/foot", { branding }) %>

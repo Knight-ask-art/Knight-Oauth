@@ -1,0 +1,156 @@
+<%- include("partials/head", { title, branding, currentUser: locals.currentUser, csrfToken }) %>
+<%
+const NOTICES = {
+  "application-deleted": "That application has been deleted."
+};
+const STATUS_BADGE = { APPROVED: "badge--ok", PENDING: "badge--warn", REJECTED: "badge--danger", DISABLED: "badge--danger" };
+%>
+<h1>Your applications</h1>
+<p class="lede">Applications you registered on this server.</p>
+
+<% if (notice && NOTICES[notice]) { %><div class="alert alert--ok"><%= NOTICES[notice] %></div><% } %>
+<% if (error) { %><div class="alert alert--error"><%= error %></div><% } %>
+
+<% if (created) { %>
+  <%
+  // The one and only time a secret is shown. Only its hash is stored, so this
+  // page cannot be revisited to read it again — an operator who loses it rotates
+  // the secret instead. Saying so here is what stops someone closing the tab and
+  // then filing a bug.
+  %>
+  <div class="card">
+    <h2><%= created.client.name %> is registered</h2>
+    <p class="small muted">Copy the secret now. It is stored only as a hash and cannot be shown again.</p>
+    <label class="small">Client ID</label>
+    <code class="secret"><%= created.client.clientId %></code>
+    <% if (created.clientSecret) { %>
+      <label class="small">Client secret</label>
+      <code class="secret"><%= created.clientSecret %></code>
+    <% } %>
+    <% if (created.client.status === "PENDING") { %>
+      <div class="alert alert--warn">
+        This server reviews new applications. Yours cannot be used until an administrator approves it.
+      </div>
+    <% } %>
+  </div>
+<% } %>
+
+<section class="card">
+  <div class="section-head">
+    <h2>Registered</h2>
+    <span class="muted small"><%= clients.length %></span>
+  </div>
+
+  <% if (!clients.length) { %>
+    <p class="muted">You have not registered anything yet.</p>
+  <% } else { %>
+    <ul class="list">
+      <% clients.forEach((client) => { %>
+        <li>
+          <div class="row row--between">
+            <div>
+              <h3>
+                <%= client.name %>
+                <span class="badge <%= STATUS_BADGE[client.status] || "" %>"><%= client.status.toLowerCase() %></span>
+                <% if (client.isPublic) { %><span class="badge">public</span><% } %>
+              </h3>
+              <p class="small muted mono"><%= client.clientId %></p>
+              <p class="small muted">
+                <% client.redirectUris.forEach((uri) => { %><%= uri %><br /><% }) %>
+              </p>
+              <p class="small muted">Scopes: <%= client.allowedScopes.join(" ") || "none" %></p>
+            </div>
+            <div class="row">
+              <% if (client.hasSecret) { %>
+                <form method="post" action="/account/applications/rotate-secret" class="inline-form">
+                  <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                  <input type="hidden" name="client_id" value="<%= client.clientId %>" />
+                  <button type="submit" class="button--secondary button--small">New secret</button>
+                </form>
+              <% } %>
+              <form method="post" action="/account/applications/delete" class="inline-form">
+                <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                <input type="hidden" name="client_id" value="<%= client.clientId %>" />
+                <button type="submit" class="button--danger button--small">Delete</button>
+              </form>
+            </div>
+          </div>
+        </li>
+      <% }) %>
+    </ul>
+  <% } %>
+</section>
+
+<% if (allowUserRegistration) { %>
+  <section class="card">
+    <h2>Register an application</h2>
+    <% if (requireApproval) { %>
+      <p class="small muted">New applications are reviewed before they can be used.</p>
+    <% } %>
+
+    <form method="post" action="/account/applications" class="stack">
+      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+
+      <div class="field">
+        <label for="name">Name</label>
+        <input id="name" name="name" type="text" required />
+        <span class="hint">Shown to users when they are asked to approve access.</span>
+      </div>
+
+      <div class="field">
+        <label for="client_type">Type</label>
+        <select id="client_type" name="client_type">
+          <%
+          // A public client is anything that cannot keep a secret — a mobile app,
+          // a desktop app, a single-page application. It gets no secret and must
+          // use PKCE, which is the correct configuration rather than a limitation.
+          %>
+          <option value="confidential">Confidential — a server that can keep a secret</option>
+          <option value="public">Public — a mobile, desktop, or browser app</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="redirect_uris">Redirect URIs</label>
+        <textarea id="redirect_uris" name="redirect_uris" required></textarea>
+        <span class="hint">
+          One per line. Must be HTTPS, except <code>http://127.0.0.1</code> and <code>http://[::1]</code> for a
+          native app, or a private-use scheme like <code>com.example.app:/callback</code>.
+        </span>
+      </div>
+
+      <div class="field">
+        <label for="post_logout_redirect_uris">Post-logout redirect URIs <span class="muted">(optional)</span></label>
+        <textarea id="post_logout_redirect_uris" name="post_logout_redirect_uris"></textarea>
+        <span class="hint">Where a user may be sent after signing out. Unregistered URIs are refused.</span>
+      </div>
+
+      <div class="field">
+        <label for="client_uri">Homepage <span class="muted">(optional)</span></label>
+        <input id="client_uri" name="client_uri" type="url" />
+      </div>
+
+      <div class="field">
+        <label for="scope">Scopes</label>
+        <input id="scope" name="scope" type="text" value="openid profile email" />
+        <span class="hint">
+          Space separated. <code>openid</code> for an ID token, <code>offline_access</code> for a refresh token.
+          <% if (scopes.length) { %>
+            This server also offers: <% scopes.forEach((scope) => { %><code><%= scope.name %></code> <% }) %>
+          <% } %>
+        </span>
+      </div>
+
+      <div class="field">
+        <label for="grant_types">Grant types</label>
+        <input id="grant_types" name="grant_types" type="text" value="authorization_code refresh_token" />
+        <span class="hint">The authorization code grant, with PKCE. Implicit and password grants are not offered.</span>
+      </div>
+
+      <div class="form-actions"><button type="submit">Register application</button></div>
+    </form>
+  </section>
+<% } else { %>
+  <p class="muted">Only an administrator can register an application on this server.</p>
+<% } %>
+<%- include("partials/foot", { branding }) %>
