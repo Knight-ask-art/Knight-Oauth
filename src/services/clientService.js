@@ -72,6 +72,9 @@ function createClientService({ prisma, config, scopeRegistry, auditLog, now = ()
   const dynamicRegistrationEnabled = Boolean(config?.clients?.dynamicRegistrationEnabled);
   const registrationAccessToken = config?.clients?.registrationAccessToken || "";
   const requirePkceForConfidential = config?.security?.requirePkce !== false;
+  // Off by default. A deployment whose relying parties genuinely live on the
+  // same private network turns it back on, having been asked to say so.
+  const allowPrivateBackchannel = Boolean(config?.backchannel?.allowPrivateNetwork);
 
   /**
    * The in-memory view of a client. Delimited columns are decoded exactly once,
@@ -219,7 +222,15 @@ function createClientService({ prisma, config, scopeRegistry, auditLog, now = ()
       // native-app carve-out to make: it must be a real HTTPS endpoint.
       backchannelLogoutUri:
         parseHttpsUrl(input.backchannelLogoutUri ?? existing?.backchannelLogoutUri, "backchannel_logout_uri", {
-          allowHttp: allowInsecureHttp
+          allowHttp: allowInsecureHttp,
+          // The one URL on a client the issuer fetches itself, so the one where
+          // a registered value decides what the server connects to. An operator
+          // approving a submission reads the name and the redirect URIs; a
+          // `backchannel_logout_uri` of http://127.0.0.1:9200/_cluster/settings
+          // is not in that line of sight, and the status it answered with is
+          // written back to `lastError` for them to read afterwards. That is a
+          // port scanner with a results page.
+          blockPrivateNetwork: !allowPrivateBackchannel
         }) || null,
       allowedScopes: encodeScopes(
         normalizeScopes(input.scopes ?? decodeScopes(existing?.allowedScopes))

@@ -187,6 +187,31 @@ test("a custom scope may not shadow a standard one or forge a reserved claim", (
   assert.throws(() => loadEnv(custom([{ description: "no name" }])), /requires a name/);
 });
 
+test("TRUST_PROXY resolves to a hop count rather than to blanket trust", () => {
+  // `req.ip` is what the rate limiter counts against and what the audit log
+  // records a sign-in as coming from. Express reads the left-most
+  // X-Forwarded-For entry as the client and `true` tells it to trust every hop,
+  // including the entries the client wrote itself — and nginx's usual recipe
+  // appends rather than replaces, so "the proxy is mine" does not close it.
+  // A hop count does: Express counts back from the socket instead.
+  assert.equal(loadEnv({}).trustProxy, false, "no proxy is the default");
+  assert.equal(loadEnv({ TRUST_PROXY: "false" }).trustProxy, false);
+  assert.equal(loadEnv({ TRUST_PROXY: "off" }).trustProxy, false);
+  assert.equal(loadEnv({ TRUST_PROXY: "0" }).trustProxy, false);
+
+  // The change in meaning, stated as an assertion so it cannot drift back.
+  assert.equal(loadEnv({ TRUST_PROXY: "true" }).trustProxy, 1, "a boolean means one proxy, not all of them");
+  assert.equal(loadEnv({ TRUST_PROXY: "yes" }).trustProxy, 1);
+
+  assert.equal(loadEnv({ TRUST_PROXY: "2" }).trustProxy, 2);
+  // Passed through for Express to interpret: it accepts addresses, CIDR ranges,
+  // and the presets `loopback`, `linklocal`, `uniquelocal`.
+  assert.equal(loadEnv({ TRUST_PROXY: "10.0.0.0/8, 192.168.0.0/16" }).trustProxy, "10.0.0.0/8, 192.168.0.0/16");
+  assert.equal(loadEnv({ TRUST_PROXY: "uniquelocal" }).trustProxy, "uniquelocal");
+
+  assert.throws(() => loadEnv({ TRUST_PROXY: "99" }), /between 0 and 32/);
+});
+
 test("a custom scope may not assert a claim the issuer makes from the account", () => {
   const custom = (entries) => ({ OAUTH_CUSTOM_SCOPES: JSON.stringify(entries) });
 
