@@ -96,6 +96,18 @@ const RESERVED_CLAIMS = new Set([
 // nobody verified into every relying party's ID token — including past
 // providerService's explicit defence that a synthesised `@external.invalid`
 // address must always report `email_verified: false`.
+// Every entry here is one the issuer already resolves from the account record,
+// so refusing it to a custom scope removes no capability — the standard scope
+// that releases it still does.
+//
+// `phone_number` is deliberately absent, and the difference is the point.
+// Nothing populates it: buildUserClaims has no phone field, so the standard
+// `phone` scope declares the claim and produces nothing, and a custom scope
+// reading it from `attributes` is the only way a deployment can supply one.
+// Refusing it would take that away and give nothing back. `phone_number_verified`
+// is a different kind of statement — it asserts the issuer checked something —
+// and that is exactly what an upstream-controlled attribute must not be able to
+// say. A deployment may supply the number; it may not certify it.
 const ACCOUNT_CLAIMS = new Set([
   "email",
   "email_verified",
@@ -103,7 +115,6 @@ const ACCOUNT_CLAIMS = new Set([
   "preferred_username",
   "picture",
   "updated_at",
-  "phone_number",
   "phone_number_verified"
 ]);
 

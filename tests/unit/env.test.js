@@ -211,6 +211,16 @@ test("a custom scope may not assert a claim the issuer makes from the account", 
   // mechanism they exist to be.
   const env = loadEnv(custom([{ name: "billing", claims: ["billing_tier"] }]));
   assert.equal(env.customScopes[0].claims[0], "billing_tier");
+
+  // `phone_number` stays allowed, and the asymmetry with
+  // `phone_number_verified` above is deliberate. Nothing populates the number —
+  // buildUserClaims has no phone field, so the standard `phone` scope declares
+  // the claim and produces nothing — which makes a custom scope the only way a
+  // deployment can supply one. Refusing it would remove that and give nothing
+  // back. Certifying it is the part an upstream attribute must not be able to
+  // do.
+  const withPhone = loadEnv(custom([{ name: "directory", claims: ["phone_number"] }]));
+  assert.deepEqual(withPhone.customScopes[0].claims, ["phone_number"]);
 });
 
 test("a custom scope reads its claims from the account's attributes", () => {
