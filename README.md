@@ -508,9 +508,26 @@ FLOW_REDIRECT_URI=https://rp.example/callback \
   node .github/scripts/flow.js http://127.0.0.1:3010
 ```
 
-CI runs it on both databases, because single-use codes and refresh rotation are
+`openid-client-flow.js` is the same flow driven by the real
+[`openid-client`](https://github.com/panva/openid-client) library — the reference
+Node relying party named in the integration examples above. Discovery, the code
+grant (including the ID-token signature check against JWKS), UserInfo, refresh,
+introspection, and revocation all go through the library rather than hand-rolled
+HTTP. The browser half is still done by hand; that is HTML forms, not something a
+token library covers. Same environment variables:
+
+```bash
+FLOW_CLIENT_ID=my-client \
+FLOW_CLIENT_SECRET=... \
+FLOW_REDIRECT_URI=https://rp.example/callback \
+  node .github/scripts/openid-client-flow.js http://127.0.0.1:3010
+```
+
+CI runs both on both databases, because single-use codes and refresh rotation are
 enforced by scoped writes — behaviour that belongs to the database, not to the
-code, and that the in-process suite only ever sees on SQLite.
+code, and that the in-process suite only ever sees on SQLite. The library-driven
+script is there so a misreading of the specification in `flow.js` cannot be the
+only thing that says the flow works.
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -751,8 +768,23 @@ FLOW_REDIRECT_URI=https://rp.example/callback \
   node .github/scripts/flow.js http://127.0.0.1:3010
 ```
 
-CI 会在两种数据库上都跑一遍：code 的一次性和 refresh 轮换是由带条件的写入保证的，
-这属于数据库的行为而不是代码的行为，而进程内的测试套件只在 SQLite 上见过它。
+`openid-client-flow.js` 是同一条流程，但由真正的
+[`openid-client`](https://github.com/panva/openid-client) 库驱动——也就是上文集成
+示例里点名的那个 Node 参考 relying party。发现文档、code 交换（含对照 JWKS 校验
+ID token 签名）、UserInfo、刷新、introspection 和 revocation 全部走库，而不是手写
+HTTP。浏览器半边仍是手写的：那是 HTML 表单，不是令牌库覆盖的范围。环境变量相同：
+
+```bash
+FLOW_CLIENT_ID=my-client \
+FLOW_CLIENT_SECRET=... \
+FLOW_REDIRECT_URI=https://rp.example/callback \
+  node .github/scripts/openid-client-flow.js http://127.0.0.1:3010
+```
+
+CI 会在两种数据库上把两条都跑一遍：code 的一次性和 refresh 轮换是由带条件的写入
+保证的，这属于数据库的行为而不是代码的行为，而进程内的测试套件只在 SQLite 上见过
+它。库驱动的脚本存在的意义是：即便 `flow.js` 对规范有误读，也不能成为唯一说
+"流程能跑通"的证据。
 
 欢迎贡献代码，见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 

@@ -38,6 +38,7 @@
     "prisma": "^6.19.3"
   },
   "devDependencies": {
+    "openid-client": "^6.8.4",
     "supertest": "^7.1.4"
   },
   "engines": {

@@ -1,6 +1,6 @@
 # Continuous integration.
 #
-# Five things are verified here that a developer's machine does not cover:
+# Six things are verified here that a developer's machine does not cover:
 #
 #   1. The suite on Linux as well as Windows. `scripts/setup.js` once failed only
 #      on Windows, because `process.execPath` is `C:\Program Files\nodejs\node.exe`
@@ -24,6 +24,10 @@
 #      suite mounts the Express app in-process, so nothing in it can see a cookie
 #      that does not survive a real socket, a redirect a proxy rewrites, or a
 #      single-use code that a database enforces differently than SQLite does.
+#   6. The same flow driven by the real `openid-client` library rather than the
+#      hand-rolled script in (5). flow.js can share its author's misreadings of
+#      the specification; openid-client validates independently, including the
+#      ID-token signature against JWKS.
 
 name: CI
 
@@ -224,6 +228,21 @@ jobs:
           fi
           node .github/scripts/flow.js http://127.0.0.1:3010
 
+      # Same flow, driven by the real openid-client library. flow.js above is a
+      # client I wrote and can share my own misreadings of the specification; this
+      # one hands discovery, the code grant (including ID-token signature check
+      # against JWKS), UserInfo, refresh, introspection, and revocation to the
+      # reference Node RP. The browser half is still done by hand — that is HTML
+      # forms, not something a token library covers.
+      - name: end-to-end flow via openid-client
+        run: |
+          if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
+            echo "the server is no longer running, so the openid-client flow cannot be attempted:"
+            cat server.log
+            exit 1
+          fi
+          node .github/scripts/openid-client-flow.js http://127.0.0.1:3010
+
       - name: server log
         if: always()
         run: cat server.log || true
@@ -366,6 +385,69 @@ jobs:
           FLOW_CLIENT_SECRET="$FLOW_CLIENT_SECRET" \
           FLOW_REDIRECT_URI=https://rp.ci.invalid/callback \
             node .github/scripts/flow.js http://127.0.0.1:3010
+
+      # Same flow, driven by the real openid-client library. A separate step
+      # from the hand-rolled one so a failure in either still reports the other.
+      #
+      # A fresh static client is generated here rather than reused from the step
+      # above: that step's secret lived only in its shell, and the docker job
+      # deliberately never writes client secrets to GITHUB_ENV. openid-client is
+      # a devDependency, so npm ci runs in this step — the earlier docker steps
+      # only need Node builtins for probe.js and flow.js.
+      - name: end-to-end flow via openid-client in the container
+        run: |
+          FLOW_CLIENT_SECRET="$(node -e 'console.log(require("crypto").randomBytes(32).toString("base64url"))')"
+          echo "::add-mask::$FLOW_CLIENT_SECRET"
+
+          export OAUTH_STATIC_CLIENTS="$(node -e '
+            console.log(JSON.stringify([{
+              clientId: "ci-openid-client",
+              clientName: "CI OpenID Client",
+              clientSecret: process.argv[1],
+              redirectUris: ["https://rp.ci.invalid/callback"],
+              grantTypes: ["authorization_code", "refresh_token"],
+              scopes: ["openid", "profile", "email", "offline_access"],
+              isFirstParty: false
+            }]))
+          ' "$FLOW_CLIENT_SECRET")"
+
+          cat > compose.ci.yml <<'YAML'
+          services:
+            knight-oauth:
+              environment:
+                OAUTH_STATIC_CLIENTS: ${OAUTH_STATIC_CLIENTS:?}
+          YAML
+
+          compose() { docker compose -f compose.yml -f compose.ci.yml "$@"; }
+          compose up -d
+
+          for i in $(seq 1 90); do
+            state="$(docker inspect --format '{{ .State.Health.Status }}' "$(compose ps -q knight-oauth)" 2>/dev/null || echo missing)"
+            if [ "$state" = "healthy" ]; then break; fi
+            if [ "$state" = "unhealthy" ]; then
+              echo "the container went unhealthy once the openid-client static client was configured"
+              compose logs
+              exit 1
+            fi
+            sleep 2
+          done
+
+          # On a re-up the static-client sync updates an existing row as often
+          # as it imports a new one, so accept either.
+          if ! compose logs 2>&1 | grep -qE "static clients: [0-9]+ (imported|updated)"; then
+            echo "the container did not import or update the openid-client static client:"
+            compose logs
+            exit 1
+          fi
+
+          # openid-client is a devDependency; the docker job has not run npm ci
+          # yet because probe.js and flow.js need only Node builtins.
+          npm ci
+
+          FLOW_CLIENT_ID=ci-openid-client \
+          FLOW_CLIENT_SECRET="$FLOW_CLIENT_SECRET" \
+          FLOW_REDIRECT_URI=https://rp.ci.invalid/callback \
+            node .github/scripts/openid-client-flow.js http://127.0.0.1:3010
 
       # A read-only root filesystem turns a stray write into an error rather than
       # a change that persists invisibly. Asserted because compose.yml claims it.
