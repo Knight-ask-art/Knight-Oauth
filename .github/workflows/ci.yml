@@ -1,6 +1,6 @@
 # Continuous integration.
 #
-# Seven things are verified here that a developer's machine does not cover:
+# Eight things are verified here that a developer's machine does not cover:
 #
 #   1. The suite on Linux as well as Windows. `scripts/setup.js` once failed only
 #      on Windows, because `process.execPath` is `C:\Program Files\nodejs\node.exe`
@@ -34,6 +34,12 @@
 #      to a successful token, so every assertion in them is on the path where
 #      the user says yes — which leaves the paths a client library exercises
 #      just as often entirely uncovered.
+#   8. The suite itself, against PostgreSQL. Job 2 has had a live server since it
+#      was written and only ever applied migrations and booted against it, so
+#      every assertion about single-use codes, rotation, scoped updates and
+#      unique constraints was checked on SQLite alone — the half where Prisma
+#      opens one connection and the application is a single writer, so a
+#      check-then-act that races on PostgreSQL is serialised into passing.
 
 name: CI
 
@@ -182,6 +188,21 @@ jobs:
       # start. A second run must be a no-op, not an error.
       - name: migrations are idempotent
         run: npm run db:migrate
+
+      # The suite, against PostgreSQL.
+      #
+      # This job has had a live PostgreSQL since it was written and never ran a
+      # test against it — it applied migrations, booted, and drove HTTP. So every
+      # assertion this project makes about single-use codes, rotated refresh
+      # tokens, scoped updates and unique constraints was checked on SQLite only,
+      # which is the forgiving half: Prisma opens one connection to it and the
+      # whole application is a single writer, so a check-then-act that races on
+      # PostgreSQL is serialised into passing here.
+      #
+      # tests/helpers/database.js now gives each suite its own schema rather than
+      # its own file, because `node --test` runs the files concurrently.
+      - name: npm test on postgresql
+        run: npm test
 
       # The point of the job. A rendered schema that applies is not proof the
       # service runs on it: the boot path connects, resolves a signing key, and
