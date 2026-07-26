@@ -32,6 +32,15 @@ const insufficientScope = (message) => protocolError("insufficient_scope", messa
 const serverError = (message) => protocolError("server_error", message, 500);
 const temporarilyUnavailable = (message) => protocolError("temporarily_unavailable", message, 503);
 
+// RFC 7591 section 3.2.2 defines its own codes for dynamic client registration,
+// and a registration client branches on them the same way a token client
+// branches on `invalid_grant`. Answering everything with `invalid_request` tells
+// a caller only that something was wrong somewhere in a metadata document that
+// may carry twenty fields; these say which kind of thing, which is the whole
+// reason the registry has entries for them. Both are 400.
+const invalidRedirectUri = (message) => protocolError("invalid_redirect_uri", message, 400);
+const invalidClientMetadata = (message) => protocolError("invalid_client_metadata", message, 400);
+
 /**
  * A non-protocol application error, for the account and management surfaces
  * where a rendered page rather than a JSON error body is the right answer.
@@ -48,7 +57,9 @@ module.exports = {
   consentRequired,
   insufficientScope,
   invalidClient,
+  invalidClientMetadata,
   invalidGrant,
+  invalidRedirectUri,
   invalidRequest,
   invalidScope,
   invalidToken,

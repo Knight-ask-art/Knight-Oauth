@@ -168,10 +168,18 @@ function createOAuthController({ config, provider, clients, scopeRegistry, accou
    * for, and the session may still fail `max_age`.
    */
   async function continueAuthorization(req, res, next) {
+    // Declared out here so the catch can tell the two cases apart: before the
+    // parked request loads there is no validated redirect_uri to answer to, and
+    // after it loads there is.
+    let request = null;
     try {
       const requestToken = String(req.query[REQUEST_PARAM] || "");
-      const request = await provider.loadAuthorizationRequest(requestToken);
+      request = await provider.loadAuthorizationRequest(requestToken);
       if (!request) {
+        // Nothing to redirect to. The token is expired, spent, or invented, so
+        // there is no client this could be reported to — and guessing one from
+        // an unvalidated parameter is how an authorization endpoint becomes an
+        // open redirect. This one stays a rendered page.
         return renderProtocolError(
           res,
           invalidRequest("This sign-in request has expired. Start again from the application."),
@@ -200,7 +208,28 @@ function createOAuthController({ config, provider, clients, scopeRegistry, accou
       });
       return res.redirect(redirectUrl);
     } catch (error) {
-      if (error?.isProtocolError) return renderProtocolError(res, error, error.statusCode || 400);
+      // Once the request has loaded, its redirect_uri has already been matched
+      // against the client's registered set, so an error here is the client's
+      // to receive — the same rule `authorize` follows past the same point.
+      //
+      // Rendering it instead left the relying party with no answer at all: the
+      // user saw a page on the issuer and the client sat on an authorization
+      // request that never came back. An account disabled between the login
+      // page and the return (`access_denied`), or a scope the account may not
+      // authorize (`invalid_scope`), both landed there.
+      if (error?.isProtocolError) {
+        if (request) {
+          return res.redirect(
+            buildErrorRedirect(request.redirectUri, {
+              error: error.code,
+              errorDescription: error.message,
+              state: request.state,
+              issuer: config.issuer
+            })
+          );
+        }
+        return renderProtocolError(res, error, error.statusCode || 400);
+      }
       return next(error);
     }
   }

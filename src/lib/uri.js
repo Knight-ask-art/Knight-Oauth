@@ -109,6 +109,25 @@ function redirectUriMatches(registered, requested) {
     return false;
   }
 
+  // Both sides normalised, which is what the exact-match rule was always meant
+  // to compare.
+  //
+  // A registered URI has already been through parseRedirectUri, so it is stored
+  // in WHATWG-normalised form; the requested one was compared as the raw string
+  // the client sent. That asymmetry is not stricter than exact matching, it is
+  // just inconsistent: `https://rp.example:443/cb`, `https://RP.example/cb`, and
+  // a registered `https://rp.example` written without its trailing slash all
+  // denote the registered endpoint and were all refused.
+  //
+  // This does not widen what a client can reach. `new URL().toString()` is the
+  // same parse a browser applies to the Location header, so the normalised form
+  // and the raw one always denote the same destination — a request can only
+  // match a registration it was already equivalent to. What it normalises is
+  // scheme and host case, a default port stated explicitly, an empty path, and
+  // dot-segments; a fragment or userinfo survives it and still fails to match,
+  // which is what RFC 6749 section 3.1.2 wants.
+  if (left.toString() === right.toString()) return true;
+
   if (left.protocol !== "http:" || right.protocol !== "http:") return false;
   if (!isLoopbackHost(left.hostname) || !isLoopbackHost(right.hostname)) return false;
   // `localhost` and `127.0.0.1` are different hosts for this comparison; only
