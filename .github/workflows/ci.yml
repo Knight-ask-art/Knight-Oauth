@@ -225,8 +225,8 @@ jobs:
           before="$(curl -fsS http://127.0.0.1:3010/oauth2/jwks | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);if(!j.keys?.length){console.error("no keys in JWKS");process.exit(1)}process.stdout.write(j.keys[0].kid)})')"
           echo "kid before: $before"
 
-          # `down` without -v: the bind mount at ./data is the thing under test,
-          # and the container is genuinely destroyed rather than restarted.
+          # `down` without -v: the volume is the thing under test, and the
+          # container is genuinely destroyed and recreated rather than restarted.
           docker compose down
           docker compose up -d
 
@@ -241,7 +241,7 @@ jobs:
 
           if [ -z "$after" ] || [ "$before" != "$after" ]; then
             echo "the signing key did not survive: every token issued before the restart would now fail to verify."
-            echo "usually this means the database is not on the volume — check DATABASE_URL and the ./data mount."
+            echo "usually this means the database is not on the volume — check DATABASE_URL and the volume mount."
             docker compose logs
             exit 1
           fi

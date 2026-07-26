@@ -79,8 +79,20 @@ services:
       # this the issuer generates a new key every time the container is recreated
       # and every token already issued stops verifying.
       #
+      # A named volume rather than a bind mount to ./data, because the container
+      # runs as an unprivileged user. Docker initializes a named volume from the
+      # image's own directory, so it inherits the node:node ownership set in the
+      # Dockerfile; a bind mount to a host path that does not exist yet is created
+      # as root instead, and the container then cannot create its database —
+      # "unable to open database file", on the documented zero-config command.
+      #
+      # To keep the database at a path on the host, create the directory and give
+      # it to uid 1000 first, then swap the line below for `./data:/app/data`:
+      #
+      #   mkdir -p data && sudo chown 1000:1000 data
+      #
       # Not needed for PostgreSQL, where the data lives in the database service.
-      - ./data:/app/data
+      - knight-oauth-data:/app/data
 
     # The image writes nowhere except the volume above, so the root filesystem is
     # read-only. That turns a file-write bug into an error instead of a
@@ -118,6 +130,14 @@ services:
     #   postgres:
     #     condition: service_healthy
 
+volumes:
+  # The SQLite database and the signing key inside it. Declared here so Docker
+  # owns its lifecycle: `docker compose down` keeps it and tokens survive, while
+  # `docker compose down -v` deletes it and every issued token becomes
+  # unverifiable. Inspect the path with `docker volume inspect
+  # knight-oauth_knight-oauth-data`.
+  knight-oauth-data:
+
 # --- PostgreSQL ------------------------------------------------------------
 # Uncomment this service, uncomment the marked lines above, set POSTGRES_PASSWORD
 # in .env, then rebuild with:
@@ -130,8 +150,8 @@ services:
 # changes automatically on boot means several replicas racing to migrate the same
 # database.
 #
-# volumes:
-#   postgres-data:
+# Add `postgres-data:` to the `volumes:` block above — it already exists, so do
+# not start a second one.
 #
 # services:
 #   postgres:

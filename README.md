@@ -394,7 +394,11 @@ docker compose up --build -d
 No `.env` is required. The container applies pending SQLite migrations on start,
 generates a signing key on first boot, and serves a working issuer on
 `http://127.0.0.1:3010`. The SQLite file — and the signing key stored in it —
-lives on a volume at `./data`, so tokens survive a rebuild.
+lives on a named Docker volume, so tokens survive a rebuild. `docker compose down`
+keeps it; `docker compose down -v` deletes it, and every token issued so far stops
+verifying. To keep the database at a path you can see, follow the comment on the
+`volumes:` entry in `compose.yml` — a bind mount needs its directory to exist and
+be owned by uid 1000 first, because the container does not run as root.
 
 The image runs as a non-root user with a read-only root filesystem, all
 capabilities dropped, and `no-new-privileges`. The compose file binds to
@@ -649,7 +653,10 @@ docker compose up --build -d
 
 不需要 `.env`。容器启动时会应用待执行的 SQLite 迁移，首次启动自动生成签名密钥，
 并在 `http://127.0.0.1:3010` 提供可用的 issuer。SQLite 文件（以及其中的签名密钥）
-挂在 `./data` 卷上，因此重建镜像不会让已签发的令牌失效。
+存放在一个具名 Docker 卷上，因此重建镜像不会让已签发的令牌失效。`docker compose down`
+会保留它；`docker compose down -v` 会删除它，此前签发的所有令牌都将无法验证。如果希望
+数据库落在宿主机上可见的路径，请参考 `compose.yml` 中 `volumes:` 条目上的注释：容器不以
+root 运行，所以 bind mount 的目录必须先存在、并且属主为 uid 1000。
 
 镜像以非 root 用户运行，根文件系统只读，丢弃所有 capability，并设置
 `no-new-privileges`。compose 文件故意只绑定 `127.0.0.1`：请在前面放一个负责 TLS

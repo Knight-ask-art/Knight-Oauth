@@ -32,6 +32,20 @@ function targetFor(provider) {
   return path.join(ROOT, "prisma", provider, "schema.prisma");
 }
 
+/**
+ * Compares content without letting a line ending decide the answer.
+ *
+ * The rendered text is built from "\n" literals, but a checkout on Windows can
+ * hold the committed file as CRLF — Git's core.autocrlf does that by default
+ * there. Comparing raw bytes reported every schema as out of date on a tree
+ * nobody had touched, and the suggested fix ("run npm run db:schema") produced a
+ * diff that looked empty. .gitattributes now pins the working tree to LF, which
+ * fixes a fresh clone; this makes the check correct in a clone that predates it.
+ */
+function sameContent(a, b) {
+  return a.replace(/\r\n/g, "\n") === b.replace(/\r\n/g, "\n");
+}
+
 function main() {
   const check = process.argv.includes("--check");
   const template = fs.readFileSync(TEMPLATE, "utf8");
@@ -42,7 +56,7 @@ function main() {
     const rendered = render(template, provider);
     if (check) {
       const existing = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "";
-      if (existing !== rendered) {
+      if (!sameContent(existing, rendered)) {
         process.stderr.write(`schema out of date: prisma/${provider}/schema.prisma\n`);
         failed = true;
       }

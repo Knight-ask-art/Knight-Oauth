@@ -1,0 +1,27 @@
+# Line endings are normalized to LF in the working tree on every platform, not
+# just in the repository.
+#
+# Without this, `npm run db:schema:check` fails on any Windows clone. Git's
+# core.autocrlf=true — the default from Git for Windows and on GitHub's Windows
+# runners — rewrites the checked-out schema to CRLF, while the header that
+# scripts/build-schema.js compares it against is built from "\n" literals in
+# JavaScript. The comparison is byte-for-byte, so it reports every schema as out
+# of date on a tree nobody touched.
+#
+# The same applies to the shell in .github/workflows and to scripts run with
+# bash: a CRLF line ending becomes part of the command, and the error that
+# produces names a file that looks correct in an editor.
+* text=auto eol=lf
+
+# Binary, so no end-of-line conversion and no attempt to diff as text. These are
+# gitignored, but a stray commit of one should not be silently corrupted by
+# newline translation.
+*.db binary
+*.db-journal binary
+*.sqlite binary
+*.sqlite3 binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
