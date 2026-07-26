@@ -38,8 +38,15 @@ function createBackchannelService({
    * and that is not a failure. The `jti` is minted here rather than at delivery
    * so a retry re-sends the same token: the spec requires a recipient to reject a
    * replayed `jti`, and a new one per attempt would look like a fresh event.
+   *
+   * `sid` is the value the ID token published, which is the OIDC session's own
+   * id — not the browser session it belongs to. The two are both random ids on
+   * the same row (`oidcSession.id` and `oidcSession.sessionId`), so passing the
+   * wrong one produces a perfectly well-formed token that no relying party can
+   * act on. The parameter is named after the claim, not after the column, so
+   * that a caller reaching for `.sessionId` reads as the mistake it is.
    */
-  async function enqueue({ clientId, sessionId, userId, subject, reason = "logout" }) {
+  async function enqueue({ clientId, sid, userId, subject, reason = "logout" }) {
     const client = await clients.findByClientId(clientId);
     if (!client?.backchannelLogoutUri) return false;
 
@@ -47,7 +54,8 @@ function createBackchannelService({
       data: {
         id: randomId(),
         clientId: client.clientId,
-        sessionId: String(sessionId),
+        // The column predates the distinction; it holds the published `sid`.
+        sessionId: String(sid),
         userId: String(userId),
         subject: String(subject),
         reason: String(reason).slice(0, 100),

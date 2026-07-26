@@ -162,12 +162,31 @@ function normalizeIssuer(value) {
 /**
  * Builds an authorization error redirect (RFC 6749 section 4.1.2.1). `state` is
  * echoed only when the client sent it.
+ *
+ * `issuer` is required, and required for the same reason the success path sets
+ * it: RFC 9207 section 2 says `iss` accompanies *every* authorization response,
+ * and section 2.4 tells the client to reject one that arrives without it. A
+ * client that trusts our discovery document — which advertises
+ * `authorization_response_iss_parameter_supported` — has been told to do
+ * exactly that, so an error response missing `iss` does not degrade to "an
+ * error the client can read". oauth4webapi, which openid-client is built on,
+ * validates `iss` before it looks at `error`, so the relying party sees a
+ * library fault instead of `access_denied` — at the one moment its error path
+ * most needs to work.
+ *
+ * It throws rather than defaulting when omitted: a missing `iss` is invisible
+ * in the response body and only shows up as an unexplained client-side failure,
+ * which is precisely the kind of silence this argument exists to prevent.
  */
-function buildErrorRedirect(redirectUri, { error, errorDescription, state }) {
+function buildErrorRedirect(redirectUri, { error, errorDescription, state, issuer }) {
+  if (!issuer) {
+    throw new TypeError("buildErrorRedirect requires an issuer: RFC 9207 applies to error responses too");
+  }
   const target = new URL(redirectUri);
   target.searchParams.set("error", error);
   if (errorDescription) target.searchParams.set("error_description", errorDescription);
   if (state) target.searchParams.set("state", state);
+  target.searchParams.set("iss", normalizeIssuer(issuer));
   return target.toString();
 }
 

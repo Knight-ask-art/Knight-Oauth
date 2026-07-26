@@ -443,6 +443,38 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     assert.equal(decision.reason, "max_age");
   });
 
+  it("stops asking once the user has re-authenticated for a prompt=login request", async () => {
+    // The parked request is what makes this reachable at all. `prompt=login`
+    // lives in the stored row, so re-reading it after the login page returns the
+    // same answer as before: the user signs in, comes back to
+    // /oauth2/authorize/continue, is sent to /login again, and the login page —
+    // seeing a session — redirects straight back. The browser ends that with
+    // ERR_TOO_MANY_REDIRECTS, so `prompt=login` does not degrade to "ignored",
+    // it fails the whole authorization. Asserting only the first decision, as a
+    // test on the request in isolation does, cannot see the second hop.
+    const request = await provider.parseAuthorizationRequest({
+      client_id: confidential.clientId,
+      redirect_uri: confidential.redirectUris[0],
+      response_type: "code",
+      scope: "openid",
+      prompt: "login",
+      code_challenge: pkce().challenge,
+      code_challenge_method: "S256"
+    });
+    const requestToken = await provider.persistAuthorizationRequest(request);
+    const parked = await provider.loadAuthorizationRequest(requestToken);
+
+    const first = await provider.resolveAuthorization({ request: parked, account, session });
+    assert.equal(first.action, "login", "the session predates the request, so it must ask");
+    assert.equal(first.reason, "prompt_login");
+
+    // What signing in again produces: a session whose authTime is later than the
+    // moment the request was parked.
+    const reauthenticated = { ...session, authTime: new Date(parked.createdAt.getTime() + 1_000) };
+    const second = await provider.resolveAuthorization({ request: parked, account, session: reauthenticated });
+    assert.notEqual(second.action, "login", "asking a second time is the redirect loop");
+  });
+
   it("skips consent for a client configured not to require it", async () => {
     const request = await provider.parseAuthorizationRequest({
       client_id: publicClient.clientId,
@@ -1084,7 +1116,7 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
 
   it("notifies a client by back channel when the session ends", async () => {
     const flow = await authorize({ scope: "openid" });
-    await provider.token({
+    const tokens = await provider.token({
       headers: basicAuth(confidential.clientId, confidentialSecret),
       body: {
         grant_type: "authorization_code",
@@ -1093,6 +1125,11 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
         code_verifier: flow.verifier
       }
     });
+    // The value the relying party indexed its session by when it accepted the
+    // ID token. Captured here so the logout token can be compared against it
+    // rather than merely inspected for a well-formed-looking identifier.
+    const idTokenSid = decodeJwt(tokens.id_token).payload.sid;
+    assert.ok(idTokenSid);
 
     const before = backchannelPosts.length;
     const { notified } = await provider.endSessions({ sessionId: session.id, userId: account.id });
@@ -1124,6 +1161,16 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     // apart from an ID token.
     assert.equal(payload.nonce, undefined);
     assert.equal(decodeJwt(logoutToken).header.typ, "logout+jwt");
+    // Back-Channel Logout 1.0 section 2.4: the same session identifier the ID
+    // token published. Asserting only that `sid` is present passes just as
+    // happily on the wrong random id — and the wrong one delivers a
+    // well-formed token that no relying party can act on, so the issuer records
+    // a successful logout while the user stays signed in.
+    assert.equal(
+      payload.sid,
+      idTokenSid,
+      "the logout token must name the session the ID token named, or the relying party ends nothing"
+    );
   });
 
   it("honours a registered post_logout_redirect_uri and refuses an unregistered one", async () => {
@@ -1170,6 +1217,13 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     assert.equal(denied.error, "access_denied");
     assert.equal(denied.state, "deny-state");
     assert.equal(denied.code, null);
+    // RFC 9207 section 2 covers every authorization response, not only the
+    // successful ones, and section 2.4 has the client reject one that arrives
+    // without `iss`. Discovery advertises support unconditionally, so an error
+    // response missing it does not reach the client as `access_denied` at all —
+    // oauth4webapi checks `iss` before it reads `error`, and the relying party
+    // gets an unexplained library fault instead.
+    assert.equal(denied.iss, "http://127.0.0.1:3010", "an error response carries iss too");
   });
 
   it("issues only the scopes the user approved", async () => {
