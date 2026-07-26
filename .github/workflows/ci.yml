@@ -1,6 +1,6 @@
 # Continuous integration.
 #
-# Six things are verified here that a developer's machine does not cover:
+# Seven things are verified here that a developer's machine does not cover:
 #
 #   1. The suite on Linux as well as Windows. `scripts/setup.js` once failed only
 #      on Windows, because `process.execPath` is `C:\Program Files\nodejs\node.exe`
@@ -188,6 +188,15 @@ jobs:
           # a fixed one in a public workflow would be a published credential,
           # and anyone reading this file could authenticate as this client
           # against a deployment that copied it.
+          #
+          # It reaches node through the environment rather than argv. base64url
+          # includes '-', so roughly one generated secret in sixty-four starts
+          # with one, and `node -e '...' "$SECRET"` then reads it as a node
+          # option: "node: bad option", an empty OAUTH_STATIC_CLIENTS, and a
+          # compose failure several lines later that names neither the secret
+          # nor the cause. Three steps generated a secret this way, so about one
+          # CI run in twenty failed for a reason that had nothing to do with the
+          # commit under test.
           FLOW_CLIENT_SECRET="$(node -e 'console.log(require("crypto").randomBytes(32).toString("base64url"))')"
           echo "::add-mask::$FLOW_CLIENT_SECRET"
           echo "FLOW_CLIENT_ID=ci-flow-client" >> "$GITHUB_ENV"
@@ -200,18 +209,18 @@ jobs:
           # do it — inside the docker job, 127.0.0.1 is the container.
           echo "EDGE_LOGOUT_URI=http://127.0.0.1:3099/backchannel" >> "$GITHUB_ENV"
 
-          export OAUTH_STATIC_CLIENTS="$(node -e '
+          export OAUTH_STATIC_CLIENTS="$(FLOW_SECRET="$FLOW_CLIENT_SECRET" node -e '
             console.log(JSON.stringify([{
               clientId: "ci-flow-client",
               clientName: "CI Flow Client",
-              clientSecret: process.argv[1],
+              clientSecret: process.env.FLOW_SECRET,
               redirectUris: ["https://rp.ci.invalid/callback"],
               backchannelLogoutUri: "http://127.0.0.1:3099/backchannel",
               grantTypes: ["authorization_code", "refresh_token"],
               scopes: ["openid", "profile", "email", "offline_access"],
               isFirstParty: false
             }]))
-          ' "$FLOW_CLIENT_SECRET")"
+          ')"
 
           npm start > server.log 2>&1 &
           echo $! > server.pid
@@ -374,17 +383,17 @@ jobs:
           FLOW_CLIENT_SECRET="$(node -e 'console.log(require("crypto").randomBytes(32).toString("base64url"))')"
           echo "::add-mask::$FLOW_CLIENT_SECRET"
 
-          export OAUTH_STATIC_CLIENTS="$(node -e '
+          export OAUTH_STATIC_CLIENTS="$(FLOW_SECRET="$FLOW_CLIENT_SECRET" node -e '
             console.log(JSON.stringify([{
               clientId: "ci-flow-client",
               clientName: "CI Flow Client",
-              clientSecret: process.argv[1],
+              clientSecret: process.env.FLOW_SECRET,
               redirectUris: ["https://rp.ci.invalid/callback"],
               grantTypes: ["authorization_code", "refresh_token"],
               scopes: ["openid", "profile", "email", "offline_access"],
               isFirstParty: false
             }]))
-          ' "$FLOW_CLIENT_SECRET")"
+          ')"
 
           # An override that passes the variable through from this shell, rather
           # than a .env file: the value holds a client secret, and a secret that
@@ -443,17 +452,17 @@ jobs:
           FLOW_CLIENT_SECRET="$(node -e 'console.log(require("crypto").randomBytes(32).toString("base64url"))')"
           echo "::add-mask::$FLOW_CLIENT_SECRET"
 
-          export OAUTH_STATIC_CLIENTS="$(node -e '
+          export OAUTH_STATIC_CLIENTS="$(FLOW_SECRET="$FLOW_CLIENT_SECRET" node -e '
             console.log(JSON.stringify([{
               clientId: "ci-openid-client",
               clientName: "CI OpenID Client",
-              clientSecret: process.argv[1],
+              clientSecret: process.env.FLOW_SECRET,
               redirectUris: ["https://rp.ci.invalid/callback"],
               grantTypes: ["authorization_code", "refresh_token"],
               scopes: ["openid", "profile", "email", "offline_access"],
               isFirstParty: false
             }]))
-          ' "$FLOW_CLIENT_SECRET")"
+          ')"
 
           cat > compose.ci.yml <<'YAML'
           services:
