@@ -159,8 +159,12 @@ function createApp(options = {}) {
   // Off, so an issuer behind a load balancer does not advertise what it runs.
   app.disable("x-powered-by");
   // `req.ip` is only trustworthy behind a proxy that sets the header, and
-  // trusting it otherwise lets a caller spoof the address in the audit log.
-  if (config.trustProxy) app.set("trust proxy", true);
+  // trusting it otherwise lets a caller spoof the address in the audit log and
+  // in every rate-limit bucket. The value is passed through rather than
+  // collapsed to `true`: a hop count is what makes the address the nearest
+  // proxy observed rather than the left-most entry the client may have written.
+  // See parseTrustProxy in config/env.js.
+  if (config.trustProxy !== false) app.set("trust proxy", config.trustProxy);
 
   app.use(
     helmet({

@@ -154,6 +154,11 @@ jobs:
       # covered properly in the suite, at both the middleware and the mounted-app
       # level.
       OAUTH_LOGIN_RATE_LIMIT_PER_MINUTE: 200
+      # edge.js stands up its own logout receiver on this runner's loopback,
+      # which is exactly the shape a registered backchannel_logout_uri is now
+      # refused for. The refusal is the point of the default; a job that is its
+      # own relying party is the case the switch exists for.
+      OAUTH_BACKCHANNEL_ALLOW_PRIVATE_NETWORK: true
 
     steps:
       - uses: actions/checkout@v5

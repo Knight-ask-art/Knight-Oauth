@@ -37,6 +37,52 @@ function list(value) {
 }
 
 /**
+ * Parses TRUST_PROXY into what Express's `trust proxy` setting accepts.
+ *
+ * The value decides what `req.ip` is, and `req.ip` is now what the rate limiter
+ * counts against and what the audit log records as the address a sign-in came
+ * from. Express reads the *left-most* X-Forwarded-For entry as the client, and
+ * `true` tells it to trust every hop — including the entries the client wrote
+ * itself. nginx's usual recipe is
+ * `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`, which appends
+ * rather than replaces, so "the proxy is mine" does not close it: a caller
+ * sending its own X-Forwarded-For gets that value back out as `req.ip`, rotates
+ * it per request, and never meets a limit.
+ *
+ * A hop count does close it. Express counts back from the socket, so with `1`
+ * the address is the one the nearest proxy observed and anything the client
+ * prepended is out of reach.
+ *
+ * `TRUST_PROXY=true` therefore now means one hop rather than all of them. That
+ * is a change in meaning, and it is the safe direction: a single reverse proxy
+ * is what almost every deployment has, it is what `true` was reached for, and a
+ * deployment behind two says `2`. Anything that is not a boolean or an integer
+ * is handed to Express as-is, which accepts a comma-separated list of addresses,
+ * CIDR ranges, and the presets `loopback`, `linklocal`, and `uniquelocal`.
+ */
+function parseTrustProxy(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return false;
+
+  const lowered = raw.toLowerCase();
+  if (["0", "false", "no", "off"].includes(lowered)) return false;
+  // Not `true`: see above. One hop is what a boolean was asking for.
+  if (["true", "yes", "on"].includes(lowered)) return 1;
+
+  if (/^\d+$/.test(raw)) {
+    const hops = Number(raw);
+    if (hops < 0 || hops > 32) {
+      throw new Error("TRUST_PROXY must be between 0 and 32 when it is a hop count");
+    }
+    return hops === 0 ? false : hops;
+  }
+
+  // An address list or a preset. Express validates it when it is applied, and a
+  // bad entry there fails the boot rather than silently trusting nothing.
+  return raw;
+}
+
+/**
  * Parses OAUTH_CUSTOM_SCOPES: deployment-specific scopes the core knows nothing
  * about. Shape:
  *
@@ -241,7 +287,7 @@ function loadEnv(source = process.env) {
     nodeEnv,
     isProduction,
     port: integer(source.PORT, 3010, "PORT", { min: 1, max: 65535 }),
-    trustProxy: bool(source.TRUST_PROXY, false),
+    trustProxy: parseTrustProxy(source.TRUST_PROXY),
     allowInsecureHttp,
 
     database: {
@@ -377,6 +423,11 @@ function loadEnv(source = process.env) {
         min: 1,
         max: 100
       }),
+      // `backchannel_logout_uri` is the only URL on a client that this server
+      // requests itself, so it is the only one where a registered value decides
+      // what the process connects to. Off by default; a deployment whose
+      // relying parties really are on the same private network says so.
+      allowPrivateNetwork: bool(source.OAUTH_BACKCHANNEL_ALLOW_PRIVATE_NETWORK, false),
       timeoutMs: integer(source.OAUTH_BACKCHANNEL_TIMEOUT_MS, 5000, "OAUTH_BACKCHANNEL_TIMEOUT_MS", {
         min: 500,
         max: 30000

@@ -24,6 +24,71 @@ function isLoopbackHost(hostname) {
 }
 
 /**
+ * Whether a host literal names an address on the machine's own networks.
+ *
+ * This exists for one caller: `backchannel_logout_uri` is the only URL the
+ * issuer fetches itself, so it is the only one where a registered value turns
+ * the server into a client of whatever it names. Everything else parseHttpsUrl
+ * validates — a logo, a terms page, an external provider's start URL — is
+ * loaded or opened by the *user's* browser, on the user's own networks.
+ *
+ * Only literals are judged. A name is not resolved: the answer could differ
+ * between this check and the request, which is the DNS-rebinding shape, and a
+ * resolver lookup at registration time would be a poor guard against it either
+ * way. So this closes the direct case — `http://127.0.0.1:9200/_cluster/settings`,
+ * `https://169.254.169.254/latest/meta-data/`, an RFC 1918 address — and not the
+ * indirect one. Said plainly rather than implied, because the difference decides
+ * whether it can be relied on.
+ */
+function ipv4ToInt(host) {
+  const parts = host.split(".");
+  if (parts.length !== 4) return null;
+  let value = 0;
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null;
+    const octet = Number(part);
+    if (octet > 255) return null;
+    value = value * 256 + octet;
+  }
+  return value;
+}
+
+const PRIVATE_V4_RANGES = [
+  ["0.0.0.0", 8], // "this network"
+  ["10.0.0.0", 8],
+  ["100.64.0.0", 10], // carrier-grade NAT
+  ["127.0.0.0", 8], // loopback
+  ["169.254.0.0", 16], // link-local, and where cloud metadata services live
+  ["172.16.0.0", 12],
+  ["192.168.0.0", 16]
+].map(([base, bits]) => [ipv4ToInt(base), bits === 0 ? 0 : (-1 << (32 - bits)) >>> 0]);
+
+function isPrivateNetworkHost(hostname) {
+  const host = String(hostname || "")
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "");
+  if (!host) return false;
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+
+  const v4 = ipv4ToInt(host);
+  if (v4 !== null) {
+    return PRIVATE_V4_RANGES.some(([base, mask]) => (v4 & mask) >>> 0 === base);
+  }
+
+  if (host.includes(":")) {
+    if (host === "::1" || host === "::") return true;
+    // An IPv4-mapped address is the v4 address wearing a v6 spelling.
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(host);
+    if (mapped) return isPrivateNetworkHost(mapped[1]);
+    // fc00::/7 unique-local, fe80::/10 link-local.
+    if (/^f[cd]/.test(host)) return true;
+    if (/^fe[89ab]/.test(host)) return true;
+  }
+
+  return false;
+}
+
+/**
  * A private-use URI scheme for a native app, per RFC 8252 section 7.1
  * (e.g. `com.example.app:/oauth2redirect`). The spec recommends a scheme based
  * on a domain name the app controls, so a dot is required: this keeps the rule
@@ -151,7 +216,7 @@ function findMatchingRedirectUri(registeredUris, requested) {
  * back-channel logout endpoint, logo URI). These are server-to-server or
  * display URLs where there is no native-app carve-out to make.
  */
-function parseHttpsUrl(value, name, { required = false, allowHttp = false } = {}) {
+function parseHttpsUrl(value, name, { required = false, allowHttp = false, blockPrivateNetwork = false } = {}) {
   const text = String(value || "").trim();
   if (!text) {
     if (required) throw invalidRequest(`${name} is required`);
@@ -162,6 +227,20 @@ function parseHttpsUrl(value, name, { required = false, allowHttp = false } = {}
     url = new URL(text);
   } catch {
     throw invalidRequest(`${name} must be an absolute URL`);
+  }
+  // Checked before the scheme, because the loopback carve-out below is one of
+  // the things it has to override: `allowHttp || isLoopbackHost(...)` accepted
+  // `http://127.0.0.1:9200/anything` unconditionally, including in production
+  // with allowInsecureHttp off.
+  if (blockPrivateNetwork && isPrivateNetworkHost(url.hostname)) {
+    // The switch is named in the message on purpose. A static client carrying
+    // such a URL fails the boot, by way of "OAUTH_STATIC_CLIENTS could not be
+    // imported", and an operator reading that needs the next step in the same
+    // line rather than in a file they have not opened yet.
+    throw invalidRequest(
+      `${name} must not point at a loopback, link-local, or private address: the issuer requests it from inside ` +
+        "its own network. Set OAUTH_BACKCHANNEL_ALLOW_PRIVATE_NETWORK=true if that is deliberate."
+    );
   }
   const httpAllowed = allowHttp || isLoopbackHost(url.hostname);
   if (url.protocol !== "https:" && !(url.protocol === "http:" && httpAllowed)) {
@@ -213,6 +292,7 @@ module.exports = {
   buildErrorRedirect,
   findMatchingRedirectUri,
   isLoopbackHost,
+  isPrivateNetworkHost,
   isPrivateUseScheme,
   normalizeIssuer,
   parseHttpsUrl,
