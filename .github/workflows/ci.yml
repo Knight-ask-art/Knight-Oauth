@@ -1,6 +1,6 @@
 # Continuous integration.
 #
-# Three things are verified here that a developer's machine does not cover:
+# Five things are verified here that a developer's machine does not cover:
 #
 #   1. The suite on Linux as well as Windows. `scripts/setup.js` once failed only
 #      on Windows, because `process.execPath` is `C:\Program Files\nodejs\node.exe`
@@ -15,6 +15,15 @@
 #      project: Prisma resolves a relative `file:` URL against the schema's
 #      directory, so the database and the generated key landed outside the mounted
 #      volume, and every issued token stopped verifying on restart.
+#   4. Docker *and* PostgreSQL together. Jobs 2 and 3 each cover half of that
+#      combination and neither covers the combination itself, which is where the
+#      compose file's PostgreSQL instructions were broken without any job
+#      noticing: following them produced a duplicate `services:` key, and the
+#      build argument they relied on was reverted by the next `up --build`.
+#   5. A complete authorization code flow over real HTTP, on both databases. The
+#      suite mounts the Express app in-process, so nothing in it can see a cookie
+#      that does not survive a real socket, a redirect a proxy rewrites, or a
+#      single-use code that a database enforces differently than SQLite does.
 
 name: CI
 
@@ -152,6 +161,29 @@ jobs:
       # imports static clients, all of which touch the database.
       - name: boot and probe
         run: |
+          # A client for the end-to-end flow, imported at boot as already
+          # approved. The secret is generated per run and never leaves the job:
+          # a fixed one in a public workflow would be a published credential,
+          # and anyone reading this file could authenticate as this client
+          # against a deployment that copied it.
+          FLOW_CLIENT_SECRET="$(node -e 'console.log(require("crypto").randomBytes(32).toString("base64url"))')"
+          echo "::add-mask::$FLOW_CLIENT_SECRET"
+          echo "FLOW_CLIENT_ID=ci-flow-client" >> "$GITHUB_ENV"
+          echo "FLOW_CLIENT_SECRET=$FLOW_CLIENT_SECRET" >> "$GITHUB_ENV"
+          echo "FLOW_REDIRECT_URI=https://rp.ci.invalid/callback" >> "$GITHUB_ENV"
+
+          export OAUTH_STATIC_CLIENTS="$(node -e '
+            console.log(JSON.stringify([{
+              clientId: "ci-flow-client",
+              clientName: "CI Flow Client",
+              clientSecret: process.argv[1],
+              redirectUris: ["https://rp.ci.invalid/callback"],
+              grantTypes: ["authorization_code", "refresh_token"],
+              scopes: ["openid", "profile", "email", "offline_access"],
+              isFirstParty: false
+            }]))
+          ' "$FLOW_CLIENT_SECRET")"
+
           npm start > server.log 2>&1 &
           echo $! > server.pid
           for i in $(seq 1 60); do
@@ -172,6 +204,14 @@ jobs:
           fi
 
           node .github/scripts/probe.js http://127.0.0.1:3010
+
+      # The full authorization code flow, on PostgreSQL. This is the half of the
+      # dual-database support the test suite cannot reach: tests/helpers/database.js
+      # replays the SQLite migration directly, so single-use codes and refresh
+      # rotation — both of which are enforced by scoped writes in the database —
+      # have never run against Postgres anywhere else.
+      - name: end-to-end authorization code flow
+        run: node .github/scripts/flow.js http://127.0.0.1:3010
 
       - name: server log
         if: always()
@@ -246,6 +286,76 @@ jobs:
             exit 1
           fi
 
+      # The full authorization code flow, in the container, against the database
+      # on the volume — and specifically after the container has been replaced,
+      # so this also proves the surviving key is one the service can still sign
+      # and verify with, rather than merely a row that outlived a restart.
+      #
+      # Deliberately a third `up` rather than configuring the first: that boot is
+      # the README's zero-configuration claim, and passing a client into it would
+      # mean the claim was never tested. The volume is never removed in between,
+      # so the key and the account database carry across all three.
+      - name: end-to-end authorization code flow in the container
+        run: |
+          FLOW_CLIENT_SECRET="$(node -e 'console.log(require("crypto").randomBytes(32).toString("base64url"))')"
+          echo "::add-mask::$FLOW_CLIENT_SECRET"
+
+          export OAUTH_STATIC_CLIENTS="$(node -e '
+            console.log(JSON.stringify([{
+              clientId: "ci-flow-client",
+              clientName: "CI Flow Client",
+              clientSecret: process.argv[1],
+              redirectUris: ["https://rp.ci.invalid/callback"],
+              grantTypes: ["authorization_code", "refresh_token"],
+              scopes: ["openid", "profile", "email", "offline_access"],
+              isFirstParty: false
+            }]))
+          ' "$FLOW_CLIENT_SECRET")"
+
+          # An override that passes the variable through from this shell, rather
+          # than a .env file: the value holds a client secret, and a secret that
+          # is never written to disk cannot be picked up by a later step or an
+          # uploaded artifact. compose.yml itself stays untouched — it is the file
+          # under test.
+          cat > compose.ci.yml <<'YAML'
+          services:
+            knight-oauth:
+              environment:
+                OAUTH_STATIC_CLIENTS: ${OAUTH_STATIC_CLIENTS:?}
+          YAML
+
+          compose() { docker compose -f compose.yml -f compose.ci.yml "$@"; }
+
+          # Changed environment, so compose replaces the container. The named
+          # volume is not touched, which is the point.
+          compose up -d
+
+          for i in $(seq 1 90); do
+            state="$(docker inspect --format '{{ .State.Health.Status }}' "$(compose ps -q knight-oauth)" 2>/dev/null || echo missing)"
+            if [ "$state" = "healthy" ]; then break; fi
+            if [ "$state" = "unhealthy" ]; then
+              echo "the container went unhealthy once a static client was configured"
+              compose logs
+              exit 1
+            fi
+            sleep 2
+          done
+
+          # The client reaching the database is a precondition, not the test.
+          # Asserted separately so a configuration mistake reports itself here
+          # instead of as an unexplained redirect failure inside the flow. This is
+          # the first boot on this volume that carries the client, so it imports.
+          if ! compose logs 2>&1 | grep -qE "static clients: [0-9]+ imported"; then
+            echo "the container did not import the static client, so the flow cannot run:"
+            compose logs
+            exit 1
+          fi
+
+          FLOW_CLIENT_ID=ci-flow-client \
+          FLOW_CLIENT_SECRET="$FLOW_CLIENT_SECRET" \
+          FLOW_REDIRECT_URI=https://rp.ci.invalid/callback \
+            node .github/scripts/flow.js http://127.0.0.1:3010
+
       # A read-only root filesystem turns a stray write into an error rather than
       # a change that persists invisibly. Asserted because compose.yml claims it.
       - name: the root filesystem is read-only and the user is not root
@@ -256,6 +366,131 @@ jobs:
           echo "read_only=$ro user=$user"
           [ "$ro" = "true" ] || { echo "the root filesystem is writable"; exit 1; }
           [ "$user" != "root" ] || { echo "the container runs as root"; exit 1; }
+
+      - name: container logs
+        if: always()
+        run: docker compose logs || true
+
+      - name: tear down
+        if: always()
+        run: docker compose down -v || true
+
+  # compose + PostgreSQL, which neither of the jobs above covers: `postgres` runs
+  # the service natively, and `docker` runs it in a container on SQLite. The
+  # combination is where the old "uncomment these lines" PostgreSQL instructions
+  # were broken — following them produced a duplicate `services:` key, so
+  # `docker compose up` failed before doing anything, and no job noticed because
+  # no job ever followed them.
+  docker-postgres:
+    name: docker + postgresql
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      # A throwaway credential for a database that exists for the length of this
+      # job and is never reachable from outside the runner.
+      POSTGRES_PASSWORD: ci-only-not-a-real-credential
+      COMPOSE_FILE: compose.postgres.yml
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Exactly the sequence compose.postgres.yml documents, run as written, so
+      # the documented commands are the ones under test.
+      - name: build
+        run: docker compose build
+
+      # A separate step rather than something the entrypoint does on start:
+      # several replicas racing to migrate one database is a real way to corrupt
+      # it, so scripts/docker-entrypoint.js defaults migrate-on-start to false for
+      # postgresql. This also exercises `run --rm` against a read_only service,
+      # where Prisma has only the /tmp tmpfs to write to.
+      - name: apply migrations
+        run: docker compose run --rm knight-oauth node scripts/prisma.js migrate deploy
+
+      - name: migrations are idempotent
+        run: docker compose run --rm knight-oauth node scripts/prisma.js migrate deploy
+
+      - name: up
+        run: docker compose up -d
+
+      - name: wait for healthy
+        run: |
+          for i in $(seq 1 90); do
+            state="$(docker inspect --format '{{ .State.Health.Status }}' "$(docker compose ps -q knight-oauth)" 2>/dev/null || echo missing)"
+            if [ "$state" = "healthy" ]; then exit 0; fi
+            if [ "$state" = "unhealthy" ]; then break; fi
+            sleep 2
+          done
+          echo "the container never became healthy"
+          docker compose logs
+          exit 1
+
+      # The assertion this job exists for.
+      #
+      # An image built with the SQLite client but pointed at PostgreSQL still goes
+      # healthy — /healthz resolves a signing key and little else — and then fails
+      # every request that touches a table. This log line is the only place the
+      # provider the image was actually built for is visible.
+      - name: the container is running on postgresql, not a SQLite fallback
+        run: |
+          if ! docker compose logs knight-oauth | grep -q "database    postgresql"; then
+            echo "the container did not report running on postgresql:"
+            docker compose logs knight-oauth
+            exit 1
+          fi
+
+      - name: probe the container
+        run: node .github/scripts/probe.js http://127.0.0.1:3010
+
+      # Same property the SQLite job asserts, carried by a different mechanism:
+      # there a named volume holds the key, here the postgres service does. Worth
+      # asserting separately because "the key is in PostgreSQL" is a claim about
+      # this compose file, not about the code.
+      - name: the signing key survives the container being replaced
+        run: |
+          kid() {
+            curl -fsS http://127.0.0.1:3010/oauth2/jwks | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);process.stdout.write(j.keys?.[0]?.kid||"")})'
+          }
+          before="$(kid)"
+          [ -n "$before" ] || { echo "no keys in JWKS"; exit 1; }
+          echo "kid before: $before"
+
+          # Only the application container, so the database service — and the key
+          # in it — is deliberately left alone. That is the thing being relied on.
+          docker compose up -d --force-recreate knight-oauth
+          for i in $(seq 1 90); do
+            state="$(docker inspect --format '{{ .State.Health.Status }}' "$(docker compose ps -q knight-oauth)" 2>/dev/null || echo missing)"
+            if [ "$state" = "healthy" ]; then break; fi
+            sleep 2
+          done
+
+          after="$(kid)"
+          echo "kid after:  $after"
+          if [ -z "$after" ] || [ "$before" != "$after" ]; then
+            echo "the signing key did not survive: every token issued before the restart would now fail to verify."
+            docker compose logs
+            exit 1
+          fi
+
+      # compose.postgres.yml publishes no port for the database and says so.
+      # Asserted because a published database port is the kind of thing that gets
+      # added for one debugging session and left behind.
+      - name: the database port is not published
+        run: |
+          # Unpublished, this is {"5432/tcp":null}; published, the entry carries a
+          # HostPort. Read from the running container rather than the compose file,
+          # so an override that adds a port is caught too.
+          ports="$(docker inspect --format '{{ json .NetworkSettings.Ports }}' "$(docker compose ps -q postgres)")"
+          echo "$ports"
+          if echo "$ports" | grep -q "HostPort"; then
+            echo "the database port is reachable from the host"
+            exit 1
+          fi
 
       - name: container logs
         if: always()

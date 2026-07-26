@@ -413,15 +413,21 @@ that for a loopback-only container. Once the service has a domain, serve HTTPS a
 set `PUBLIC_BASE_URL` to the `https` address, supply a key through
 `OAUTH_SIGNING_KEYS_JSON` from a secret manager, and set both back to `false`.
 
-For PostgreSQL, uncomment the marked lines in `compose.yml`, set
-`POSTGRES_PASSWORD`, rebuild with `--build-arg DATABASE_PROVIDER=postgresql`, and
+For PostgreSQL, use `compose.postgres.yml`. Set `POSTGRES_PASSWORD` in `.env` and
 run the migration once by hand before starting the service:
 
 ```bash
-docker compose build --build-arg DATABASE_PROVIDER=postgresql
-docker compose run --rm knight-oauth node scripts/prisma.js migrate deploy
-docker compose up -d
+echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> .env
+docker compose -f compose.postgres.yml build
+docker compose -f compose.postgres.yml run --rm knight-oauth \
+    node scripts/prisma.js migrate deploy
+docker compose -f compose.postgres.yml up -d
 ```
+
+A separate file rather than lines to uncomment in `compose.yml`: the provider is
+baked into the image at build time and also read from `DATABASE_URL` at run time,
+so a half-applied switch produces a container that starts, answers discovery, and
+fails every request that touches a table.
 
 Migrations are not applied automatically for PostgreSQL: several replicas racing
 to migrate the same database is a real way to corrupt one. Override either way
@@ -476,14 +482,35 @@ actually makes a single-use token single-use, or that a template renders at all.
 
 CI covers what a single machine does not: the suite on Linux and Windows across
 Node 22 and 24, the PostgreSQL migration applied to a real server with the issuer
-booted against it, and a `docker compose up` that asserts the signing key survives
-the container being destroyed and recreated. `.github/scripts/probe.js` is the
-piece that runs against a live server over real HTTP — point it at any running
-instance to check it the way a client library would:
+booted against it, a `docker compose up` that asserts the signing key survives the
+container being destroyed and recreated, and the two together — the PostgreSQL
+compose stack built, migrated, and probed, with an assertion that the running
+image was actually built for PostgreSQL rather than falling back to SQLite.
+
+Two scripts do the checking, and both run against a live server over real HTTP.
+`probe.js` stays on the unauthenticated surface — metadata, JWKS, error shapes —
+so it works against any instance, including one you did not start:
 
 ```bash
 node .github/scripts/probe.js http://127.0.0.1:3010
 ```
+
+`flow.js` drives a complete authorization code flow the way a third-party relying
+party would: register, log in, consent, exchange the code with PKCE, read
+UserInfo, refresh, and confirm that both the used code and the rotated-out refresh
+token are refused a second time. It needs a client it is allowed to use, so it
+takes one from `OAUTH_STATIC_CLIENTS`:
+
+```bash
+FLOW_CLIENT_ID=my-client \
+FLOW_CLIENT_SECRET=... \
+FLOW_REDIRECT_URI=https://rp.example/callback \
+  node .github/scripts/flow.js http://127.0.0.1:3010
+```
+
+CI runs it on both databases, because single-use codes and refresh rotation are
+enforced by scoped writes — behaviour that belongs to the database, not to the
+code, and that the in-process suite only ever sees on SQLite.
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -669,15 +696,20 @@ root 运行，所以 bind mount 的目录必须先存在、并且属主为 uid 1
 域名，请启用 HTTPS 并把 `PUBLIC_BASE_URL` 改为 `https` 地址，通过
 `OAUTH_SIGNING_KEYS_JSON` 从密钥管理服务注入密钥，然后把这两项改回 `false`。
 
-切换到 PostgreSQL 时，取消 `compose.yml` 中标注行的注释，设置
-`POSTGRES_PASSWORD`，用 `--build-arg DATABASE_PROVIDER=postgresql` 重新构建，并在
-启动服务前手动执行一次迁移：
+切换到 PostgreSQL 时请改用 `compose.postgres.yml`。在 `.env` 中设置
+`POSTGRES_PASSWORD`，并在启动服务前手动执行一次迁移：
 
 ```bash
-docker compose build --build-arg DATABASE_PROVIDER=postgresql
-docker compose run --rm knight-oauth node scripts/prisma.js migrate deploy
-docker compose up -d
+echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> .env
+docker compose -f compose.postgres.yml build
+docker compose -f compose.postgres.yml run --rm knight-oauth \
+    node scripts/prisma.js migrate deploy
+docker compose -f compose.postgres.yml up -d
 ```
+
+之所以用独立文件而不是在 `compose.yml` 里"取消若干行注释"：provider 既在构建时被烤进
+镜像，又在运行时由 `DATABASE_URL` 决定，只改一半的结果是容器正常启动、discovery 正常
+应答，但凡是碰数据库的请求全部失败。
 
 PostgreSQL 默认不会在启动时自动迁移：多副本同时迁移同一数据库是真实的损坏路径。
 可用 `OAUTH_MIGRATE_ON_START=true|false` 覆盖任一方向的默认行为。
@@ -695,14 +727,32 @@ npm test               # 单元 + 集成测试
 能用一次，或者模板真的能渲染出来。
 
 CI 覆盖单台机器覆盖不到的部分：Linux 与 Windows 上分别跑 Node 22 和 24 的测试；把
-PostgreSQL 迁移应用到真实数据库并在其上启动 issuer；以及执行一次
-`docker compose up`，验证容器被销毁重建后签名密钥依然有效。其中
-`.github/scripts/probe.js` 是通过真实 HTTP 探测运行中服务的部分，可以指向任意实例，
-用第三方客户端库的视角检查它：
+PostgreSQL 迁移应用到真实数据库并在其上启动 issuer；执行一次 `docker compose up`，
+验证容器被销毁重建后签名密钥依然有效；以及两者的组合——构建、迁移并探测 PostgreSQL
+版 compose 栈，同时断言运行中的镜像确实是为 PostgreSQL 构建的，而不是悄悄回退到
+SQLite。
+
+检查由两个脚本完成，都通过真实 HTTP 打到运行中的服务。`probe.js` 只停留在无需认证的
+表面——元数据、JWKS、错误结构——因此可以指向任意实例，包括不是你自己启动的那个：
 
 ```bash
 node .github/scripts/probe.js http://127.0.0.1:3010
 ```
+
+`flow.js` 则以第三方 relying party 的视角走完整个授权码流程：注册、登录、授权同意、
+带 PKCE 交换 code、读取 UserInfo、刷新令牌，并确认用过的 code 和轮换掉的 refresh
+token 第二次都会被拒绝。它需要一个被允许使用的客户端，因此从 `OAUTH_STATIC_CLIENTS`
+中取：
+
+```bash
+FLOW_CLIENT_ID=my-client \
+FLOW_CLIENT_SECRET=... \
+FLOW_REDIRECT_URI=https://rp.example/callback \
+  node .github/scripts/flow.js http://127.0.0.1:3010
+```
+
+CI 会在两种数据库上都跑一遍：code 的一次性和 refresh 轮换是由带条件的写入保证的，
+这属于数据库的行为而不是代码的行为，而进程内的测试套件只在 SQLite 上见过它。
 
 欢迎贡献代码，见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
