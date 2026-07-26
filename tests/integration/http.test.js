@@ -81,7 +81,13 @@ describe("the HTTP surface", () => {
       OAUTH_DYNAMIC_REGISTRATION_ENABLED: "true",
       OAUTH_REGISTRATION_ACCESS_TOKEN: "registration-token-at-least-32-characters",
       OAUTH_CUSTOM_SCOPES: JSON.stringify([
-        { name: "credits.read", description: "Read your credit balance", claims: ["knight_uid"] }
+        { name: "credits.read", description: "Read your credit balance", claims: ["knight_uid"] },
+        // Restricted, so there is a scope a signed-in non-admin cannot
+        // authorize. That is the one way to reach a protocol error at
+        // /oauth2/authorize/continue rather than at /oauth2/authorize: an
+        // anonymous request is sent to the login page before the scope is ever
+        // checked, so the refusal happens on the way back.
+        { name: "ledger.admin", description: "Administer the ledger", adminOnly: true }
       ])
     });
 
@@ -116,7 +122,7 @@ describe("the HTTP surface", () => {
         clientType: "confidential",
         redirectUris: ["https://rp.example/callback"],
         postLogoutRedirectUris: ["https://rp.example/signed-out"],
-        scopes: ["openid", "profile", "email", "offline_access", "credits.read"],
+        scopes: ["openid", "profile", "email", "offline_access", "credits.read", "ledger.admin"],
         grantTypes: ["authorization_code", "refresh_token"],
         tokenEndpointAuthMethod: "client_secret_basic",
         requireConsent: true
@@ -1012,7 +1018,94 @@ describe("the HTTP surface", () => {
     assert.equal((await accounts.findById(target.id)).role, "ADMIN");
   });
 
+  it("returns a protocol error raised after sign-in to the client, not to the browser", async () => {
+    // The refusal has to reach the relying party. Rendering it on the issuer
+    // left the client with no answer at all: the user saw a page here, and the
+    // authorization request it was waiting on simply never came back.
+    //
+    // `ledger.admin` is the lever. An anonymous request is sent to the login
+    // page before the scope is checked, so the refusal happens on the way back,
+    // at /oauth2/authorize/continue — by which point the redirect_uri has been
+    // matched against the client's registrations and the error is the client's
+    // to receive.
+    const agent = request.agent(app);
+    const { challenge } = pkce();
+    const query = new URLSearchParams({
+      client_id: confidential.clientId,
+      redirect_uri: confidential.redirectUris[0],
+      response_type: "code",
+      scope: "openid ledger.admin",
+      state: "continue-error",
+      code_challenge: challenge,
+      code_challenge_method: "S256"
+    });
+
+    const started = await agent.get(`/oauth2/authorize?${query}`).expect(302);
+    const loginUrl = new URL(started.headers.location, "http://127.0.0.1:3010");
+    assert.equal(loginUrl.pathname, "/login", "an anonymous request must reach the login page first");
+    const continueUrl = loginUrl.searchParams.get("next");
+    assert.ok(continueUrl?.startsWith("/oauth2/authorize/continue"));
+
+    const page = await agent.get("/login").expect(200);
+    await agent
+      .post("/login")
+      .type("form")
+      .send({ _csrf: csrfFrom(page.text), identifier: "user@example.com", password: PASSWORD })
+      .expect(302);
+
+    // user@example.com is not an admin, so resolveAuthorization refuses the
+    // scope on this pass.
+    const refused = await agent.get(continueUrl).expect(302);
+    const target = new URL(refused.headers.location);
+    assert.equal(target.origin + target.pathname, "https://rp.example/callback", "the client was not told");
+    assert.equal(target.searchParams.get("error"), "invalid_scope");
+    assert.equal(target.searchParams.get("state"), "continue-error");
+    // RFC 9207 applies to this response like any other.
+    assert.equal(target.searchParams.get("iss"), "http://127.0.0.1:3010");
+  });
+
   // --- Dynamic client registration -----------------------------------------
+
+  it("rejects a registration with the RFC 7591 code for what was wrong with it", async () => {
+    // Section 3.2.2 gives registration its own codes, and a client branches on
+    // them the same way a token client branches on invalid_grant. Answering a
+    // well-formed document with a bad field the same way as a malformed request
+    // — `invalid_request` for both — tells the caller only that something,
+    // somewhere in twenty fields, was not right.
+    const post = (body) =>
+      request(app)
+        .post("/oauth2/register")
+        .set("authorization", "Bearer registration-token-at-least-32-characters")
+        .send(body);
+
+    const badRedirect = await post({
+      client_name: "Bad Redirect",
+      redirect_uris: ["https://rp.example/cb#fragment"]
+    }).expect(400);
+    assert.equal(badRedirect.body.error, "invalid_redirect_uri");
+
+    const noRedirect = await post({ client_name: "No Redirect", redirect_uris: [] }).expect(400);
+    assert.equal(noRedirect.body.error, "invalid_redirect_uri");
+
+    const badScope = await post({
+      client_name: "Bad Scope",
+      redirect_uris: ["https://rp.example/cb"],
+      scope: "openid not-a-registered-scope"
+    }).expect(400);
+    assert.equal(badScope.body.error, "invalid_client_metadata");
+
+    // A grant the token endpoint does not implement. Accepting it here meant a
+    // client could register for client_credentials, read it back in its own
+    // metadata, and find out at the first request that the endpoint has only
+    // two branches and neither is that one.
+    const badGrant = await post({
+      client_name: "Bad Grant",
+      redirect_uris: ["https://rp.example/cb"],
+      grant_types: ["client_credentials"]
+    }).expect(400);
+    assert.equal(badGrant.body.error, "invalid_client_metadata");
+    assert.match(badGrant.body.error_description, /client_credentials/);
+  });
 
   it("registers a client dynamically and manages it with the returned token", async () => {
     // RFC 7591 and 7592. This is what an off-the-shelf client that self-registers

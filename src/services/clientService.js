@@ -2,7 +2,15 @@
 
 const { hashToken, randomId, randomToken, verifyTokenHash } = require("../lib/crypto");
 const { decodeScopes, decodeUris, encodeScopes, encodeUris } = require("../lib/lists");
-const { appError, invalidClient, invalidRequest, invalidToken, unauthorizedClient } = require("../lib/errors");
+const {
+  appError,
+  invalidClient,
+  invalidClientMetadata,
+  invalidRedirectUri,
+  invalidRequest,
+  invalidToken,
+  unauthorizedClient
+} = require("../lib/errors");
 const { findMatchingRedirectUri, parseHttpsUrl, parseRedirectUri } = require("../lib/uri");
 
 // Registered relying parties.
@@ -32,16 +40,29 @@ const { findMatchingRedirectUri, parseHttpsUrl, parseRedirectUri } = require("..
 const AUTH_METHODS = new Set(["client_secret_basic", "client_secret_post", "none"]);
 const CLIENT_TYPES = new Set(["confidential", "public"]);
 const STATUS = { PENDING: "PENDING", APPROVED: "APPROVED", REJECTED: "REJECTED", DISABLED: "DISABLED" };
-const GRANT_TYPES = new Set(["authorization_code", "refresh_token", "client_credentials"]);
+// What registration accepts has to be what the token endpoint implements.
+//
+// `client_credentials` was accepted here, and rejected at the token endpoint —
+// `unsupported_grant_type`, from the only two branches `token` actually has —
+// and discovery never advertised it either. A client could register for it,
+// see the grant echoed back in its own metadata, and discover at the first
+// request that it was never going to work. Registering for a capability is a
+// promise; this is the list of promises the server can keep.
+const GRANT_TYPES = new Set(["authorization_code", "refresh_token"]);
 const RESPONSE_TYPES = new Set(["code"]);
 
 const MAX_REDIRECT_URIS = 20;
 const MAX_NAME_LENGTH = 120;
 
+// Every rejection below is a complaint about one field of a client metadata
+// document, which is what RFC 7591 section 3.2.2 gives `invalid_client_metadata`
+// and `invalid_redirect_uri` for. `invalid_request` is the code for a malformed
+// request, and answering a well-formed document with a bad `scope` the same way
+// as a truncated body tells a registration client nothing it can act on.
 function text(value, maximum, name, { required = false } = {}) {
   const raw = String(value ?? "").trim();
-  if (required && !raw) throw invalidRequest(`${name} is required`);
-  if (raw.length > maximum) throw invalidRequest(`${name} is too long`);
+  if (required && !raw) throw invalidClientMetadata(`${name} is required`);
+  if (raw.length > maximum) throw invalidClientMetadata(`${name} is too long`);
   return raw;
 }
 
@@ -95,11 +116,23 @@ function createClientService({ prisma, config, scopeRegistry, auditLog, now = ()
   function normalizeRedirectUris(value, { name = "redirect_uris", required = true } = {}) {
     const raw = Array.isArray(value) ? value : decodeUris(String(value || "").replaceAll("\r\n", "\n"));
     const entries = [...new Set(raw.map((entry) => String(entry || "").trim()).filter(Boolean))];
-    if (required && !entries.length) throw invalidRequest(`${name} is required`);
-    if (entries.length > MAX_REDIRECT_URIS) throw invalidRequest(`${name} has too many entries`);
+    if (required && !entries.length) throw invalidRedirectUri(`${name} is required`);
+    if (entries.length > MAX_REDIRECT_URIS) throw invalidRedirectUri(`${name} has too many entries`);
     // parseRedirectUri is what allows loopback http and private-use schemes, so a
     // native or desktop app can register here at all.
-    return entries.map((entry) => parseRedirectUri(entry, { allowInsecureHttp, name }));
+    //
+    // Its own rejections are re-coded rather than re-worded: it is shared with
+    // paths that are not registration, so the RFC 7591 code belongs here, where
+    // the value is known to have come from a client metadata document. The
+    // message it wrote is the useful half and is kept.
+    return entries.map((entry) => {
+      try {
+        return parseRedirectUri(entry, { allowInsecureHttp, name });
+      } catch (error) {
+        if (error?.isProtocolError) throw invalidRedirectUri(error.message);
+        throw error;
+      }
+    });
   }
 
   /**
@@ -116,23 +149,18 @@ function createClientService({ prisma, config, scopeRegistry, auditLog, now = ()
     const selected = entries.length ? entries : fallback;
     const unknown = selected.filter((scope) => !scopeRegistry.has(scope));
     if (unknown.length) {
-      throw invalidRequest(`Unknown scope: ${unknown.join(", ")}`);
+      throw invalidClientMetadata(`Unknown scope: ${unknown.join(", ")}`);
     }
     return scopeRegistry.sort(selected);
   }
 
-  function normalizeGrantTypes(value, { clientType }) {
+  function normalizeGrantTypes(value) {
     const raw = Array.isArray(value) ? value : String(value || "").split(/[\s,]+/);
     const entries = [...new Set(raw.map((entry) => String(entry || "").trim()).filter(Boolean))];
     const selected = entries.length ? entries : ["authorization_code", "refresh_token"];
     for (const grant of selected) {
       if (!GRANT_TYPES.has(grant)) {
-        throw invalidRequest(`Unsupported grant type: ${grant}`);
-      }
-      // client_credentials authenticates the client itself, which a client with
-      // no secret cannot do.
-      if (grant === "client_credentials" && clientType === "public") {
-        throw invalidRequest("A public client cannot use the client_credentials grant");
+        throw invalidClientMetadata(`Unsupported grant type: ${grant}`);
       }
     }
     return selected;
@@ -141,13 +169,13 @@ function createClientService({ prisma, config, scopeRegistry, auditLog, now = ()
   function normalizeAuthMethod(value, { clientType }) {
     const method = String(value || "").trim() || (clientType === "public" ? "none" : "client_secret_basic");
     if (!AUTH_METHODS.has(method)) {
-      throw invalidRequest(`Unsupported token_endpoint_auth_method: ${method}`);
+      throw invalidClientMetadata(`Unsupported token_endpoint_auth_method: ${method}`);
     }
     if (clientType === "public" && method !== "none") {
-      throw invalidRequest("A public client must use token_endpoint_auth_method=none");
+      throw invalidClientMetadata("A public client must use token_endpoint_auth_method=none");
     }
     if (clientType === "confidential" && method === "none") {
-      throw invalidRequest("A confidential client must authenticate at the token endpoint");
+      throw invalidClientMetadata("A confidential client must authenticate at the token endpoint");
     }
     return method;
   }
@@ -155,7 +183,7 @@ function createClientService({ prisma, config, scopeRegistry, auditLog, now = ()
   /** Builds the row for a create or update, validating every field. */
   function buildClientData(input, { existing = null } = {}) {
     const clientType = String(input.clientType || existing?.clientType || "confidential").trim();
-    if (!CLIENT_TYPES.has(clientType)) throw invalidRequest("client_type must be confidential or public");
+    if (!CLIENT_TYPES.has(clientType)) throw invalidClientMetadata("client_type must be confidential or public");
 
     const responseTypes = Array.isArray(input.responseTypes) ? input.responseTypes : [];
     for (const responseType of responseTypes) {
@@ -163,7 +191,7 @@ function createClientService({ prisma, config, scopeRegistry, auditLog, now = ()
         // The implicit and hybrid flows return tokens through the browser's URL,
         // where they land in history and referrers. Current OAuth 2.0 Security
         // BCP guidance is not to use them, so only `code` is implemented.
-        throw invalidRequest(`Unsupported response type: ${responseType}. Only "code" is supported.`);
+        throw invalidClientMetadata(`Unsupported response type: ${responseType}. Only "code" is supported.`);
       }
     }
 
@@ -197,7 +225,7 @@ function createClientService({ prisma, config, scopeRegistry, auditLog, now = ()
         normalizeScopes(input.scopes ?? decodeScopes(existing?.allowedScopes))
       ),
       allowedGrantTypes: encodeScopes(
-        normalizeGrantTypes(input.grantTypes ?? decodeScopes(existing?.allowedGrantTypes), { clientType })
+        normalizeGrantTypes(input.grantTypes ?? decodeScopes(existing?.allowedGrantTypes))
       ),
       tokenEndpointAuthMethod: normalizeAuthMethod(
         input.tokenEndpointAuthMethod ?? existing?.tokenEndpointAuthMethod,
