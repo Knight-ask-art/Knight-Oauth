@@ -3,7 +3,7 @@
 const path = require("node:path");
 
 const { SUPPORTED_ALGORITHMS, DEFAULT_ALGORITHM } = require("../lib/jwt");
-const { RESERVED_CLAIMS, STANDARD_SCOPES } = require("../lib/scopes");
+const { ACCOUNT_CLAIMS, RESERVED_CLAIMS, STANDARD_SCOPES } = require("../lib/scopes");
 const { normalizeIssuer, parseHttpsUrl } = require("../lib/uri");
 const { ROOT: PROJECT_ROOT } = require("./dotenv");
 
@@ -449,6 +449,17 @@ function loadEnv(source = process.env) {
       if (RESERVED_CLAIMS.has(claim)) {
         throw new Error(
           `OAUTH_CUSTOM_SCOPES entry "${scope.name}" may not define the reserved claim "${claim}"`
+        );
+      }
+      // A custom scope's values are read from the account's `attributes` map,
+      // which an external identity provider rewrites on every login. Letting one
+      // declare `email_verified` would hand every relying party a verified
+      // address that nobody verified. The standard `email` and `profile` scopes
+      // are how these are released, and they read the account record instead.
+      if (ACCOUNT_CLAIMS.has(claim)) {
+        throw new Error(
+          `OAUTH_CUSTOM_SCOPES entry "${scope.name}" may not define "${claim}": it is asserted from the account record. ` +
+            "Use the standard scope that releases it."
         );
       }
     }

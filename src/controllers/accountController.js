@@ -229,10 +229,17 @@ function createAccountController({ config, accounts, sessions, provider, clients
       });
 
       if (!result.ok) {
+        // `disabled` gets its own message rather than falling into "not valid".
+        // The holder of this link proved control of the address, so telling
+        // them the account is disabled reveals nothing they could not already
+        // learn from the sign-in page — and "that link is not valid" would send
+        // them to ask for another one that will fail the same way.
         const message =
           result.reason === "expired_token"
             ? "That link has expired. Ask for a new one."
-            : "That link is not valid. It may already have been used.";
+            : result.reason === "disabled"
+              ? "That account has been disabled. Contact the operator of this server."
+              : "That link is not valid. It may already have been used.";
         return res.status(400).render("reset-password", {
           branding,
           title: "Choose a new password",
@@ -282,7 +289,9 @@ function createAccountController({ config, accounts, sessions, provider, clients
           message:
             result.reason === "expired_token"
               ? "The link has expired. Sign in to ask for a new one."
-              : "The link is not valid, or it has already been used.",
+              : result.reason === "disabled"
+                ? "That account has been disabled. Contact the operator of this server."
+                : "The link is not valid, or it has already been used.",
           actionUrl: "/login",
           actionLabel: "Sign in"
         });

@@ -413,4 +413,70 @@ describe("local accounts and external identity", () => {
     const reloaded = await accounts.findById(account.id);
     assert.equal(reloaded.status, "DISABLED");
   });
+
+  it("burns an outstanding reset link when the password changes another way", async () => {
+    // The sequence this closes: someone with brief access to the mailbox
+    // requests a reset, takes the link, and deletes the mail. The account holder
+    // notices and does the textbook thing — signs in and changes their password.
+    // That killed every session and refresh token and left the attacker's link
+    // untouched, still unused and valid for the rest of its hour. Using it then
+    // locks the holder back out, from a remedy they had already applied.
+    sentMail.length = 0;
+    const account = await accounts.register({
+      email: "outstanding@example.com",
+      password: "a-long-enough-password-here"
+    });
+    await accounts.requestPasswordReset({ email: "outstanding@example.com" });
+    const link = sentMail.find((entry) => entry.kind === "reset");
+    assert.ok(link?.token, "no reset link was issued");
+
+    await accounts.changePassword({
+      userId: account.account.id,
+      currentPassword: "a-long-enough-password-here",
+      newPassword: "a-different-long-password"
+    });
+
+    const used = await accounts.resetPassword({ token: link.token, password: "attacker-chosen-password" });
+    assert.equal(used.ok, false, "the reset link outlived the password change it should have been ended by");
+    assert.equal(
+      (await accounts.authenticate({
+        identifier: "outstanding@example.com",
+        password: "a-different-long-password"
+      })).ok,
+      true,
+      "the password the holder actually chose must still be the one that works"
+    );
+  });
+
+  it("will not let a disabled account re-enable itself with a link from before", async () => {
+    // Both writes used to set `status: ACTIVE` unconditionally, so a reset or
+    // verification link issued while the account was usable was also a way back
+    // in after an administrator disabled it — and the reset controller signs the
+    // caller in immediately afterwards.
+    sentMail.length = 0;
+    const created = await accounts.register({
+      email: "disabled-later@example.com",
+      password: "a-long-enough-password-here"
+    });
+    await accounts.requestPasswordReset({ email: "disabled-later@example.com" });
+    const reset = sentMail.find((entry) => entry.kind === "reset");
+    const verify = sentMail.find((entry) => entry.kind === "verify");
+    assert.ok(reset?.token && verify?.token, "both kinds of link are needed for this");
+
+    // Disabled by writing the row, not through setStatus — that revokes
+    // credentials, which now burns both links, and the point here is the guard
+    // that refuses a link which *did* survive. A row disabled by an older
+    // build, or by an operator reaching for SQL, is exactly that case.
+    await prisma.user.update({ where: { id: created.account.id }, data: { status: "DISABLED" } });
+
+    const viaReset = await accounts.resetPassword({ token: reset.token, password: "a-brand-new-password-x" });
+    assert.equal(viaReset.ok, false);
+    assert.equal(viaReset.reason, "disabled");
+
+    const viaVerify = await accounts.verifyEmail(verify.token);
+    assert.equal(viaVerify.ok, false);
+    assert.equal(viaVerify.reason, "disabled");
+
+    assert.equal((await accounts.findById(created.account.id)).status, "DISABLED", "the account let itself back in");
+  });
 });

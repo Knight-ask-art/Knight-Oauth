@@ -399,6 +399,14 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
     if (!record || record.usedAt) return { ok: false, reason: "invalid_token", account: null };
     if (record.expiresAt <= now()) return { ok: false, reason: "expired_token", account: null };
 
+    // Same rule as resetPassword, and the window here is longer: a verification
+    // link lives 24 hours, so "issued while active, opened after an
+    // administrator disabled the account" is not a narrow race.
+    const holder = await prisma.user.findUnique({ where: { id: record.userId } });
+    if (!holder || holder.status === STATUS.DISABLED) {
+      return { ok: false, reason: "disabled", account: null };
+    }
+
     const timestamp = now();
     // Marking the token used is scoped to `usedAt: null` so two concurrent
     // requests cannot both consume it.
@@ -412,7 +420,9 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
       where: { id: record.userId },
       data: {
         emailVerifiedAt: timestamp,
-        status: STATUS.ACTIVE
+        // Confirming an address promotes a PENDING account. It is not a reason
+        // to move one out of any other state.
+        status: holder.status === STATUS.PENDING ? STATUS.ACTIVE : holder.status
       }
     });
     await auditLog?.record({
@@ -491,6 +501,17 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
     if (!record || record.usedAt) return { ok: false, reason: "invalid_token", account: null };
     if (record.expiresAt <= now()) return { ok: false, reason: "expired_token", account: null };
 
+    // Checked before the token is spent, so a refusal does not also consume the
+    // link. An administrator disabling an account has to outrank a reset that
+    // was issued while it was still active: the write below used to set
+    // `status: ACTIVE` unconditionally, so a disabled user could re-enable
+    // themselves by opening a link from before — and submitResetPassword signs
+    // them in immediately afterwards.
+    const holder = await prisma.user.findUnique({ where: { id: record.userId } });
+    if (!holder || holder.status === STATUS.DISABLED) {
+      return { ok: false, reason: "disabled", account: null };
+    }
+
     const newPassword = assertValidPassword(password, { minLength: minPasswordLength });
     const passwordHash = await hashPassword(newPassword);
     const timestamp = now();
@@ -508,7 +529,10 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
         // Completing a reset proves control of the address, so it doubles as
         // email verification.
         emailVerifiedAt: timestamp,
-        status: STATUS.ACTIVE
+        // Promotes a PENDING account and leaves anything else where it is.
+        // DISABLED cannot reach here — it was refused above — and writing
+        // ACTIVE unconditionally is what made that reachable in the first place.
+        status: holder.status === STATUS.PENDING ? STATUS.ACTIVE : holder.status
       }
     });
 
@@ -584,6 +608,25 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
       data: { revokedAt: timestamp, revocationReason: reason }
     });
     await prisma.session.deleteMany({ where: { userId } });
+
+    // Outstanding reset and verification links are credentials too, and leaving
+    // them alive let a reset survive the remedy for it.
+    //
+    // The sequence this closes: an attacker with brief access to the mailbox
+    // requests a reset, takes the link, and deletes the mail. The user notices
+    // and does the textbook thing — signs in and changes their password. That
+    // killed every session and refresh token and left the attacker's link
+    // untouched, still unused and valid for the rest of its hour, and using it
+    // locks the user back out. A 24-hour verification link had the same
+    // property.
+    await prisma.passwordResetToken.updateMany({
+      where: { userId, usedAt: null },
+      data: { usedAt: timestamp }
+    });
+    await prisma.emailVerificationToken.updateMany({
+      where: { userId, usedAt: null },
+      data: { usedAt: timestamp }
+    });
   }
 
   // --- Profile and administration -----------------------------------------

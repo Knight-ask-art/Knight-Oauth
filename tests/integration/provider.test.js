@@ -644,6 +644,107 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     );
   });
 
+  it("revokes and audits a replay that arrives as a race rather than as a repeat", async () => {
+    // Two places discover a spent code, and only one of them used to act on it.
+    //
+    // The test above hits the pre-read: by the time the second request looked,
+    // the row already carried `usedAt`. An attacker holding a stolen code does
+    // not wait — they race the real client, so both requests read `usedAt: null`
+    // and the conditional update picks a winner. The loser used to get a bare
+    // invalid_grant with nothing revoked and nothing audited, which meant the
+    // detection was missing from exactly the case it exists for.
+    //
+    // The race is made deterministic by spending the code between this
+    // request's read and its update, which is what the other request would do.
+    const raced = (client) => {
+      const codes = new Proxy(client.authorizationCode, {
+        get(target, prop) {
+          if (prop !== "findUnique") {
+            const value = target[prop];
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return async (args) => {
+            const row = await target.findUnique(args);
+            if (row && !row.usedAt) {
+              await target.updateMany({ where: { id: row.id, usedAt: null }, data: { usedAt: new Date() } });
+            }
+            // The snapshot this request read, before the other one landed.
+            return row;
+          };
+        }
+      });
+      return new Proxy(client, {
+        get(target, prop) {
+          if (prop === "authorizationCode") return codes;
+          const value = target[prop];
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    };
+
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+
+    // A live token for this session and client, which is what the revocation
+    // has to reach.
+    const first = await authorize({ scope: "openid offline_access" });
+    const issued = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: first.code,
+        redirect_uri: first.redirectUri,
+        code_verifier: first.verifier
+      }
+    });
+    assert.ok(issued.refresh_token);
+
+    const racingProvider = createProviderService({
+      prisma: raced(prisma),
+      config,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {}, warn() {}, info() {} } })
+    });
+
+    const before = await prisma.auditLog.count({ where: { action: "oauth.code.replayed" } });
+
+    const second = await authorize({ scope: "openid" });
+    await assert.rejects(
+      racingProvider.token({
+        headers,
+        body: {
+          grant_type: "authorization_code",
+          code: second.code,
+          redirect_uri: second.redirectUri,
+          code_verifier: second.verifier
+        }
+      }),
+      (error) => {
+        assert.equal(error.code, "invalid_grant");
+        return true;
+      }
+    );
+
+    assert.equal(
+      await prisma.auditLog.count({ where: { action: "oauth.code.replayed" } }),
+      before + 1,
+      "losing the race for a code is a replay, and an operator has to be able to see it"
+    );
+
+    // The point of the revocation: whatever the first redemption produced is
+    // no longer usable, because a code being redeemed twice means it leaked.
+    await assert.rejects(
+      provider.token({
+        headers,
+        body: { grant_type: "refresh_token", refresh_token: issued.refresh_token }
+      }),
+      /revoked|not valid|session has been ended/
+    );
+  });
+
   it("rejects a code redeemed by a different client", async () => {
     const flow = await authorize({ scope: "openid" });
     const other = await clients.create(
@@ -939,6 +1040,47 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
       }
     });
     await assert.rejects(provider.userinfo({ accessToken: tokens.id_token }), (error) => {
+      assert.equal(error.code, "invalid_token");
+      return true;
+    });
+  });
+
+  it("stops answering UserInfo once the session behind the token has been ended", async () => {
+    // An access token is a self-contained JWT, so a resource server checking it
+    // offline cannot know it was revoked. That is a real trade-off and the
+    // README makes it. This endpoint is not covered by it: it belongs to the
+    // issuer, it is already reading the database for the account, and `sid` is
+    // in the claims it just verified.
+    //
+    // Without the check, a user who ends a device from /account is shown that
+    // it is signed out while the token taken from it keeps returning their
+    // email and name for the rest of its lifetime — and the same token handed
+    // to introspection came back inactive, so the issuer disagreed with itself
+    // about one token.
+    const flow = await authorize({ scope: "openid profile email" });
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+
+    const before = await provider.userinfo({ accessToken: tokens.access_token });
+    assert.equal(before.email, "owner@example.com", "the token has to work before it is revoked");
+
+    await provider.endSessions({ sessionId: session.id, userId: account.id, reason: "user_revoked" });
+
+    const introspected = await provider.introspect({
+      headers,
+      body: { token: tokens.access_token }
+    });
+    assert.equal(introspected.active, false, "introspection already reported this");
+
+    await assert.rejects(provider.userinfo({ accessToken: tokens.access_token }), (error) => {
       assert.equal(error.code, "invalid_token");
       return true;
     });
