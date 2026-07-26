@@ -98,6 +98,20 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
   const registrationEnabled = config?.accounts?.registrationEnabled !== false;
   const firstUserIsAdmin = config?.accounts?.firstUserIsAdmin !== false;
 
+  // Prisma compiles `contains` to LIKE, and the two supported databases do not
+  // agree on what that means: SQLite's LIKE folds case for ASCII, PostgreSQL's
+  // does not. Left alone, an administrator searching "smith" finds "Alice Smith"
+  // on SQLite and nothing on PostgreSQL — the same query, two answers, and only
+  // the SQLite one is covered by the suite.
+  //
+  // `mode: "insensitive"` is how PostgreSQL is told to fold case, and it is added
+  // only there: Prisma accepts the field on PostgreSQL alone and rejects it as an
+  // unknown argument elsewhere, so sending it unconditionally would turn a wrong
+  // result into a failed query. SQLite needs nothing, because its LIKE already
+  // behaves the way this spreads to.
+  const caseInsensitive =
+    config?.database?.provider === "postgresql" ? { mode: "insensitive" } : {};
+
   /** Shape handed to the rest of the app. `attributes` is what custom scopes read. */
   function toAccount(record) {
     if (!record) return null;
@@ -630,12 +644,16 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
 
   async function list({ take = 50, skip = 0, query = "" } = {}) {
     const search = String(query || "").trim();
+    // The email term stays lowercased even with the flag above. Addresses are
+    // stored normalized, so folding the term is what makes the match exact
+    // rather than merely case-insensitive, and it keeps working if a row
+    // predates normalizeEmail.
     const where = search
       ? {
           OR: [
-            { email: { contains: search.toLowerCase() } },
-            { username: { contains: search } },
-            { name: { contains: search } }
+            { email: { contains: search.toLowerCase(), ...caseInsensitive } },
+            { username: { contains: search, ...caseInsensitive } },
+            { name: { contains: search, ...caseInsensitive } }
           ]
         }
       : {};

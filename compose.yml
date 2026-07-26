@@ -5,18 +5,24 @@
 # That is the whole thing: SQLite, a signing key generated on first boot, and a
 # working issuer on http://127.0.0.1:3010. No .env is required.
 #
-# For PostgreSQL, uncomment the `postgres` service at the bottom and the four
-# marked lines in this one.
+# For PostgreSQL, use compose.postgres.yml instead of this file. It is a separate
+# file rather than a block to uncomment here, because the uncomment-these-lines
+# version could be half-applied and a half-applied database switch is a service
+# that starts and then fails every request that touches a table.
 
 services:
   knight-oauth:
     build:
       context: .
       # The Prisma client is generated for one provider at build time, because
-      # Prisma cannot read the datasource provider from the environment. Switching
-      # to PostgreSQL means rebuilding with this set to postgresql.
+      # Prisma cannot read the datasource provider from the environment.
+      #
+      # Read from the environment rather than pinned to the literal, so the
+      # baked-in provider always matches what DATABASE_URL points at. Pinned, a
+      # single `docker compose up --build` silently rebuilds the image against
+      # SQLite regardless of how it was first built with --build-arg.
       args:
-        DATABASE_PROVIDER: sqlite
+        DATABASE_PROVIDER: ${DATABASE_PROVIDER:-sqlite}
     image: knight-oauth:local
     restart: unless-stopped
 
@@ -63,9 +69,6 @@ services:
       # is exposed directly: with no proxy in front, a client can spoof its own
       # address past the rate limiter.
       TRUST_PROXY: ${TRUST_PROXY:-false}
-      # --- PostgreSQL: uncomment these two, comment out DATABASE_URL above -----
-      # DATABASE_PROVIDER: postgresql
-      # DATABASE_URL: postgresql://knight_oauth:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/knight_oauth
 
     ports:
       # Bound to the loopback address deliberately. OAuth over plaintext http
@@ -125,11 +128,6 @@ services:
       start_period: 40s
       retries: 3
 
-    # --- PostgreSQL: uncomment to wait for the database -----------------------
-    # depends_on:
-    #   postgres:
-    #     condition: service_healthy
-
 volumes:
   # The SQLite database and the signing key inside it. Declared here so Docker
   # owns its lifecycle: `docker compose down` keeps it and tokens survive, while
@@ -137,38 +135,3 @@ volumes:
   # unverifiable. Inspect the path with `docker volume inspect
   # knight-oauth_knight-oauth-data`.
   knight-oauth-data:
-
-# --- PostgreSQL ------------------------------------------------------------
-# Uncomment this service, uncomment the marked lines above, set POSTGRES_PASSWORD
-# in .env, then rebuild with:
-#
-#   docker compose build --build-arg DATABASE_PROVIDER=postgresql
-#   docker compose run --rm knight-oauth node scripts/prisma.js migrate deploy
-#   docker compose up -d
-#
-# The migration step is explicit rather than part of startup: applying schema
-# changes automatically on boot means several replicas racing to migrate the same
-# database.
-#
-# Add `postgres-data:` to the `volumes:` block above — it already exists, so do
-# not start a second one.
-#
-# services:
-#   postgres:
-#     image: postgres:17-alpine
-#     restart: unless-stopped
-#     environment:
-#       POSTGRES_DB: knight_oauth
-#       POSTGRES_USER: knight_oauth
-#       # No default. A database holding password hashes and signing keys must not
-#       # come up with a password that is published in this file.
-#       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-#     volumes:
-#       - postgres-data:/var/lib/postgresql/data
-#     # Not published. Only the service above needs to reach it, and exposing a
-#     # database port to the host is how one ends up reachable from the network.
-#     healthcheck:
-#       test: ["CMD-SHELL", "pg_isready -U knight_oauth -d knight_oauth"]
-#       interval: 10s
-#       timeout: 5s
-#       retries: 5

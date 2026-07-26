@@ -22,4 +22,4 @@ npm-debug.log*
 
 # Documentation, which does not affect the build.
 *.md
-compose.yml
+compose*.yml
