@@ -1,7 +1,6 @@
 "use strict";
 
 const { randomToken, safeEqual } = require("../lib/crypto");
-const { SESSION_COOKIE } = require("../services/sessionService");
 
 // Sign-in through an external identity provider.
 //
@@ -47,7 +46,12 @@ function createExternalController({ config, external, sessions, accounts, logger
       ipAddress: req.ip,
       userAgent: req.get("user-agent")
     });
-    res.cookie(SESSION_COOKIE, sid, sessions.cookieOptions(maxAgeMs));
+    // `sessions.cookieName`, not the bare constant: an https issuer uses the
+    // `__Host-` prefixed spelling, and writing the unprefixed one here would set
+    // a cookie the session middleware does not read — so the state parked in it
+    // would be gone by the time the upstream handed the browser back, and no
+    // external sign-in would ever complete.
+    res.cookie(sessions.cookieName, sid, sessions.cookieOptions(maxAgeMs));
     req.sid = sid;
     req.session = session;
     return session;
