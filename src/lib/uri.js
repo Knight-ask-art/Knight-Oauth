@@ -233,8 +233,13 @@ function parseHttpsUrl(value, name, { required = false, allowHttp = false, block
   // `http://127.0.0.1:9200/anything` unconditionally, including in production
   // with allowInsecureHttp off.
   if (blockPrivateNetwork && isPrivateNetworkHost(url.hostname)) {
+    // The switch is named in the message on purpose. A static client carrying
+    // such a URL fails the boot, by way of "OAUTH_STATIC_CLIENTS could not be
+    // imported", and an operator reading that needs the next step in the same
+    // line rather than in a file they have not opened yet.
     throw invalidRequest(
-      `${name} must not point at a loopback, link-local, or private address: the issuer requests it from inside your network`
+      `${name} must not point at a loopback, link-local, or private address: the issuer requests it from inside ` +
+        "its own network. Set OAUTH_BACKCHANNEL_ALLOW_PRIVATE_NETWORK=true if that is deliberate."
     );
   }
   const httpAllowed = allowHttp || isLoopbackHost(url.hostname);
