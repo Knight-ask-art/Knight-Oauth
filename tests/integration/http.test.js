@@ -738,6 +738,71 @@ describe("the HTTP surface", () => {
     assert.equal(unavailable.body.status, "unavailable");
   });
 
+  it("names its cookies __Host- when the issuer is https, and not when it is not", async () => {
+    // This suite runs against http://127.0.0.1, where the prefix is illegal —
+    // a `__Host-` cookie must be Secure — so every other test here exercises
+    // the unprefixed path. Asserting the prefix therefore needs an app built
+    // for an https issuer, or the change would be untested on the only side
+    // that has the problem.
+    //
+    // What the prefix buys: a browser rejects a cookie carrying it if the
+    // Set-Cookie has a Domain attribute. Without that rule, any host under the
+    // same registrable domain — a user-content subdomain, a dangling CNAME, an
+    // XSS on app.example.com while the issuer is auth.example.com — can send
+    // `koauth_csrf=KNOWN; Domain=example.com; Path=/account/password`, and RFC
+    // 6265 section 5.4 serialises the longer path first. A double-submit token
+    // an attacker can write is not a defence, and what is left is SameSite=Lax
+    // alone, which csrf.js says in its own comment cannot be the only layer.
+    const quiet = { error() {}, warn() {}, info() {} };
+    const secureApp = createApp({
+      env: loadEnv({
+        PUBLIC_BASE_URL: "https://issuer.example",
+        OAUTH_ALLOW_GENERATED_KEYS: "true"
+      }),
+      prisma: db.prisma,
+      logger: quiet,
+      mailer: {
+        sendEmailVerification: async () => {},
+        sendPasswordReset: async () => {},
+        sendExistingAccountNotice: async () => {}
+      },
+      auditLog: createAuditService({ prisma: db.prisma, logger: quiet })
+    });
+
+    const secure = await request(secureApp).get("/login").expect(200);
+    const setCookies = secure.headers["set-cookie"] || [];
+    const csrf = setCookies.find((cookie) => cookie.startsWith("__Host-koauth_csrf="));
+    assert.ok(csrf, `no __Host- CSRF cookie was set: ${JSON.stringify(setCookies)}`);
+
+    // The three the prefix requires, which the browser checks and which this
+    // code already satisfied — the name is what makes them enforceable.
+    assert.match(csrf, /;\s*Secure/i, "a __Host- cookie must be Secure");
+    assert.match(csrf, /;\s*Path=\/(;|$)/i, "a __Host- cookie must have Path=/");
+    assert.doesNotMatch(csrf, /;\s*Domain=/i, "a __Host- cookie must carry no Domain");
+
+    assert.ok(
+      !setCookies.some((cookie) => cookie.startsWith("koauth_csrf=")),
+      "the unprefixed name was set alongside, which would leave the plantable one in play"
+    );
+
+    // And the other direction: on http the prefix is illegal, so a browser
+    // would discard the cookie and nobody could sign in.
+    const plain = await request(app).get("/login").expect(200);
+    const plainCookies = plain.headers["set-cookie"] || [];
+    assert.ok(
+      plainCookies.some((cookie) => cookie.startsWith("koauth_csrf=")),
+      "an http issuer must keep the bare name"
+    );
+    assert.ok(!plainCookies.some((cookie) => cookie.startsWith("__Host-")));
+
+    // The session cookie gets the same treatment. Asserted on the service
+    // rather than over the wire because a Secure cookie is not carried by an
+    // http round trip, and mounting a TLS listener to check a cookie name would
+    // be a lot of machinery for one string.
+    assert.equal(secureApp.locals.services.sessions.cookieName, "__Host-koauth_session");
+    assert.equal(app.locals.services.sessions.cookieName, "koauth_session");
+  });
+
   it("meters only paths that a route actually serves", async () => {
     // A rule naming a path nothing is mounted at is silently dead: no error, no
     // warning, just a limit that never applies. That is the same shape as the

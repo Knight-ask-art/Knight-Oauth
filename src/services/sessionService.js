@@ -18,7 +18,22 @@ const { decodeJson, encodeJson } = require("../lib/lists");
 // change: logging in issues a new one and destroys the old, so a value planted
 // before authentication is worthless after it.
 
+// Two names for one cookie, and which is used depends on the scheme.
+//
+// `__Host-` is a browser-enforced contract, not decoration (RFC 6265bis section
+// 4.1.3.2): a cookie whose name carries it is rejected unless it is Secure, has
+// Path=/, and has *no* Domain attribute. The last one is the point. Without it,
+// anything under the same registrable domain — a user-content subdomain, a
+// dangling CNAME, an XSS on app.example.com while the issuer is on
+// auth.example.com — can send `Set-Cookie: koauth_session=...; Domain=example.com;
+// Path=/account/password`, and RFC 6265 section 5.4 has the browser serialise
+// the longer path first, so the planted value is the one this server reads.
+//
+// The prefix is only legal on Secure cookies, so a local http deployment keeps
+// the bare name — where the attack needs a sibling host on the same domain that
+// http://127.0.0.1 does not have.
 const SESSION_COOKIE = "koauth_session";
+const SESSION_COOKIE_SECURE = `__Host-${SESSION_COOKIE}`;
 
 function createSessionService({ prisma, config, auditLog, now = () => new Date() } = {}) {
   const defaultTtlSeconds = config?.ttl?.sessionSeconds ?? 24 * 60 * 60;
@@ -27,6 +42,7 @@ function createSessionService({ prisma, config, auditLog, now = () => new Date()
   // deployment on https gets it, and a local http deployment must not, or the
   // browser silently discards the cookie and nobody can log in.
   const secureCookies = String(config?.publicBaseUrl || "").startsWith("https:");
+  const cookieName = secureCookies ? SESSION_COOKIE_SECURE : SESSION_COOKIE;
 
   function cookieOptions(maxAgeMs) {
     return {
@@ -40,6 +56,16 @@ function createSessionService({ prisma, config, auditLog, now = () => new Date()
       path: "/",
       maxAge: maxAgeMs
     };
+  }
+
+  /**
+   * Clears both spellings. The unprefixed one is never read once the prefixed
+   * one is in use, but leaving it in the browser until it expires would be
+   * untidy at best and confusing to anyone reading their own cookie jar.
+   */
+  function clearSessionCookie(res) {
+    res?.clearCookie?.(cookieName, { path: "/" });
+    if (secureCookies) res?.clearCookie?.(SESSION_COOKIE, { path: "/" });
   }
 
   function toSession(record) {
@@ -104,7 +130,7 @@ function createSessionService({ prisma, config, auditLog, now = () => new Date()
       await prisma.session.deleteMany({ where: { sidHash: hashToken(currentSid) } });
     }
     const { sid, session, maxAgeMs } = await create({ userId, remember, ipAddress, userAgent });
-    res?.cookie?.(SESSION_COOKIE, sid, cookieOptions(maxAgeMs));
+    res?.cookie?.(cookieName, sid, cookieOptions(maxAgeMs));
     return { sid, session };
   }
 
@@ -120,7 +146,7 @@ function createSessionService({ prisma, config, auditLog, now = () => new Date()
   async function logout({ res, sid, reason = "user_logout" } = {}) {
     const raw = String(sid || "").trim();
     if (!raw) {
-      res?.clearCookie?.(SESSION_COOKIE, { path: "/" });
+      clearSessionCookie(res);
       return { loggedOut: false, sessionId: null };
     }
     const sidHash = hashToken(raw);
@@ -141,7 +167,7 @@ function createSessionService({ prisma, config, auditLog, now = () => new Date()
       });
     }
 
-    res?.clearCookie?.(SESSION_COOKIE, { path: "/" });
+    clearSessionCookie(res);
     return { loggedOut: Boolean(record), sessionId: record?.id || null };
   }
 
@@ -174,7 +200,7 @@ function createSessionService({ prisma, config, auditLog, now = () => new Date()
       where: { id: session.id },
       data: { expiresAt }
     });
-    res?.cookie?.(SESSION_COOKIE, sid, cookieOptions(ttlSeconds * 1000));
+    res?.cookie?.(cookieName, sid, cookieOptions(ttlSeconds * 1000));
     return toSession(record);
   }
 
@@ -213,6 +239,8 @@ function createSessionService({ prisma, config, auditLog, now = () => new Date()
 
   return {
     SESSION_COOKIE,
+    /** The name actually in use, which depends on whether the issuer is https. */
+    cookieName,
     cookieOptions,
     create,
     find,
@@ -226,4 +254,4 @@ function createSessionService({ prisma, config, auditLog, now = () => new Date()
   };
 }
 
-module.exports = { SESSION_COOKIE, createSessionService };
+module.exports = { SESSION_COOKIE, SESSION_COOKIE_SECURE, createSessionService };
