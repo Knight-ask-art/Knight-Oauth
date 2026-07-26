@@ -1114,6 +1114,49 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
 
   // --- Logout -------------------------------------------------------------
 
+  it("will not end a session that belongs to someone else", async () => {
+    // `sessionId` reaches endSessions from `req.body.session_id`. With the
+    // queries matching on it alone, any signed-in user could end another user's
+    // OIDC sessions across every client — and fire a back-channel logout to
+    // each of them — by submitting an identifier that was not theirs. The
+    // caller passed `userId` and its own comment said the call was scoped by
+    // it; only the audit entry ever read it.
+    const flow = await authorize({ scope: "openid" });
+    await provider.token({
+      headers: basicAuth(confidential.clientId, confidentialSecret),
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+
+    const live = await prisma.oidcSession.count({ where: { sessionId: session.id, revokedAt: null } });
+    assert.ok(live >= 1, "a live session is needed for the attempt to mean anything");
+
+    const result = await provider.endSessions({
+      sessionId: session.id,
+      userId: "some-other-user-entirely",
+      reason: "user_revoked"
+    });
+    assert.equal(result.notified, 0, "a stranger's session was notified");
+    assert.equal(
+      await prisma.oidcSession.count({ where: { sessionId: session.id, revokedAt: null } }),
+      live,
+      "a stranger's session was revoked"
+    );
+  });
+
+  it("refuses to end sessions without an owner to scope the revocation to", async () => {
+    // An absent scope is the defect itself, so it fails loudly rather than
+    // falling back to matching every user — which is what it used to do.
+    await assert.rejects(
+      () => provider.endSessions({ sessionId: session.id }),
+      /requires a userId/
+    );
+  });
+
   it("notifies a client by back channel when the session ends", async () => {
     const flow = await authorize({ scope: "openid" });
     const tokens = await provider.token({

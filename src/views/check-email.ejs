@@ -22,6 +22,15 @@
   <% } %>
 
   <hr />
-  <p class="small"><a href="/login">Back to sign in</a></p>
+  <%
+  // `next` is already restricted to a path on this issuer by safeNext, so it
+  // cannot carry the sign-in link off-site. It is what lets a registration that
+  // started inside an authorization request resume it: registering no longer
+  // signs anyone in, because doing so would give a free address a session
+  // cookie that a taken one could not get, and that difference is readable
+  // without opening the page.
+  const signIn = typeof next !== "undefined" && next ? `/login?next=${encodeURIComponent(next)}` : "/login";
+  %>
+  <p class="small"><a href="<%= signIn %>">Back to sign in</a></p>
 </div>
 <%- include("partials/foot", { branding }) %>

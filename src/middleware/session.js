@@ -50,7 +50,12 @@ function createSessionMiddleware({ sessions, accounts, provider }) {
       };
 
       req.signOut = async ({ reason = "user_logout" } = {}) => {
-        if (req.session) {
+        // An anonymous session — one holding only external-login state — has no
+        // OIDC sessions to end, because those are created at authorization and
+        // that requires an account. Skipping it here rather than inside
+        // `endSessions` keeps `userId` a hard requirement there, where it is
+        // the check that scopes the revocation to its owner.
+        if (req.session?.userId) {
           // Notifying each client by back channel is what makes this a real
           // logout rather than one only this issuer knows about.
           await provider?.endSessions({ sessionId: req.session.id, userId: req.session.userId, reason });

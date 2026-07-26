@@ -21,8 +21,8 @@ npm start
 
 That is the whole install. It runs on SQLite, generates a signing key on first
 boot, and serves a working issuer at <http://127.0.0.1:3010>. Register an
-account — the first one becomes the administrator — and the issuer is ready for
-a client.
+account — the first one becomes the administrator — sign in, and the issuer is
+ready for a client.
 
 ---
 
@@ -128,7 +128,10 @@ npm run setup     # renders the schema, generates the client, applies migrations
 npm start
 ```
 
-Open <http://127.0.0.1:3010>, register, and you have an issuer. No `.env` is
+Open <http://127.0.0.1:3010>, register, sign in, and you have an issuer. Signing
+in is a separate step from registering, deliberately: a registration that handed
+back a session would answer "is this address already taken" from the response
+alone, which is an account-enumeration oracle. No `.env` is
 needed to get this far; `npm run setup -- --env` writes one from the example if
 you want somewhere to start editing.
 

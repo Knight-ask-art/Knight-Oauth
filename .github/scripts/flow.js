@@ -156,13 +156,25 @@ async function main() {
       name: "CI Flow",
       password
     });
-    // 302 to /account is the success path. A 200 means the page came back with
-    // an error on it, which for registration is deliberately indistinguishable
-    // from "this address is taken" — so report the status rather than guess.
+    // 200 either way, by design: registering a free address and registering one
+    // already taken render the identical page, because a 302-with-a-cookie next
+    // to a 200 would answer "does this address exist" from the status line
+    // alone. Nothing here can distinguish them, which is the point — the sign-in
+    // below is what proves the account was actually created.
+    check("registering is accepted", created.response.status === 200, `status ${created.response.status}`);
+
+    // A separate, explicit step, for the same reason: registration establishes
+    // no session.
+    const loginPage = await visit("/login");
+    const signedIn = await post("/login", {
+      _csrf: csrfFrom(loginPage.text),
+      identifier: email,
+      password
+    });
     check(
-      "registering redirects to the account page",
-      created.response.status === 302 && created.response.headers.get("location") === "/account",
-      `status ${created.response.status} location ${created.response.headers.get("location")}`
+      "the new account can sign in",
+      signedIn.response.status === 302,
+      `status ${signedIn.response.status} — registration did not create a usable account`
     );
 
     const account = await visit("/account");

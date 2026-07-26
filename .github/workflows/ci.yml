@@ -147,6 +147,13 @@ jobs:
       # configured floor; the default of 60 would put a minute of sleep in the
       # job for no additional coverage.
       OAUTH_BACKCHANNEL_RETRY_SECONDS: 15
+      # Three scripts sign in against one long-lived server from one address, so
+      # the shipped default of 10 a minute meters this job rather than anything
+      # in it. Today they total about five and would pass; that is too small a
+      # margin to leave a future check to discover as a flake. The limiter is
+      # covered properly in the suite, at both the middleware and the mounted-app
+      # level.
+      OAUTH_LOGIN_RATE_LIMIT_PER_MINUTE: 200
 
     steps:
       - uses: actions/checkout@v5

@@ -71,27 +71,30 @@ function createAccountController({ config, accounts, sessions, provider, clients
         userAgent: req.get("user-agent")
       });
 
-      // A duplicate address returns no account and mails the existing holder.
-      // The page below says the same thing either way, so a caller cannot tell
-      // which happened.
-      if (!result.account) {
-        return view(res, "check-email", {
-          title: "Check your email",
-          heading: "Check your email",
-          message: `If ${values.email} can be registered, a message is on its way with what to do next.`
-        });
-      }
-
-      if (accounts.requireEmailVerification && !result.account.emailVerified) {
-        return view(res, "check-email", {
-          title: "Check your email",
-          heading: "Confirm your email address",
-          message: `A confirmation link is on its way to ${result.account.email}. Open it to finish setting up your account.`
-        });
-      }
-
-      await req.signIn({ userId: result.account.id });
-      return res.redirect(safeNext(req.body.next, "/account"));
+      // One answer for every outcome: same status, same heading, same message,
+      // and no Set-Cookie in any of them.
+      //
+      // Every other layer already treats this as the invariant. `register`
+      // swallows P2002 and returns `{account: null}` rather than an error;
+      // it notifies the existing holder inside a try/catch so a mail failure
+      // cannot change the reply; check-email.ejs says in its own comment that
+      // its wording is conditional precisely because this page is what a caller
+      // sees when the address was already taken. This function was the one
+      // place that gave it away, and it did not need the page to be read: a
+      // duplicate rendered 200 HTML, while a free address answered 302 with a
+      // session cookie. Status line alone, one request, no guessing.
+      //
+      // Signing in is therefore a separate, explicit step. There is no way to
+      // establish a session here and still have the two answers be identical —
+      // the cookie is the tell. The link below carries `next`, so a
+      // registration that began inside an authorization request still lands
+      // back in it after signing in.
+      return view(res, "check-email", {
+        title: "Check your email",
+        heading: "Check your email",
+        message: `If ${values.email} can be registered, a message is on its way with what to do next.`,
+        next: safeNext(req.body.next, "")
+      });
     } catch (error) {
       if (error?.statusCode && error.statusCode < 500) {
         return res.status(error.statusCode).render("register", {

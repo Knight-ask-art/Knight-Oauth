@@ -53,13 +53,66 @@ function verifyTokenHash(token, expectedHash) {
 const SCRYPT = { N: 131072, r: 8, p: 1, keylen: 64, maxmem: 256 * 1024 * 1024 };
 const SALT_BYTES = 16;
 
-function scryptHash(password, salt) {
-  return new Promise((resolve, reject) => {
-    crypto.scrypt(password, salt, SCRYPT.keylen, SCRYPT, (error, derivedKey) => {
-      if (error) reject(error);
-      else resolve(derivedKey);
+// A concurrency gate in front of scrypt.
+//
+// These parameters cost 128 * N * r bytes — 128 MiB — for the duration of each
+// call, and Node runs scrypt on the libuv thread pool, which is four threads by
+// default. Four concurrent hashes therefore reach for half a gigabyte at once,
+// and compose.yml sets `mem_limit: 512m`. The container hits its own ceiling,
+// `restart: unless-stopped` brings it back, and the next four requests do it
+// again. Nothing about that requires an authenticated caller: every entry point
+// that hashes is reachable without an account, and the ones that do not need to
+// hash — an unknown login, a password reset for an address that does not exist —
+// hash anyway, on purpose, so their timing does not answer whether the account
+// is real.
+//
+// Two at a time bounds the peak at 256 MiB and still uses the pool. The rate
+// limiter in front is the real defence; this is the floor under it, for the
+// case where the limiter's per-IP key is spread across enough hosts.
+const HASH_CONCURRENCY = 2;
+
+// Past this, refuse rather than accept work that will not be reached in any
+// useful time. Well out of reach of the rate limiter's defaults, so a 503 here
+// means something the operator should see rather than routine load.
+const HASH_QUEUE_LIMIT = 64;
+
+let hashesRunning = 0;
+const hashesWaiting = [];
+
+function acquireHashSlot() {
+  if (hashesRunning < HASH_CONCURRENCY) {
+    hashesRunning += 1;
+    return Promise.resolve();
+  }
+  if (hashesWaiting.length >= HASH_QUEUE_LIMIT) {
+    const error = new Error("The server is busy checking credentials. Try again in a moment.");
+    // Read by the error handler, which turns it into a 503 rather than a 500.
+    error.statusCode = 503;
+    return Promise.reject(error);
+  }
+  return new Promise((resolve) => hashesWaiting.push(resolve));
+}
+
+function releaseHashSlot() {
+  const next = hashesWaiting.shift();
+  // Hand the slot straight to the next waiter rather than freeing and
+  // re-taking it, so a queue cannot be overtaken by an arriving request.
+  if (next) next();
+  else hashesRunning -= 1;
+}
+
+async function scryptHash(password, salt) {
+  await acquireHashSlot();
+  try {
+    return await new Promise((resolve, reject) => {
+      crypto.scrypt(password, salt, SCRYPT.keylen, SCRYPT, (error, derivedKey) => {
+        if (error) reject(error);
+        else resolve(derivedKey);
+      });
     });
-  });
+  } finally {
+    releaseHashSlot();
+  }
 }
 
 /**

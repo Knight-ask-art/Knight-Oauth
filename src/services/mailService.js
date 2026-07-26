@@ -3,15 +3,34 @@
 // Outbound mail for email verification and password reset.
 //
 // With SMTP disabled — the default — the link is written to the log instead of
-// being sent. That is deliberate for a local install: silently dropping a
-// verification mail would make a fresh deployment look broken with no way to
-// find out why. `loadEnv` refuses to start in production with verification
-// required and no SMTP configured, so the log fallback cannot become the
-// production behaviour by accident.
+// being sent, but only outside production. That is deliberate for a local
+// install: silently dropping a verification mail would make a fresh deployment
+// look broken with no way to find out why.
+//
+// In production the link is suppressed and only the kind and a masked address
+// are recorded. The guard used to be `loadEnv` refusing to start when
+// verification was required without SMTP, and that covered the wrong half: it
+// says nothing about password reset, `OAUTH_REQUIRE_EMAIL_VERIFICATION`
+// defaults to false, `SMTP_ENABLED` defaults to false, and compose.yml sets
+// NODE_ENV=production — so the README's first command produced an issuer that
+// printed a working password-reset link for any address on request. Anyone who
+// could read the container log could take over any account, and that set is far
+// larger than the set who can read the database.
 //
 // A mail body carries a single-use token. It is therefore never logged at
-// anything other than the operator's own console, and never recorded in the
+// anything other than a developer's own console, and never recorded in the
 // audit log.
+
+/**
+ * `ada@example.com` -> `a***@example.com`. Enough for an operator to correlate
+ * a report with a log line, not enough to enumerate from.
+ */
+function maskAddress(value) {
+  const text = String(value ?? "");
+  const at = text.lastIndexOf("@");
+  if (at <= 0) return "***";
+  return `${text[0]}***${text.slice(at)}`;
+}
 
 /** Minimal HTML escape for the values interpolated into a mail body. */
 function escapeHtml(value) {
@@ -35,6 +54,7 @@ function createMailService({ config, logger = console, transport = null, now = (
   const serviceName = config?.branding?.serviceName || "Knight OAuth";
   const baseUrl = config?.publicBaseUrl || "";
   const enabled = Boolean(mail.enabled);
+  const isProduction = Boolean(config?.isProduction);
 
   let cachedTransport = transport;
 
@@ -57,8 +77,18 @@ function createMailService({ config, logger = console, transport = null, now = (
 
   async function deliver({ to, subject, text, html, kind, link }) {
     if (!enabled) {
-      // The link is the whole point of the message, so it goes to the console
-      // where the operator can act on it.
+      if (isProduction) {
+        // The link authenticates whoever opens it. A process log is read by
+        // more people, and copied to more places, than the database it would
+        // otherwise take to impersonate this user.
+        logger.warn?.(
+          `[mail:disabled] ${kind} for ${maskAddress(to)} — SMTP is off, so nothing was delivered ` +
+            "and the link is not logged. Set SMTP_ENABLED=true to make this work."
+        );
+        return { delivered: false, reason: "smtp_disabled" };
+      }
+      // Outside production the link is the whole point of the message, so it
+      // goes to the console where the developer can act on it.
       logger.info?.(
         `[mail:disabled] ${kind} for ${to} — SMTP is off, open this link to continue:\n  ${link}`
       );

@@ -1,4 +1,11 @@
-<%- include("partials/head", { title, branding, currentUser: locals.currentUser, csrfToken }) %>
+<%
+// `locals.csrfToken`, not a bare `csrfToken`: this page is the one rendered
+// when something failed, and some of those failures happen before the CSRF
+// middleware has run — a body larger than the parser's limit is refused at
+// express.urlencoded, which is mounted well ahead of it. A bare reference is a
+// ReferenceError there, so the error page would fail while reporting an error
+// and the caller would get a blank 500 instead of the message below.
+%><%- include("partials/head", { title, branding, currentUser: locals.currentUser, csrfToken: locals.csrfToken || "" }) %>
 <%
 // The error page.
 //
