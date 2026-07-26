@@ -702,6 +702,42 @@ describe("the HTTP surface", () => {
 
   // --- Registration, recovery, verification --------------------------------
 
+  it("reports unavailable once the database is gone", async () => {
+    // The check used to answer from memory.
+    //
+    // `provider.jwks()` resolves from a key ring ensureKeyRing caches on first
+    // use, and verifyBoot fills it before the port opens — so after boot this
+    // endpoint returned a constant. A deployment whose database had gone
+    // answered every real request with a 500 while /healthz stayed 200: the
+    // compose healthcheck stayed green, no restart fired, and a load balancer
+    // kept sending traffic to it. It reported that the process was running,
+    // which was never the question.
+    //
+    // On its own database, because the way to test this is to take the database
+    // away and the rest of the suite still needs one.
+    const own = await withDatabase();
+    const quiet = { error() {}, warn() {}, info() {} };
+    const isolated = createApp({
+      env: loadEnv({ PUBLIC_BASE_URL: "http://127.0.0.1:3010", OAUTH_ALLOW_GENERATED_KEYS: "true" }),
+      prisma: own.prisma,
+      logger: quiet,
+      mailer: {
+        sendEmailVerification: async () => {},
+        sendPasswordReset: async () => {},
+        sendExistingAccountNotice: async () => {}
+      },
+      auditLog: createAuditService({ prisma: own.prisma, logger: quiet })
+    });
+
+    const healthy = await request(isolated).get("/healthz").expect(200);
+    assert.equal(healthy.body.status, "ok");
+
+    await own.close();
+
+    const unavailable = await request(isolated).get("/healthz").expect(503);
+    assert.equal(unavailable.body.status, "unavailable");
+  });
+
   it("names its cookies __Host- when the issuer is https, and not when it is not", async () => {
     // This suite runs against http://127.0.0.1, where the prefix is illegal —
     // a `__Host-` cookie must be Secure — so every other test here exercises

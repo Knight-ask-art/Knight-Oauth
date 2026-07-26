@@ -78,13 +78,27 @@ async function verifyBoot({ services, config, logger }) {
  * but only rows already retired past their overlap window — the active key is
  * matched by `isActive: false`, never by age.
  */
-async function prune({ services, logger }) {
+async function prune({ services, config, logger }) {
+  // Passed in rather than read off `services`, which does not carry it — a
+  // `services.config?.audit` would have been undefined, the step would have
+  // been skipped, and nothing would have said so.
+  const auditRetentionDays = config?.audit?.retentionDays ?? 0;
   const steps = [
     ["authorization state", () => services.provider.pruneExpired()],
     ["sessions", () => services.sessions.pruneExpired()],
     ["account tokens", () => services.accounts.pruneExpiredTokens()],
     ["retired signing keys", () => services.keys.pruneExpired()],
     ["delivered logouts", () => services.backchannel.pruneDelivered()],
+    // The audit log had no cleanup path at all: auditService.prune existed and
+    // nothing called it, there is no admin page and no CLI, so an operator's
+    // only route to it was raw SQL against the table. It is the fastest-growing
+    // table here — one row per sign-in, token, consent, and revocation — and
+    // when the volume it lives on fills, this issuer stops being able to sign
+    // anything. A retention period rather than a fixed rule, and 0 keeps
+    // everything, so a deployment that must retain says so.
+    ...(auditRetentionDays > 0
+      ? [["audit log", () => services.auditLog.prune({ olderThanDays: auditRetentionDays })]]
+      : []),
     ...(services.external ? [["consumed tickets", () => services.external.pruneConsumedTickets()]] : [])
   ];
 
@@ -207,7 +221,7 @@ async function start(options = {}) {
   logger.info?.(describe({ config, keys: services.keys, port }));
 
   const timers = [
-    repeat(PRUNE_INTERVAL_MS, () => prune({ services, logger })),
+    repeat(PRUNE_INTERVAL_MS, () => prune({ services, config, logger })),
     repeat(config.backchannel.retrySeconds * 1000, () => flushLogouts({ services, logger }))
   ];
 

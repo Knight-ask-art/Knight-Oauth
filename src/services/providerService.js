@@ -452,33 +452,72 @@ function createProviderService({
     });
   }
 
-  /** Records or widens the user's decision to trust a client. */
+  /**
+   * Records or widens the user's decision to trust a client.
+   *
+   * Read, merge, write — which is a race, and one SQLite hid. Prisma opens a
+   * single connection to it and the whole application is one writer, so two
+   * consents arriving together were serialised into correctness. PostgreSQL has
+   * no such funnel, and `grants` carries @@unique([userId, clientId]): two tabs
+   * finishing consent at the same moment both found no row, both inserted, and
+   * the loser got an unhandled P2002. oauthController only redirects an error
+   * it recognises as a protocol error, so a raw `{"error":"server_error"}`
+   * appeared in the browser.
+   *
+   * The other half was quieter. Two widenings that both found the same existing
+   * row each wrote their own merge over it, and whichever landed second won
+   * outright — one tab granting `profile` and another granting `email` left the
+   * user with one of them and no indication the other was dropped.
+   *
+   * So: compare-and-swap on `version`, which the column already existed for.
+   * A write that finds the version it read has moved re-reads and merges on top
+   * of the winner rather than over it, and an insert that loses the unique
+   * constraint becomes a widening of the row that beat it. Both halves converge
+   * on the union, which is what the user actually agreed to.
+   */
   async function upsertGrant({ userId, clientId, scopes }) {
-    const existing = await prisma.grant.findUnique({
-      where: { userId_clientId: { userId, clientId } }
-    });
-    const merged = scopeRegistry.sort([...(existing && !existing.revokedAt ? decodeScopes(existing.scopes) : []), ...scopes]);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const existing = await prisma.grant.findUnique({
+        where: { userId_clientId: { userId, clientId } }
+      });
+      const merged = scopeRegistry.sort([
+        ...(existing && !existing.revokedAt ? decodeScopes(existing.scopes) : []),
+        ...scopes
+      ]);
 
-    if (existing) {
-      return prisma.grant.update({
-        where: { id: existing.id },
+      if (!existing) {
+        try {
+          return await prisma.grant.create({
+            data: { id: randomId(), userId, clientId, scopes: encodeScopes(merged) }
+          });
+        } catch (error) {
+          // P2002 is Prisma's unique-constraint violation: someone inserted the
+          // row between the read above and this write. Their scopes are now the
+          // ones to merge on top of, so go round again rather than fail.
+          if (error?.code !== "P2002") throw error;
+          continue;
+        }
+      }
+
+      const claimed = await prisma.grant.updateMany({
+        where: { id: existing.id, version: existing.version },
         data: {
           scopes: encodeScopes(merged),
           revokedAt: null,
           // The version increments on every change, so a stored grant can be
-          // told apart from the one a token was issued under.
+          // told apart from the one a token was issued under — and so this
+          // update can tell whether it is writing over what it read.
           version: existing.version + 1
         }
       });
-    }
-    return prisma.grant.create({
-      data: {
-        id: randomId(),
-        userId,
-        clientId,
-        scopes: encodeScopes(merged)
+      if (claimed.count) {
+        return prisma.grant.findUnique({ where: { id: existing.id } });
       }
-    });
+    }
+
+    // Four consecutive losses means sustained contention on one (user, client)
+    // pair, which no real consent flow produces. Failing is better than looping.
+    throw new Error("The grant could not be recorded because it was being changed concurrently");
   }
 
   /**
@@ -1451,16 +1490,38 @@ function createProviderService({
    */
   async function pruneExpired() {
     const cutoff = now();
-    const [requests, codes, tokens] = await Promise.all([
+    const [requests, codes, tokens, sessions] = await Promise.all([
       prisma.authorizationRequest.deleteMany({
         where: { OR: [{ expiresAt: { lt: cutoff } }, { consumedAt: { not: null } }] }
       }),
       prisma.authorizationCode.deleteMany({
         where: { OR: [{ expiresAt: { lt: cutoff } }, { usedAt: { not: null } }] }
       }),
-      prisma.refreshToken.deleteMany({ where: { expiresAt: { lt: cutoff } } })
+      prisma.refreshToken.deleteMany({ where: { expiresAt: { lt: cutoff } } }),
+      // The per-client session view, which nothing deleted.
+      //
+      // It has no expiry column and no foreign key to the browser session, so
+      // pruning that one cascaded to nothing here: a row survived per
+      // (browser session, client) for the life of the database.
+      //
+      // The cutoff is the refresh-token lifetime, and it cannot be shorter.
+      // Introspection reports a token inactive by looking this row up by the
+      // ID token's `sid` and reading `revokedAt` — so deleting a *revoked* row
+      // makes the tokens it revoked answer as active again. Only once nothing
+      // that could reference it is still alive is the row safe to remove, and
+      // the longest-lived reference is a refresh token. `lastSeenAt` is
+      // rewritten on every issuance, so a session still in use is never inside
+      // this window.
+      prisma.oidcSession.deleteMany({
+        where: { lastSeenAt: { lt: new Date(cutoff.getTime() - ttl.refreshTokenSeconds * 1000) } }
+      })
     ]);
-    return { authorizationRequests: requests.count, codes: codes.count, refreshTokens: tokens.count };
+    return {
+      authorizationRequests: requests.count,
+      codes: codes.count,
+      refreshTokens: tokens.count,
+      oidcSessions: sessions.count
+    };
   }
 
   return {
@@ -1469,6 +1530,22 @@ function createProviderService({
     completeAuthorization,
     denyAuthorization,
     discoveryDocument,
+    /**
+     * One indexed read, for the health check.
+     *
+     * Against a real table rather than `SELECT 1`, and the difference is not
+     * pedantic: Prisma reconnects on the next query after a disconnect, and
+     * `SELECT 1` needs no schema — so against a SQLite file that had been
+     * removed it opened a fresh empty one and answered successfully. It proved
+     * a connection, which was never the question either.
+     *
+     * `signingKey` is the table to ask for. It is small, it is read once at
+     * boot and rarely after, and an issuer that cannot reach it cannot sign
+     * anything — so "this row is unreachable" and "this process is useless" are
+     * the same statement. LIMIT 1 on the primary key, so the cost does not grow
+     * with the data.
+     */
+    ping: () => prisma.signingKey.findFirst({ select: { id: true } }),
     endSessions,
     findActiveGrant,
     introspect,
