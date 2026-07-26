@@ -405,6 +405,22 @@ describe("local accounts and external identity", () => {
     assert.equal(allowed.ok, true);
   });
 
+  it("runs against the database the environment selected", async () => {
+    // Asked of the engine, not of the configuration.
+    //
+    // The suite passing is not evidence of which database it passed on: a run
+    // that silently fell back to SQLite would report the same counts, and this
+    // whole helper exists because "it was green" had been standing in for "it
+    // was checked on both". So the engine is asked what it is.
+    if (db.provider === "postgresql") {
+      const rows = await prisma.$queryRawUnsafe("SELECT version() AS version");
+      assert.match(String(rows[0].version), /PostgreSQL/, "DATABASE_PROVIDER said postgresql; the engine disagreed");
+    } else {
+      const rows = await prisma.$queryRawUnsafe("SELECT sqlite_version() AS version");
+      assert.match(String(rows[0].version), /^\d+\./, "the engine did not answer as SQLite");
+    }
+  });
+
   it("revokes credentials when an account is disabled", async () => {
     const account = await accounts.findByEmail("upstream@example.com");
     const { sid } = await sessions.create({ userId: account.id });
