@@ -211,7 +211,18 @@ jobs:
       # rotation — both of which are enforced by scoped writes in the database —
       # have never run against Postgres anywhere else.
       - name: end-to-end authorization code flow
-        run: node .github/scripts/flow.js http://127.0.0.1:3010
+        run: |
+          # The server was backgrounded by an earlier step. A step boundary is not
+          # a process boundary on the runner, but that is a property of the
+          # runner rather than something this job should assume silently: if the
+          # process is gone, say so, instead of letting 34 checks fail one by one
+          # with connection errors.
+          if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
+            echo "the server is no longer running, so the flow cannot be attempted:"
+            cat server.log
+            exit 1
+          fi
+          node .github/scripts/flow.js http://127.0.0.1:3010
 
       - name: server log
         if: always()
