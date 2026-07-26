@@ -374,6 +374,12 @@ off the other.
   byte for byte; changing it invalidates every token already issued.
 - **Back up the database.** It holds the accounts, the grants, and — unless you
   supplied one — the signing key.
+- **Access tokens are self-contained JWTs and cannot be withdrawn early.**
+  Revoking one, or a refresh-token replay that revokes its whole family, ends the
+  grant — but an access token already issued stays verifiable until it expires,
+  so introspection keeps reporting `active: true` for it. What bounds that window
+  is `OAUTH_ACCESS_TOKEN_TTL` (one hour by default); shorten it if your threat
+  model needs revocation to bite sooner, at the cost of more refresh traffic.
 
 ---
 
@@ -608,6 +614,11 @@ OAUTH_CUSTOM_SCOPES=[
 - **不要修改已上线部署的 `OAUTH_ISSUER`。** 客户端会逐字节比对 `iss`，改了会让
   所有已签发的令牌失效。
 - **备份数据库。** 里面有账号、授权记录，以及（如果你没自己提供）签名密钥。
+- **访问令牌是自包含 JWT，无法提前撤销。** 撤销令牌、或刷新令牌被重放导致整个
+  family 被吊销，都会终止这次授权；但已经签发出去的访问令牌在过期前仍然可以验签
+  通过，内省也会继续返回 `active: true`。真正限制这个窗口的是
+  `OAUTH_ACCESS_TOKEN_TTL`（默认 1 小时）——如果你的威胁模型要求撤销立刻生效，就
+  把它调短，代价是刷新请求变多。
 
 ## Docker
 
