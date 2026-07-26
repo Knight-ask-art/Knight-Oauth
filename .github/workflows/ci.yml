@@ -28,6 +28,12 @@
 #      hand-rolled script in (5). flow.js can share its author's misreadings of
 #      the specification; openid-client validates independently, including the
 #      ID-token signature against JWKS.
+#   7. The protocol paths either flow reaches only when something does not go to
+#      plan: the user declining, the authorization endpoint over POST,
+#      `prompt=login`, and back-channel logout. (5) and (6) both drive the flow
+#      to a successful token, so every assertion in them is on the path where
+#      the user says yes — which leaves the paths a client library exercises
+#      just as often entirely uncovered.
 
 name: CI
 
@@ -136,6 +142,11 @@ jobs:
       DATABASE_PROVIDER: postgresql
       DATABASE_URL: postgresql://knight_oauth:ci-only-not-a-real-credential@127.0.0.1:5432/knight_oauth
       PUBLIC_BASE_URL: http://127.0.0.1:3010
+      # Back-channel logout is delivered by a scheduled pass rather than
+      # synchronously, so edge.js has to wait one full interval for it. 15 is the
+      # configured floor; the default of 60 would put a minute of sleep in the
+      # job for no additional coverage.
+      OAUTH_BACKCHANNEL_RETRY_SECONDS: 15
 
     steps:
       - uses: actions/checkout@v5
@@ -175,6 +186,12 @@ jobs:
           echo "FLOW_CLIENT_ID=ci-flow-client" >> "$GITHUB_ENV"
           echo "FLOW_CLIENT_SECRET=$FLOW_CLIENT_SECRET" >> "$GITHUB_ENV"
           echo "FLOW_REDIRECT_URI=https://rp.ci.invalid/callback" >> "$GITHUB_ENV"
+          # A loopback address rather than the https one the redirect_uri uses:
+          # edge.js binds this port itself and stands in for the relying party
+          # receiving the logout, so it has to be an address on this runner. The
+          # server runs natively here, which is why this job is the one that can
+          # do it — inside the docker job, 127.0.0.1 is the container.
+          echo "EDGE_LOGOUT_URI=http://127.0.0.1:3099/backchannel" >> "$GITHUB_ENV"
 
           export OAUTH_STATIC_CLIENTS="$(node -e '
             console.log(JSON.stringify([{
@@ -182,6 +199,7 @@ jobs:
               clientName: "CI Flow Client",
               clientSecret: process.argv[1],
               redirectUris: ["https://rp.ci.invalid/callback"],
+              backchannelLogoutUri: "http://127.0.0.1:3099/backchannel",
               grantTypes: ["authorization_code", "refresh_token"],
               scopes: ["openid", "profile", "email", "offline_access"],
               isFirstParty: false
@@ -242,6 +260,25 @@ jobs:
             exit 1
           fi
           node .github/scripts/openid-client-flow.js http://127.0.0.1:3010
+
+      # The paths both flows above stop short of, because both drive the flow to
+      # a successful token: the user declining (RFC 9207 requires `iss` on error
+      # responses too, and oauth4webapi reads `iss` before `error`), the
+      # authorization endpoint over POST (OIDC Core 3.1.2.1 makes it a MUST),
+      # `prompt=login` (a redirect chain that has to terminate), and back-channel
+      # logout (the logout token's `sid` has to be the one the ID token carried,
+      # or the relying party ends no session at all).
+      #
+      # Last, because it logs out and binds a port: a failure here should not
+      # cost the coverage of the two steps above.
+      - name: protocol edge paths
+        run: |
+          if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
+            echo "the server is no longer running, so the edge paths cannot be attempted:"
+            cat server.log
+            exit 1
+          fi
+          node .github/scripts/edge.js http://127.0.0.1:3010
 
       - name: server log
         if: always()

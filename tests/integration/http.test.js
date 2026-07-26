@@ -600,10 +600,20 @@ describe("the HTTP surface", () => {
         code_challenge: challenge,
         code_challenge_method: "S256"
       });
-    // POST /oauth2/authorize is not a CSRF-exempt protocol endpoint, so this
-    // documents the actual behaviour: the request either completes or is
-    // refused for a missing token, but never 500s.
-    assert.ok([302, 403].includes(response.status), `unexpected status ${response.status}`);
+    // OIDC Core section 3.1.2.1 makes supporting POST a MUST. The form that
+    // sends it belongs to the relying party, so it is cross-site by
+    // construction: it carries no cookie of ours and cannot read a token to put
+    // in `_csrf`. 403 is therefore the failure mode worth naming — the previous
+    // `assert.ok([302, 403].includes(...))` accepted the endpoint being GET-only
+    // and the requirement being met equally, which is how this went unnoticed.
+    assert.equal(
+      response.status,
+      302,
+      `expected a redirect, got ${response.status}` +
+        (response.status === 403
+          ? ": a relying party's cross-site form POST cannot carry a CSRF token, so this means POST is unsupported"
+          : "")
+    );
   });
 
   // --- Self-service: withdrawing access ------------------------------------

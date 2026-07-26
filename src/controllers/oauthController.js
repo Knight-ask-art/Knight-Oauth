@@ -103,7 +103,8 @@ function createOAuthController({ config, provider, clients, scopeRegistry, accou
           buildErrorRedirect(error.redirectUri, {
             error: error.code || "invalid_request",
             errorDescription: error.message,
-            state: error.state
+            state: error.state,
+            issuer: config.issuer
           })
         );
       }
@@ -152,7 +153,8 @@ function createOAuthController({ config, provider, clients, scopeRegistry, accou
           buildErrorRedirect(request.redirectUri, {
             error: error.code,
             errorDescription: error.message,
-            state: request.state
+            state: request.state,
+            issuer: config.issuer
           })
         );
       }

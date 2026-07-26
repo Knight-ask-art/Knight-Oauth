@@ -348,7 +348,12 @@ function createProviderService({
       prompts: decodeScopes(record.prompt),
       maxAge: record.maxAge,
       loginHint: record.loginHint,
-      expiresAt: record.expiresAt
+      expiresAt: record.expiresAt,
+      // When the request was parked. `resolveAuthorization` compares it against
+      // the session's `authTime` to tell a session the user just re-established
+      // from the one they arrived with — which is the only thing that makes
+      // `prompt=login` terminate.
+      createdAt: record.createdAt
     };
   }
 
@@ -371,13 +376,42 @@ function createProviderService({
       throw accessDenied("That account has been disabled");
     }
 
+    // Whether the user authenticated *for this request* rather than before it.
+    //
+    // Without this distinction `prompt=login` cannot terminate. The demand lives
+    // in the stored request, so re-reading it after the login page yields the
+    // same answer as before — the user signs in, comes back to
+    // /oauth2/authorize/continue, is sent to /login again, and because a session
+    // now exists the login page redirects straight back. That is a redirect loop
+    // the browser ends with ERR_TOO_MANY_REDIRECTS, and `prompt=login` is how a
+    // relying party forces re-authentication before a sensitive operation, so it
+    // fails the whole authorization rather than degrading to "ignored".
+    //
+    // A request only carries `createdAt` once it has been parked, which is
+    // exactly the first pass through: no timestamp means the user has not been
+    // asked yet, so the demand stands.
+    const reauthenticated =
+      Boolean(request.createdAt) && session.authTime.getTime() > new Date(request.createdAt).getTime();
+
     // prompt=login forces re-authentication even for an active session.
-    if (prompts.includes("login")) {
+    if (prompts.includes("login") && !reauthenticated) {
       return { action: "login", reason: "prompt_login" };
     }
 
-    // max_age caps how long ago authentication may have happened.
-    if (request.maxAge !== null && request.maxAge !== undefined) {
+    // max_age caps how long ago authentication may have happened. The same guard
+    // applies, and for the same reason: `max_age=0` is satisfiable only at the
+    // instant of login, so comparing elapsed time alone sends a user who has
+    // just authenticated back to authenticate again, forever.
+    //
+    // The trade-off, stated rather than left implicit: a user who authenticated
+    // *for this request* is accepted even if they then took longer to come back
+    // than `max_age` allows. The window is bounded by the request's own TTL
+    // (`OAUTH_AUTHORIZATION_REQUEST_TTL`, 600s by default, 3600s at most), after
+    // which the parked request no longer loads at all. Refusing instead would
+    // make `max_age=0` — which clients send to mean "re-authenticate now" —
+    // impossible to satisfy, since any round trip through the login page takes
+    // longer than zero seconds.
+    if (request.maxAge !== null && request.maxAge !== undefined && !reauthenticated) {
       const age = (now().getTime() - session.authTime.getTime()) / 1000;
       if (age > request.maxAge) {
         if (prompts.includes("none")) throw loginRequired("The session is older than max_age");
@@ -530,7 +564,8 @@ function createProviderService({
         redirectUrl: buildErrorRedirect(request.redirectUri, {
           error: "access_denied",
           errorDescription: "The user declined the request",
-          state: request.state
+          state: request.state,
+          issuer
         })
       };
     }
@@ -552,7 +587,8 @@ function createProviderService({
       redirectUrl: buildErrorRedirect(request.redirectUri, {
         error: "access_denied",
         errorDescription: "The user declined the request",
-        state: request.state
+        state: request.state,
+        issuer
       })
     };
   }
@@ -1244,7 +1280,9 @@ function createProviderService({
     for (const session of oidcSessions) {
       await backchannel?.enqueue({
         clientId: grant.clientId,
-        sessionId: session.sessionId,
+        // `session.id`, not `session.sessionId`: the ID token published the
+        // former as `sid`, and that is what the relying party indexed by.
+        sid: session.id,
         userId: grant.userId,
         subject: grant.userId,
         reason
@@ -1324,7 +1362,11 @@ function createProviderService({
     for (const session of oidcSessions) {
       const queued = await backchannel?.enqueue({
         clientId: session.clientId,
-        sessionId: session.sessionId,
+        // `session.id`, not `session.sessionId`: see the note on enqueue. The
+        // rows here were selected by browser session, so `sessionId` is the
+        // same value for every one of them — which is what made the mistake
+        // look plausible.
+        sid: session.id,
         userId: session.userId,
         subject: session.userId,
         reason

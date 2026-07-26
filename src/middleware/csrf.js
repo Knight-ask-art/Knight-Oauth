@@ -14,6 +14,16 @@ const { randomToken, safeEqual } = require("../lib/crypto");
 //     without those credentials fails anyway, and requiring a CSRF token would
 //     break every conformant client library, none of which sends one.
 //   * /oauth2/backchannel-logout-style callbacks are server-to-server.
+//   * /oauth2/authorize is required to accept POST as well as GET (OIDC Core
+//     section 3.1.2.1, a MUST). The form that posts it belongs to the relying
+//     party, so it is cross-site by construction: it carries no cookie of ours
+//     and cannot read a token to submit. Protecting it does not make the
+//     endpoint safer — the GET form has exactly the same capability and never
+//     had a token either — it only makes POST fail with a 403 the client
+//     cannot interpret. What a forged request could actually achieve is
+//     bounded by the next step: reaching /oauth2/authorize renders a consent
+//     screen, and the decision that grants anything is the POST to
+//     /oauth2/consent, which is same-origin and stays protected.
 //
 // SameSite=Lax on the session cookie is a second layer, but it cannot be the
 // only one: it does not cover a top-level cross-site POST in every browser.
@@ -22,12 +32,12 @@ const CSRF_COOKIE = "koauth_csrf";
 
 /** Endpoints authenticated by client credentials or a bearer token, not a cookie. */
 const PROTOCOL_ENDPOINTS = new Set([
+  "/oauth2/authorize",
   "/oauth2/token",
   "/oauth2/introspect",
   "/oauth2/revoke",
   "/oauth2/userinfo",
-  "/oauth2/register",
-  "/oauth2/handoff/consume"
+  "/oauth2/register"
 ]);
 
 function isProtocolEndpoint(pathname) {
