@@ -219,13 +219,34 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
       userAgent
     });
 
-    let verificationSent = false;
-    if (requireEmailVerification && account.status === STATUS.PENDING) {
-      await issueEmailVerification(account);
-      verificationSent = true;
+    // A message goes out on every registration, not only when verification is
+    // mandatory.
+    //
+    // The answer to a new address and to one already taken is deliberately
+    // identical, and the page it renders tells the caller to check their mail.
+    // With verification optional — the default — a new account used to send
+    // nothing at all, so "did anything actually arrive?" answered the question
+    // that identical wording exists to close, and the page was simply false.
+    // The link is worth sending either way: opening it records emailVerifiedAt.
+    //
+    // Skipped only for an account that is already verified, which on a fresh
+    // install is the first user.
+    try {
+      if (!account.emailVerified) await issueEmailVerification(account);
+    } catch {
+      // Swallowed for the same reason the duplicate branch swallows its own
+      // notice: a mail failure that changed the response would be the
+      // enumeration oracle this is written to avoid. An account that never got
+      // its link can ask for another one.
     }
 
-    return { account, duplicateEmail: false, verificationRequired: verificationSent };
+    return {
+      account,
+      duplicateEmail: false,
+      // Whether the user must confirm before the account is usable — not
+      // whether a message was sent, which is now always.
+      verificationRequired: requireEmailVerification && account.status === STATUS.PENDING
+    };
   }
 
   /**

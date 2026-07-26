@@ -1348,13 +1348,27 @@ function createProviderService({
 
   /** Ends every per-client session for a browser session and notifies each client. */
   async function endSessions({ sessionId, userId, reason = "user_logout" }) {
-    const oidcSessions = await prisma.oidcSession.findMany({
-      where: { sessionId: String(sessionId), revokedAt: null }
-    });
+    // `userId` is the authorization check, not decoration for the audit entry.
+    //
+    // It arrived as a parameter and was used only in the audit record below,
+    // while both queries matched on `sessionId` alone — and `sessionId` reaches
+    // here from `req.body.session_id`. Any signed-in user could therefore end
+    // another user's OIDC sessions across every client, and fire a logout
+    // notification to each one, by submitting an identifier that was not
+    // theirs. The caller's own comment said this was scoped; it was not.
+    //
+    // Required rather than optional: an omitted scope is the whole defect, and
+    // a default of "match everything" is what it silently did before.
+    if (!userId) {
+      throw new TypeError("endSessions requires a userId: it is what scopes the revocation to its owner");
+    }
+
+    const where = { sessionId: String(sessionId), userId: String(userId), revokedAt: null };
+    const oidcSessions = await prisma.oidcSession.findMany({ where });
     if (!oidcSessions.length) return { notified: 0 };
 
     await prisma.oidcSession.updateMany({
-      where: { sessionId: String(sessionId), revokedAt: null },
+      where,
       data: { revokedAt: now(), revocationReason: reason }
     });
 

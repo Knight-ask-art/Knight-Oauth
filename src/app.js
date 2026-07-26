@@ -21,6 +21,7 @@ const { createSessionService } = require("./services/sessionService");
 
 const { cookieMiddleware } = require("./middleware/cookies");
 const { createCsrfMiddleware } = require("./middleware/csrf");
+const { createRateLimitMiddleware } = require("./middleware/rateLimit");
 const { createSessionMiddleware, requireAdmin, requireAuth } = require("./middleware/session");
 
 const { createAccountController } = require("./controllers/accountController");
@@ -247,6 +248,18 @@ function createApp(options = {}) {
     if (req.method === "OPTIONS") return res.status(204).end();
     return next();
   });
+
+  // --- Rate limiting --------------------------------------------------------
+  //
+  // After CSRF, so a request that fails there is never counted — it cost
+  // nothing to refuse, and the endpoints being metered are expensive only past
+  // that point. After the body parsers, because the second half of each key is
+  // the identifier the caller submitted.
+  //
+  // Mounted here rather than on each route so that rateLimit.js holds the whole
+  // policy in one readable table. Which endpoints are metered, and at what, is
+  // the kind of thing that should be answerable by opening one file.
+  app.use(createRateLimitMiddleware({ config, logger }));
 
   // --- Routes ---------------------------------------------------------------
   app.get("/healthz", oauthController.health);

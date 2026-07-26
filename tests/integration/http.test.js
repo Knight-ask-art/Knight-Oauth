@@ -12,6 +12,7 @@ const { createAccountService } = require("../../src/services/accountService");
 const { createAuditService } = require("../../src/services/auditService");
 const { createClientService } = require("../../src/services/clientService");
 const { createScopeRegistry } = require("../../src/lib/scopes");
+const { buildRules } = require("../../src/middleware/rateLimit");
 
 // The HTTP suite.
 //
@@ -70,6 +71,12 @@ describe("the HTTP surface", () => {
     config = loadEnv({
       PUBLIC_BASE_URL: "http://127.0.0.1:3010",
       OAUTH_ALLOW_GENERATED_KEYS: "true",
+      // Every request in this suite arrives from one address, so the shipped
+      // default of 10 sign-ins a minute throttles the suite itself rather than
+      // anything under test. Raised here and asserted properly further down,
+      // where an app is built with a deliberately tiny limit.
+      OAUTH_LOGIN_RATE_LIMIT_PER_MINUTE: "1000",
+      OAUTH_TOKEN_RATE_LIMIT_PER_MINUTE: "10000",
       OAUTH_CLIENT_REQUIRE_APPROVAL: "false",
       OAUTH_DYNAMIC_REGISTRATION_ENABLED: "true",
       OAUTH_REGISTRATION_ACCESS_TOKEN: "registration-token-at-least-32-characters",
@@ -689,7 +696,68 @@ describe("the HTTP surface", () => {
 
   // --- Registration, recovery, verification --------------------------------
 
-  it("registers an account through the form and signs it in", async () => {
+  it("meters only paths that a route actually serves", async () => {
+    // A rule naming a path nothing is mounted at is silently dead: no error, no
+    // warning, just a limit that never applies. That is the same shape as the
+    // defect the limiter itself was written to fix — a setting with no
+    // consumer — one level up, and renaming a route is all it would take.
+    //
+    // 404 is the only status this rejects. A CSRF refusal or a protocol error
+    // both prove the route is there, which is the whole question.
+    for (const rule of buildRules(config.security)) {
+      const response = await request(app).post(rule.path).type("form").send({});
+      assert.notEqual(response.status, 404, `${rule.path} is rate limited but no route serves it`);
+    }
+  });
+
+  it("enforces the configured login rate limit through the real app", async () => {
+    // The point of this test is not that a counter counts.
+    //
+    // OAUTH_LOGIN_RATE_LIMIT_PER_MINUTE and OAUTH_TOKEN_RATE_LIMIT_PER_MINUTE
+    // were parsed, range-checked, documented in .env.example, and referred to
+    // by README and compose.yml as "the rate limiter" while nothing in the
+    // codebase read either one. A unit test on the middleware would have passed
+    // throughout. So this builds an app the ordinary way, from a config whose
+    // only distinguishing feature is a tiny limit, and drives it over HTTP: it
+    // fails if the middleware is not mounted, if it is mounted where the body
+    // is not parsed yet, or if it ignores the configured value.
+    const quiet = { error() {}, warn() {}, info() {} };
+    const limited = createApp({
+      env: loadEnv({
+        PUBLIC_BASE_URL: "http://127.0.0.1:3010",
+        OAUTH_ALLOW_GENERATED_KEYS: "true",
+        OAUTH_LOGIN_RATE_LIMIT_PER_MINUTE: "2"
+      }),
+      prisma: db.prisma,
+      logger: quiet,
+      mailer: {
+        sendEmailVerification: async () => {},
+        sendPasswordReset: async () => {},
+        sendExistingAccountNotice: async () => {}
+      },
+      auditLog: createAuditService({ prisma: db.prisma, logger: quiet })
+    });
+
+    const agent = request.agent(limited);
+    const page = await agent.get("/login").expect(200);
+    const token = csrfFrom(page.text);
+    const attempt = () =>
+      agent
+        .post("/login")
+        .type("form")
+        .send({ _csrf: token, identifier: "user@example.com", password: "not-the-right-password" });
+
+    // Wrong on purpose: a rejected sign-in still pays for a full scrypt, which
+    // is the cost being metered.
+    await attempt();
+    await attempt();
+
+    const blocked = await attempt().expect(429);
+    assert.ok(blocked.headers["retry-after"], "a 429 has to say when it is worth trying again");
+    assert.match(blocked.text, /too many attempts/i);
+  });
+
+  it("registers an account without signing it in, and the account then works", async () => {
     const agent = request.agent(app);
     const page = await agent.get("/register").expect(200);
     const response = await agent
@@ -702,8 +770,26 @@ describe("the HTTP surface", () => {
         name: "Fresh Account",
         password: PASSWORD
       })
+      .expect(200);
+    assert.match(response.text, /Check your email/);
+
+    // Registration establishes no session, and cannot: a free address that came
+    // back with a cookie next to a taken one that did not is distinguishable
+    // from the response line alone, without reading a word of either page.
+    const cookies = response.headers["set-cookie"] || [];
+    assert.ok(
+      !cookies.some((cookie) => cookie.startsWith("koauth_session=")),
+      "registering handed out a session cookie, which is the enumeration tell"
+    );
+
+    // Signing in is the separate, explicit step — and it works, so the account
+    // really was created.
+    const login = await agent.get("/login").expect(200);
+    await agent
+      .post("/login")
+      .type("form")
+      .send({ _csrf: csrfFrom(login.text), identifier: "fresh@example.com", password: PASSWORD })
       .expect(302);
-    assert.equal(response.headers.location, "/account");
     const account = await agent.get("/account").expect(200);
     assert.match(account.text, /fresh@example\.com/);
   });
@@ -711,15 +797,31 @@ describe("the HTTP surface", () => {
   it("answers a registration for an existing address exactly as it answers a new one", async () => {
     // An authorization server that reveals whether an address is registered is
     // an account-enumeration oracle, so the two responses must be the same page.
-    const agent = request.agent(app);
-    const page = await agent.get("/register").expect(200);
-    const response = await agent
-      .post("/register")
-      .type("form")
-      .send({ _csrf: csrfFrom(page.text), email: "user@example.com", password: PASSWORD })
-      .expect(200);
-    assert.match(response.text, /Check your email/);
-    assert.doesNotMatch(response.text, /already|taken|exists/i);
+    //
+    // Compared byte for byte, the way the password-reset test below does it.
+    // Asserting a 200 and the absence of /already|taken|exists/ was what this
+    // did before, and it let the actual difference through untouched: a free
+    // address answered 302 with a session cookie while a taken one answered 200
+    // HTML. Nothing about the wording was ever the problem.
+    const responses = [];
+    for (const email of ["user@example.com", "not-registered-yet@example.com"]) {
+      const agent = request.agent(app);
+      const page = await agent.get("/register").expect(200);
+      const response = await agent
+        .post("/register")
+        .type("form")
+        .send({ _csrf: csrfFrom(page.text), email, password: PASSWORD })
+        .expect(200);
+      responses.push(
+        response.text
+          // The CSRF token differs by construction.
+          .replace(/value="[^"]*"/g, "")
+          // The page echoes the address the caller submitted, which they
+          // already know. Normalised so the comparison is about everything else.
+          .replaceAll(email, "{address}")
+      );
+    }
+    assert.equal(responses[0], responses[1], "the two answers differ, which reveals whether the address exists");
   });
 
   it("answers a password reset for an unknown address the same way as a known one", async () => {

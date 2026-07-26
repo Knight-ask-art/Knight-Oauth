@@ -232,10 +232,22 @@ async function main() {
         name: "CI Edge",
         password
       });
+      // Identical for a free address and a taken one by design, so this cannot
+      // assert more than "accepted". Registration also establishes no session,
+      // which is why the sign-in below is a separate step — every check after
+      // this one needs an authenticated browser.
+      check("registering is accepted", created.response.status === 200, `status ${created.response.status}`);
+
+      const loginPage = await visit("/login");
+      const signedIn = await post("/login", {
+        _csrf: csrfFrom(loginPage.text),
+        identifier: email,
+        password
+      });
       check(
-        "registering redirects to the account page",
-        created.response.status === 302 && created.response.headers.get("location") === "/account",
-        `status ${created.response.status} location ${created.response.headers.get("location")}`
+        "the new account can sign in",
+        signedIn.response.status === 302,
+        `status ${signedIn.response.status} — nothing below can run without a session`
       );
     }
 

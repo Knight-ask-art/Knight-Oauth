@@ -192,10 +192,21 @@ async function main() {
       name: "CI OpenID Client",
       password
     });
+    // 200 whether or not the address was free: the two answers are identical by
+    // design, so that registering cannot be used to enumerate accounts.
+    check("registering is accepted", created.response.status === 200, `status ${created.response.status}`);
+
+    // Registration establishes no session, so signing in is a separate step.
+    const loginPage = await visit("/login");
+    const signedIn = await post("/login", {
+      _csrf: csrfFrom(loginPage.text),
+      identifier: email,
+      password
+    });
     check(
-      "registering redirects to the account page",
-      created.response.status === 302 && created.response.headers.get("location") === "/account",
-      `status ${created.response.status} location ${created.response.headers.get("location")}`
+      "the new account can sign in",
+      signedIn.response.status === 302,
+      `status ${signedIn.response.status} — registration did not create a usable account`
     );
 
     const account = await visit("/account");

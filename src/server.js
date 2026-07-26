@@ -146,6 +146,15 @@ function describe({ config, keys, port }) {
   if (config.clients.dynamicRegistrationEnabled && !config.clients.registrationAccessToken) {
     lines.push("WARNING     dynamic registration is open — anyone can register a client");
   }
+  // Outside production a disabled mailer prints the link, so the operator finds
+  // out by using it. In production the link is suppressed, which is correct but
+  // silent: password reset and email verification simply stop working, and the
+  // first report of it comes from a locked-out user. Say so at boot instead.
+  if (config.isProduction && !config.mail.enabled) {
+    lines.push(
+      "WARNING     SMTP is off in production — password reset and email verification cannot be delivered; set SMTP_ENABLED=true"
+    );
+  }
   // Every URL a client is told to use comes from the issuer, so an issuer whose
   // port is not the one being listened on produces a discovery document that
   // points at nothing. Easy to do with PORT set and PUBLIC_BASE_URL left alone,
