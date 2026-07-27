@@ -66,10 +66,12 @@ const SALT_BYTES = 16;
 // hash anyway, on purpose, so their timing does not answer whether the account
 // is real.
 //
-// Two at a time bounds the peak at 256 MiB and still uses the pool. The rate
-// limiter in front is the real defence; this is the floor under it, for the
-// case where the limiter's per-IP key is spread across enough hosts.
-const HASH_CONCURRENCY = 2;
+// One at a time bounds the peak at roughly 128 MiB and one busy CPU core. This
+// service is intended to share a small host with other Knight services, so a
+// second simultaneous hash is a worse default than a short, bounded queue. The
+// rate limiter in front is the first defence; this gate is the floor under it,
+// for callers spread across enough addresses to avoid sharing a rate bucket.
+const HASH_CONCURRENCY = 1;
 
 // Past this, refuse rather than accept work that will not be reached in any
 // useful time. Well out of reach of the rate limiter's defaults, so a 503 here
@@ -101,11 +103,11 @@ function releaseHashSlot() {
   else hashesRunning -= 1;
 }
 
-async function scryptHash(password, salt) {
+async function runScrypt(password, salt, keylen, options) {
   await acquireHashSlot();
   try {
     return await new Promise((resolve, reject) => {
-      crypto.scrypt(password, salt, SCRYPT.keylen, SCRYPT, (error, derivedKey) => {
+      crypto.scrypt(password, salt, keylen, options, (error, derivedKey) => {
         if (error) reject(error);
         else resolve(derivedKey);
       });
@@ -113,6 +115,10 @@ async function scryptHash(password, salt) {
   } finally {
     releaseHashSlot();
   }
+}
+
+async function scryptHash(password, salt) {
+  return runScrypt(password, salt, SCRYPT.keylen, SCRYPT);
 }
 
 /**
@@ -163,16 +169,18 @@ async function verifyPassword(password, storedHash) {
   }
   if (!salt.length || !expected.length) return false;
 
-  const derived = await new Promise((resolve) => {
-    crypto.scrypt(
-      raw,
-      salt,
-      expected.length,
-      { ...params, maxmem: SCRYPT.maxmem },
-      (error, key) => resolve(error ? null : key)
-    );
-  });
-  if (!derived) return false;
+  let derived;
+  try {
+    derived = await runScrypt(raw, salt, expected.length, { ...params, maxmem: SCRYPT.maxmem });
+  } catch (error) {
+    // Queue saturation is an availability signal, not an invalid credential.
+    // Preserve the 503 so known and unknown accounts fail the same way while
+    // the bounded worker is overloaded. Malformed stored parameters still
+    // behave like an invalid hash rather than turning a bad database row into a
+    // server error.
+    if (error?.statusCode === 503) throw error;
+    return false;
+  }
   return crypto.timingSafeEqual(derived, expected);
 }
 

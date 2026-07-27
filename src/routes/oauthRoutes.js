@@ -22,17 +22,6 @@ const express = require("express");
 function createOAuthRoutes({ controller }) {
   const router = express.Router();
 
-  // --- Discovery -----------------------------------------------------------
-  // Both documents, because a plain OAuth 2.0 client looks for RFC 8414's path
-  // and an OIDC client looks for Discovery 1.0's. Serving only one turns a
-  // supported configuration into a support question.
-  router.get("/.well-known/openid-configuration", controller.openidConfiguration);
-  router.get("/.well-known/oauth-authorization-server", controller.authorizationServerMetadata);
-  router.get("/oauth2/jwks", controller.jwks);
-  // The path OIDC Discovery examples use most often. Kept as an alias so a
-  // hand-configured client that guessed it still finds the key set.
-  router.get("/.well-known/jwks.json", controller.jwks);
-
   // --- Authorization -------------------------------------------------------
   router.get("/oauth2/authorize", controller.authorize);
   router.post("/oauth2/authorize", controller.authorize);

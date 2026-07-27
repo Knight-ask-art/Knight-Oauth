@@ -1,7 +1,8 @@
 # Knight OAuth production image.
 #
-# Two stages, so the Prisma CLI and the query engine it downloads at build time
-# do not ship in the runtime image.
+# The multi-stage build removes build-only files and development dependencies.
+# Prisma's CLI and generated query engine remain in the runtime image because
+# the SQLite entrypoint applies production migrations before Node starts.
 
 FROM node:22-bookworm-slim AS build
 

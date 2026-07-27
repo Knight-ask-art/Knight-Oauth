@@ -55,6 +55,20 @@ const PROTOCOL_ENDPOINTS = new Set([
   "/oauth2/register"
 ]);
 
+// These endpoints authenticate exclusively with a client credential, bearer
+// token, or registration access token. They neither render a browser form nor
+// consume browser session state, so issuing a CSRF cookie here only pollutes a
+// machine-to-machine response. Authorization is intentionally absent: it uses
+// the browser session and can lead to login or consent even though its POST is
+// exempt from CSRF validation by protocol design.
+const STATELESS_PROTOCOL_ENDPOINTS = new Set([
+  "/oauth2/token",
+  "/oauth2/introspect",
+  "/oauth2/revoke",
+  "/oauth2/userinfo",
+  "/oauth2/register"
+]);
+
 function isProtocolEndpoint(pathname) {
   if (PROTOCOL_ENDPOINTS.has(pathname)) return true;
   // RFC 7592 client management is /oauth2/register/{client_id}, authenticated by
@@ -62,10 +76,24 @@ function isProtocolEndpoint(pathname) {
   return pathname.startsWith("/oauth2/register/");
 }
 
+function isStatelessProtocolEndpoint(pathname) {
+  if (STATELESS_PROTOCOL_ENDPOINTS.has(pathname)) return true;
+  return pathname.startsWith("/oauth2/register/");
+}
+
 function createCsrfMiddleware({ secureCookies = false } = {}) {
   const cookieName = secureCookies ? CSRF_COOKIE_SECURE : CSRF_COOKIE;
 
   return function csrfMiddleware(req, res, next) {
+    if (isStatelessProtocolEndpoint(req.path)) return next();
+
+    // Every response that can depend on browser identity or contains a CSRF
+    // token is private. `Vary: Cookie` protects against a misconfigured shared
+    // cache, while no-store is the primary boundary and also covers redirects.
+    res.set("Cache-Control", "no-store");
+    res.set("Pragma", "no-cache");
+    res.vary("Cookie");
+
     // No fallback to the unprefixed name. A token is cheap to reissue — the
     // line below does it whenever one is absent — so the only cost of switching
     // is that a form rendered before the change fails once, which is what the
@@ -102,4 +130,10 @@ function createCsrfMiddleware({ secureCookies = false } = {}) {
   };
 }
 
-module.exports = { CSRF_COOKIE, CSRF_COOKIE_SECURE, createCsrfMiddleware, isProtocolEndpoint };
+module.exports = {
+  CSRF_COOKIE,
+  CSRF_COOKIE_SECURE,
+  createCsrfMiddleware,
+  isProtocolEndpoint,
+  isStatelessProtocolEndpoint
+};

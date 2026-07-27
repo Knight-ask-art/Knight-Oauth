@@ -16,6 +16,16 @@ const {
 } = require("../lib/errors");
 const { buildErrorRedirect } = require("../lib/uri");
 
+class RefreshReplayDetected extends Error {}
+class CodeReplayDetected extends Error {}
+class RefreshStateRejected extends Error {
+  constructor(reason, protocolError) {
+    super(protocolError.message);
+    this.reason = reason;
+    this.protocolError = protocolError;
+  }
+}
+
 // The OAuth 2.0 / OpenID Connect provider.
 //
 // Interoperability is the point of this file. A relying party using any
@@ -101,9 +111,148 @@ function createProviderService({
   const requireNonce = Boolean(config?.security?.requireNonceForIdToken);
   const rotateRefreshTokens = config?.security?.rotateRefreshTokens !== false;
   const clockToleranceSeconds = ttl.clockToleranceSeconds || 0;
+  const databaseProvider = config?.database?.provider || "sqlite";
 
   function endpoint(pathname) {
     return `${issuer}${pathname}`;
+  }
+
+  // PostgreSQL needs explicit row locks: a plain read at READ COMMITTED does not
+  // serialize a later credential issuance with a concurrent administrative
+  // change. SQLite has no SELECT ... FOR UPDATE, so a no-op UPDATE takes its
+  // database write lock without changing application data or @updatedAt fields.
+  // Every credential transition uses these in the same order:
+  // Client -> User -> Grant -> Browser Session -> Refresh/Code -> OIDC Session.
+  async function lockClient(database, clientId) {
+    const id = String(clientId || "");
+    if (!id) return null;
+    if (databaseProvider === "postgresql") {
+      await database.$queryRawUnsafe(
+        'SELECT "client_id" FROM "oauth_clients" WHERE "client_id" = $1 FOR UPDATE',
+        id
+      );
+    } else {
+      await database.$executeRawUnsafe(
+        'UPDATE "oauth_clients" SET "client_id" = "client_id" WHERE "client_id" = ?',
+        id
+      );
+    }
+    return clients.toClient(await database.oAuthClient.findUnique({ where: { clientId: id } }));
+  }
+
+  async function lockUser(database, userId) {
+    const id = String(userId || "");
+    if (!id) return null;
+    if (databaseProvider === "postgresql") {
+      await database.$queryRawUnsafe('SELECT "id" FROM "users" WHERE "id" = $1 FOR UPDATE', id);
+    } else {
+      await database.$executeRawUnsafe('UPDATE "users" SET "id" = "id" WHERE "id" = ?', id);
+    }
+    return accounts.toAccount(await database.user.findUnique({ where: { id } }));
+  }
+
+  async function lockGrant(database, { userId, clientId }) {
+    const owner = String(userId || "");
+    const client = String(clientId || "");
+    if (!owner || !client) return null;
+    if (databaseProvider === "postgresql") {
+      await database.$queryRawUnsafe(
+        'SELECT "id" FROM "grants" WHERE "user_id" = $1 AND "client_id" = $2 FOR UPDATE',
+        owner,
+        client
+      );
+    } else {
+      await database.$executeRawUnsafe(
+        'UPDATE "grants" SET "id" = "id" WHERE "user_id" = ? AND "client_id" = ?',
+        owner,
+        client
+      );
+    }
+    return database.grant.findUnique({
+      where: { userId_clientId: { userId: owner, clientId: client } }
+    });
+  }
+
+  async function lockBrowserSession(database, { sessionId, userId, validAt = null }) {
+    const id = String(sessionId || "");
+    const owner = String(userId || "");
+    if (!id || !owner) return null;
+    if (databaseProvider === "postgresql") {
+      await database.$queryRawUnsafe(
+        'SELECT "id" FROM "sessions" WHERE "id" = $1 AND "user_id" = $2 FOR UPDATE',
+        id,
+        owner
+      );
+    } else {
+      await database.$executeRawUnsafe(
+        'UPDATE "sessions" SET "id" = "id" WHERE "id" = ? AND "user_id" = ?',
+        id,
+        owner
+      );
+    }
+    const record = await database.session.findUnique({ where: { id } });
+    if (!record || record.userId !== owner) return null;
+    if (validAt && record.expiresAt <= validAt) return null;
+    return record;
+  }
+
+  function assertAuthorizationClientEligible(client, scopes, redirectUri) {
+    if (!client || client.status !== clients.STATUS.APPROVED) {
+      throw accessDenied("This application is no longer permitted to sign users in");
+    }
+    if (!client.allowedGrantTypes.includes("authorization_code")) {
+      throw accessDenied("This application is no longer permitted to use authorization codes");
+    }
+    if (!scopeRegistry.covers(client.allowedScopes, scopes)) {
+      throw invalidScope("This application is no longer permitted to request one or more approved scopes");
+    }
+    try {
+      clients.resolveRedirectUri(client, redirectUri);
+    } catch {
+      throw accessDenied("This application's callback is no longer registered");
+    }
+  }
+
+  function assertTokenClientEligible(client, scopes, grantType, redirectUri = null) {
+    if (
+      !client ||
+      client.status !== clients.STATUS.APPROVED ||
+      !client.allowedGrantTypes.includes(grantType) ||
+      !scopeRegistry.covers(client.allowedScopes, scopes)
+    ) {
+      throw invalidGrant("The authorization is no longer valid for this client");
+    }
+    if (redirectUri) {
+      try {
+        clients.resolveRedirectUri(client, redirectUri);
+      } catch {
+        throw invalidGrant("The authorization callback is no longer registered for this client");
+      }
+    }
+  }
+
+  function assertTokenAccountEligible(account, scopes) {
+    if (!account || account.status === accounts.STATUS.DISABLED) {
+      throw invalidGrant("That account is no longer available");
+    }
+    try {
+      scopeRegistry.assertAllowedForUser(account, scopes);
+    } catch {
+      throw invalidGrant("The authorization is no longer permitted for this account");
+    }
+  }
+
+  function scopesRemainAllowed(account, client, grant, scopes) {
+    if (!account || account.status === accounts.STATUS.DISABLED) return false;
+    if (!client || client.status !== clients.STATUS.APPROVED) return false;
+    if (!scopeRegistry.covers(client.allowedScopes, scopes)) return false;
+    if (!grant || grant.revokedAt || !scopeRegistry.covers(decodeScopes(grant.scopes), scopes)) return false;
+    try {
+      scopeRegistry.assertAllowedForUser(account, scopes);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // --- Discovery -----------------------------------------------------------
@@ -475,9 +624,9 @@ function createProviderService({
    * constraint becomes a widening of the row that beat it. Both halves converge
    * on the union, which is what the user actually agreed to.
    */
-  async function upsertGrant({ userId, clientId, scopes }) {
+  async function upsertGrant({ userId, clientId, scopes, database = prisma }) {
     for (let attempt = 0; attempt < 4; attempt += 1) {
-      const existing = await prisma.grant.findUnique({
+      const existing = await database.grant.findUnique({
         where: { userId_clientId: { userId, clientId } }
       });
       const merged = scopeRegistry.sort([
@@ -487,7 +636,7 @@ function createProviderService({
 
       if (!existing) {
         try {
-          return await prisma.grant.create({
+          return await database.grant.create({
             data: { id: randomId(), userId, clientId, scopes: encodeScopes(merged) }
           });
         } catch (error) {
@@ -499,7 +648,7 @@ function createProviderService({
         }
       }
 
-      const claimed = await prisma.grant.updateMany({
+      const claimed = await database.grant.updateMany({
         where: { id: existing.id, version: existing.version },
         data: {
           scopes: encodeScopes(merged),
@@ -511,7 +660,7 @@ function createProviderService({
         }
       });
       if (claimed.count) {
-        return prisma.grant.findUnique({ where: { id: existing.id } });
+        return database.grant.findUnique({ where: { id: existing.id } });
       }
     }
 
@@ -524,54 +673,100 @@ function createProviderService({
    * Issues an authorization code and marks the request consumed, so one
    * authorization request can never yield two codes.
    */
-  async function issueCode({ request, account, session, scopes }) {
+  async function issueCode({ request, account, session, scopes, explicitConsent }) {
     const code = randomToken();
     const consumedAt = now();
+    const issued = await prisma.$transaction(async (database) => {
+      const currentClient = await lockClient(database, request.client.clientId);
+      assertAuthorizationClientEligible(currentClient, scopes, request.redirectUri);
 
-    const consumed = await prisma.authorizationRequest.updateMany({
-      where: { id: request.id, consumedAt: null },
-      data: { consumedAt }
-    });
-    if (!consumed.count) throw invalidRequest("This authorization request has already been completed");
-
-    // The per-client session view backs `sid`, session status, and back-channel
-    // logout fan-out.
-    const oidcSession = await prisma.oidcSession.upsert({
-      where: { sessionId_clientId: { sessionId: session.id, clientId: request.client.clientId } },
-      create: {
-        id: randomId(),
-        sessionId: session.id,
-        clientId: request.client.clientId,
-        userId: account.id,
-        authTime: session.authTime,
-        lastSeenAt: consumedAt
-      },
-      update: { lastSeenAt: consumedAt, revokedAt: null, revocationReason: null }
-    });
-
-    await prisma.authorizationCode.create({
-      data: {
-        id: randomId(),
-        codeHash: hashToken(code),
-        clientId: request.client.clientId,
-        redirectUri: request.redirectUri,
-        nonce: request.nonce,
-        codeChallenge: request.codeChallenge,
-        codeChallengeMethod: request.codeChallengeMethod,
-        scopes: encodeScopes(scopes),
-        userId: account.id,
-        sessionId: session.id,
-        authTime: session.authTime,
-        expiresAt: new Date(consumedAt.getTime() + ttl.authorizationCodeSeconds * 1000)
+      const currentAccount = await lockUser(database, account?.id);
+      if (!currentAccount || currentAccount.status === accounts.STATUS.DISABLED) {
+        throw accessDenied("That account is no longer available");
       }
+      scopeRegistry.assertAllowedForUser(currentAccount, scopes);
+
+      let grant = await lockGrant(database, {
+        userId: currentAccount.id,
+        clientId: currentClient.clientId
+      });
+      if (explicitConsent || !currentClient.requireConsent) {
+        grant = await upsertGrant({
+          userId: currentAccount.id,
+          clientId: currentClient.clientId,
+          scopes,
+          database
+        });
+      }
+      if (!grant || grant.revokedAt || !scopeRegistry.covers(decodeScopes(grant.scopes), scopes)) {
+        throw accessDenied("Access for this application is no longer authorized");
+      }
+
+      const browserSession = await lockBrowserSession(database, {
+        sessionId: session?.id,
+        userId: currentAccount.id,
+        validAt: consumedAt
+      });
+      if (!browserSession) {
+        throw accessDenied("The signed-in browser session is no longer available");
+      }
+
+      const consumed = await database.authorizationRequest.updateMany({
+        where: { id: request.id, consumedAt: null, expiresAt: { gt: consumedAt } },
+        data: { consumedAt }
+      });
+      if (!consumed.count) {
+        throw invalidRequest("This authorization request has expired or already been completed");
+      }
+
+      // The per-client session view backs `sid`, session status, and
+      // back-channel logout fan-out.
+      const established = await database.oidcSession.upsert({
+        where: {
+          sessionId_clientId: { sessionId: browserSession.id, clientId: currentClient.clientId }
+        },
+        create: {
+          id: randomId(),
+          sessionId: browserSession.id,
+          clientId: currentClient.clientId,
+          userId: currentAccount.id,
+          authTime: browserSession.createdAt,
+          lastSeenAt: consumedAt
+        },
+        update: {
+          userId: currentAccount.id,
+          authTime: browserSession.createdAt,
+          lastSeenAt: consumedAt,
+          revokedAt: null,
+          revocationReason: null
+        }
+      });
+
+      await database.authorizationCode.create({
+        data: {
+          id: randomId(),
+          codeHash: hashToken(code),
+          clientId: currentClient.clientId,
+          redirectUri: request.redirectUri,
+          nonce: request.nonce,
+          codeChallenge: request.codeChallenge,
+          codeChallengeMethod: request.codeChallengeMethod,
+          scopes: encodeScopes(scopes),
+          userId: currentAccount.id,
+          sessionId: browserSession.id,
+          authTime: browserSession.createdAt,
+          expiresAt: new Date(consumedAt.getTime() + ttl.authorizationCodeSeconds * 1000)
+        }
+      });
+      return { oidcSession: established, account: currentAccount, client: currentClient };
     });
 
     await auditLog?.record({
       action: "oauth.code.issued",
-      actorUserId: account.id,
+      actorUserId: issued.account.id,
       targetType: "client",
-      targetId: request.client.clientId,
-      metadata: { scopes, sid: oidcSession.id }
+      targetId: issued.client.clientId,
+      metadata: { scopes, sid: issued.oidcSession.id }
     });
 
     const redirect = new URL(request.redirectUri);
@@ -590,7 +785,8 @@ function createProviderService({
     const request = await loadAuthorizationRequest(requestToken);
     if (!request) throw invalidRequest("This sign-in request has expired. Start again from the application.");
 
-    const scopes = approvedScopes
+    const explicitConsent = approvedScopes !== null;
+    const scopes = explicitConsent
       ? scopeRegistry.sort(request.scopes.filter((scope) => approvedScopes.includes(scope)))
       : request.scopes;
 
@@ -610,18 +806,21 @@ function createProviderService({
     }
 
     scopeRegistry.assertAllowedForUser(account, scopes);
-    await upsertGrant({ userId: account.id, clientId: request.client.clientId, scopes });
-    return issueCode({ request, account, session, scopes });
+    return issueCode({ request, account, session, scopes, explicitConsent });
   }
 
   /** Records the user's refusal as an `access_denied` redirect (RFC 6749 4.1.2.1). */
   async function denyAuthorization({ requestToken }) {
     const request = await loadAuthorizationRequest(requestToken);
     if (!request) throw invalidRequest("This sign-in request has expired");
-    await prisma.authorizationRequest.updateMany({
-      where: { id: request.id, consumedAt: null },
-      data: { consumedAt: now() }
+    const claimTime = now();
+    const consumed = await prisma.authorizationRequest.updateMany({
+      where: { id: request.id, consumedAt: null, expiresAt: { gt: claimTime } },
+      data: { consumedAt: claimTime }
     });
+    if (!consumed.count) {
+      throw invalidRequest("This sign-in request has expired or already been completed");
+    }
     return {
       redirectUrl: buildErrorRedirect(request.redirectUri, {
         error: "access_denied",
@@ -705,7 +904,12 @@ function createProviderService({
     const refuseAsReplay = async () => {
       // The code is gone, but a token issued from its first use may still be
       // live, so every token descended from it is revoked.
-      await revokeTokensForSession({ sessionId: record.sessionId, clientId: client.clientId, reason: "code_replay" });
+      await revokeTokensForSession({
+        sessionId: record.sessionId,
+        clientId: client.clientId,
+        userId: record.userId,
+        reason: "code_replay"
+      });
       await auditLog?.record({
         action: "oauth.code.replayed",
         actorUserId: record.userId,
@@ -730,36 +934,80 @@ function createProviderService({
 
     verifyPkce({ record, body, client });
 
-    // The conditional update is what makes redemption single-use: the database
-    // decides which of two concurrent requests gets the row, not a read we
-    // performed earlier.
-    const claimed = await prisma.authorizationCode.updateMany({
-      where: { id: record.id, usedAt: null },
-      data: { usedAt: now() }
-    });
-    if (!claimed.count) {
+    // Resolve the key before opening the database transaction. A generated key
+    // may itself need the database on first boot, and nested work through the
+    // root client would defeat the atomic state transition below.
+    await keys.ensureKeyRing();
+
+    const issuedAt = now();
+    const accessTokenId = randomId();
+    const scopes = decodeScopes(record.scopes);
+    let account;
+    let issuedClient;
+    let response;
+    try {
+      response = await prisma.$transaction(async (database) => {
+        issuedClient = await lockClient(database, client.clientId);
+        assertTokenClientEligible(issuedClient, scopes, "authorization_code", record.redirectUri);
+        verifyPkce({ record, body, client: issuedClient });
+
+        account = await lockUser(database, record.userId);
+        assertTokenAccountEligible(account, scopes);
+
+        const grant = await lockGrant(database, {
+          userId: record.userId,
+          clientId: issuedClient.clientId
+        });
+        if (!grant || grant.revokedAt || !scopeRegistry.covers(decodeScopes(grant.scopes), scopes)) {
+          throw invalidGrant("Access for this application has been revoked");
+        }
+
+        // Claiming the code and storing every token derived from it are one
+        // transition. A database error therefore leaves the code retryable.
+        const claimed = await database.authorizationCode.updateMany({
+          where: { id: record.id, usedAt: null, expiresAt: { gt: issuedAt } },
+          data: { usedAt: issuedAt }
+        });
+        if (!claimed.count) {
+          const current = await database.authorizationCode.findUnique({ where: { id: record.id } });
+          if (current?.usedAt) throw new CodeReplayDetected();
+          throw invalidGrant("The authorization code has expired");
+        }
+
+        const session = await database.oidcSession.findUnique({
+          where: {
+            sessionId_clientId: { sessionId: record.sessionId, clientId: issuedClient.clientId }
+          }
+        });
+        if (!session || session.revokedAt) throw invalidGrant("That session has been ended");
+
+        return issueTokens({
+          client: issuedClient,
+          account,
+          scopes,
+          sessionId: record.sessionId,
+          sid: session.id,
+          authTime: record.authTime,
+          nonce: record.nonce,
+          database,
+          issuedAt,
+          accessTokenId,
+          recordAudit: false
+        });
+      });
+    } catch (error) {
+      if (!(error instanceof CodeReplayDetected)) throw error;
       throw await refuseAsReplay();
     }
 
-    const account = await accounts.findById(record.userId);
-    if (!account || account.status === accounts.STATUS.DISABLED) {
-      throw invalidGrant("That account is no longer available");
-    }
-
-    const oidcSession = await prisma.oidcSession.findUnique({
-      where: { sessionId_clientId: { sessionId: record.sessionId, clientId: client.clientId } }
-    });
-    if (oidcSession?.revokedAt) throw invalidGrant("That session has been ended");
-
-    return issueTokens({
-      client,
+    await recordTokenIssued({
+      client: issuedClient,
       account,
-      scopes: decodeScopes(record.scopes),
-      sessionId: record.sessionId,
-      sid: oidcSession?.id || record.sessionId,
-      authTime: record.authTime,
-      nonce: record.nonce
+      scopes,
+      refreshed: false,
+      accessTokenId
     });
+    return response;
   }
 
   /**
@@ -825,28 +1073,6 @@ function createProviderService({
 
     if (record.expiresAt <= now()) throw invalidGrant("The refresh token has expired");
 
-    const account = await accounts.findById(record.userId);
-    if (!account || account.status === accounts.STATUS.DISABLED) {
-      await revokeFamily(record.familyId, "account_unavailable");
-      throw invalidGrant("That account is no longer available");
-    }
-
-    // A grant the user has since revoked must stop working, or "revoke access"
-    // means nothing until the refresh token expires on its own.
-    const grant = await findActiveGrant({ userId: account.id, clientId: client.clientId });
-    if (!grant) {
-      await revokeFamily(record.familyId, "grant_revoked");
-      throw invalidGrant("Access for this application has been revoked");
-    }
-
-    const oidcSession = await prisma.oidcSession.findUnique({
-      where: { sessionId_clientId: { sessionId: record.sessionId, clientId: client.clientId } }
-    });
-    if (oidcSession?.revokedAt) {
-      await revokeFamily(record.familyId, "session_ended");
-      throw invalidGrant("That session has been ended");
-    }
-
     let scopes = decodeScopes(record.scopes);
     // RFC 6749 section 6: the requested scope must not exceed what was granted.
     if (body.scope) {
@@ -856,33 +1082,221 @@ function createProviderService({
       }
       scopes = requested;
     }
-    // Narrow to what the grant still covers, in case it was reduced.
-    scopes = scopeRegistry.sort(scopes.filter((scope) => decodeScopes(grant.scopes).includes(scope)));
-    if (!scopes.length) throw invalidGrant("Access for this application has been revoked");
 
-    if (rotateRefreshTokens) {
-      const claimed = await prisma.refreshToken.updateMany({
-        where: { id: record.id, usedAt: null, revokedAt: null },
-        data: { usedAt: now() }
-      });
-      if (!claimed.count) {
-        await revokeFamily(record.familyId, "refresh_replay");
-        throw invalidGrant("The refresh token has been revoked");
-      }
-    }
-
-    return issueTokens({
-      client,
-      account,
+    const tokenArgs = {
       scopes,
       sessionId: record.sessionId,
-      sid: oidcSession?.id || record.sessionId,
       authTime: record.authTime,
       // No `nonce` on a refresh: OIDC Core section 12.2 says an ID token issued
       // from a refresh must not carry the original nonce.
       nonce: null,
       familyId: record.familyId,
       parentTokenId: record.id
+    };
+
+    if (!rotateRefreshTokens) {
+      // RFC 6749 makes a replacement refresh token optional. Reuse the
+      // presented token in this compatibility mode instead of minting an
+      // unbounded tree of live siblings on every exchange.
+      //
+      // The original row still has to participate in the transaction. Without
+      // the conditional update below, RFC 7009 revocation can commit after the
+      // pre-read above but before token issuance, and this request would return
+      // a new access token from an already-revoked refresh token. Writing the
+      // unchanged expiry acquires the row lock without rotating or extending
+      // the credential.
+      await keys.ensureKeyRing();
+      const issuedAt = now();
+      const accessTokenId = randomId();
+      let issuedAccount;
+      let issuedClient;
+      let response;
+      try {
+        response = await prisma.$transaction(async (database) => {
+          issuedClient = await lockClient(database, client.clientId);
+          try {
+            assertTokenClientEligible(issuedClient, scopes, "refresh_token");
+          } catch (error) {
+            throw new RefreshStateRejected("client_changed", error);
+          }
+
+          issuedAccount = await lockUser(database, record.userId);
+          try {
+            assertTokenAccountEligible(issuedAccount, scopes);
+          } catch (error) {
+            throw new RefreshStateRejected("account_unavailable", error);
+          }
+
+          const currentGrant = await lockGrant(database, {
+            userId: record.userId,
+            clientId: issuedClient.clientId
+          });
+          if (
+            !currentGrant ||
+            currentGrant.revokedAt ||
+            !scopeRegistry.covers(decodeScopes(currentGrant.scopes), scopes)
+          ) {
+            throw new RefreshStateRejected(
+              "grant_revoked",
+              invalidGrant("Access for this application has been revoked")
+            );
+          }
+
+          const locked = await database.refreshToken.updateMany({
+            where: {
+              id: record.id,
+              usedAt: null,
+              revokedAt: null,
+              expiresAt: { gt: issuedAt }
+            },
+            data: { expiresAt: record.expiresAt }
+          });
+          if (!locked.count) {
+            throw new RefreshStateRejected(
+              "refresh_revoked",
+              invalidGrant("The refresh token has been revoked")
+            );
+          }
+
+          const currentSession = await database.oidcSession.findUnique({
+            where: {
+              sessionId_clientId: { sessionId: record.sessionId, clientId: issuedClient.clientId }
+            }
+          });
+          if (!currentSession || currentSession.revokedAt) {
+            throw new RefreshStateRejected("session_ended", invalidGrant("That session has been ended"));
+          }
+
+          return issueTokens({
+            ...tokenArgs,
+            client: issuedClient,
+            account: issuedAccount,
+            sid: currentSession.id,
+            database,
+            issuedAt,
+            accessTokenId,
+            recordAudit: false,
+            issueRefreshToken: false
+          });
+        });
+      } catch (error) {
+        if (!(error instanceof RefreshStateRejected)) throw error;
+        if (error.reason !== "refresh_revoked") {
+          await revokeFamily(record.familyId, error.reason);
+        }
+        throw error.protocolError;
+      }
+
+      await recordTokenIssued({
+        client: issuedClient,
+        account: issuedAccount,
+        scopes,
+        refreshed: true,
+        accessTokenId
+      });
+      return response;
+    }
+
+    // Retiring the presented token and storing its replacement are one state
+    // transition. Otherwise a database error between the two writes makes a
+    // legitimate retry look like theft and revokes the whole token family.
+    await keys.ensureKeyRing();
+    const issuedAt = now();
+    const accessTokenId = randomId();
+    let issuedAccount;
+    let issuedClient;
+    let response;
+    try {
+      response = await prisma.$transaction(async (database) => {
+        issuedClient = await lockClient(database, client.clientId);
+        try {
+          assertTokenClientEligible(issuedClient, scopes, "refresh_token");
+        } catch (error) {
+          throw new RefreshStateRejected("client_changed", error);
+        }
+
+        issuedAccount = await lockUser(database, record.userId);
+        try {
+          assertTokenAccountEligible(issuedAccount, scopes);
+        } catch (error) {
+          throw new RefreshStateRejected("account_unavailable", error);
+        }
+
+        const currentGrant = await lockGrant(database, {
+          userId: record.userId,
+          clientId: issuedClient.clientId
+        });
+        if (
+          !currentGrant ||
+          currentGrant.revokedAt ||
+          !scopeRegistry.covers(decodeScopes(currentGrant.scopes), scopes)
+        ) {
+          throw new RefreshStateRejected(
+            "grant_revoked",
+            invalidGrant("Access for this application has been revoked")
+          );
+        }
+
+        const claimed = await database.refreshToken.updateMany({
+          where: { id: record.id, usedAt: null, revokedAt: null, expiresAt: { gt: issuedAt } },
+          data: { usedAt: issuedAt }
+        });
+        if (!claimed.count) throw new RefreshReplayDetected();
+
+        const currentSession = await database.oidcSession.findUnique({
+          where: {
+            sessionId_clientId: { sessionId: record.sessionId, clientId: issuedClient.clientId }
+          }
+        });
+        if (!currentSession || currentSession.revokedAt) {
+          throw new RefreshStateRejected("session_ended", invalidGrant("That session has been ended"));
+        }
+
+        return issueTokens({
+          ...tokenArgs,
+          client: issuedClient,
+          account: issuedAccount,
+          sid: currentSession.id,
+          database,
+          issuedAt,
+          accessTokenId,
+          recordAudit: false
+        });
+      });
+    } catch (error) {
+      if (error instanceof RefreshStateRejected) {
+        await revokeFamily(record.familyId, error.reason);
+        throw error.protocolError;
+      }
+      if (!(error instanceof RefreshReplayDetected)) throw error;
+      await revokeFamily(record.familyId, "refresh_replay");
+      await auditLog?.record({
+        action: "oauth.refresh.replayed",
+        actorUserId: record.userId,
+        targetType: "client",
+        targetId: client.clientId,
+        metadata: { familyId: record.familyId }
+      });
+      throw invalidGrant("The refresh token has been revoked");
+    }
+
+    await recordTokenIssued({
+      client: issuedClient,
+      account: issuedAccount,
+      scopes,
+      refreshed: true,
+      accessTokenId
+    });
+    return response;
+  }
+
+  async function recordTokenIssued({ client, account, scopes, refreshed, accessTokenId }) {
+    await auditLog?.record({
+      action: "oauth.token.issued",
+      actorUserId: account.id,
+      targetType: "client",
+      targetId: client.clientId,
+      metadata: { scopes, refreshed, jti: accessTokenId }
     });
   }
 
@@ -903,12 +1317,15 @@ function createProviderService({
     authTime,
     nonce,
     familyId = null,
-    parentTokenId = null
+    parentTokenId = null,
+    database = prisma,
+    issuedAt = now(),
+    accessTokenId = randomId(),
+    recordAudit = true,
+    issueRefreshToken = true
   }) {
     const keyRing = await keys.ensureKeyRing();
-    const issuedAt = now();
     const issuedAtSeconds = epoch(issuedAt);
-    const accessTokenId = randomId();
 
     const accessToken = signJwt({
       key: keyRing.activeKey,
@@ -959,10 +1376,10 @@ function createProviderService({
       client.allowedGrantTypes.includes("refresh_token") &&
       (scopes.includes("offline_access") || (client.isFirstParty && !scopes.includes("openid")));
 
-    if (wantsRefresh) {
+    if (wantsRefresh && issueRefreshToken) {
       const refreshToken = randomToken();
       const family = familyId || randomId();
-      await prisma.refreshToken.create({
+      await database.refreshToken.create({
         data: {
           id: randomId(),
           tokenHash: hashToken(refreshToken),
@@ -979,18 +1396,21 @@ function createProviderService({
       response.refresh_token = refreshToken;
     }
 
-    await prisma.oidcSession.updateMany({
-      where: { sessionId, clientId: client.clientId },
+    const touchedSession = await database.oidcSession.updateMany({
+      where: { id: sid, sessionId, clientId: client.clientId, revokedAt: null },
       data: { lastSeenAt: issuedAt }
     });
+    if (touchedSession.count !== 1) throw invalidGrant("That session has been ended");
 
-    await auditLog?.record({
-      action: "oauth.token.issued",
-      actorUserId: account.id,
-      targetType: "client",
-      targetId: client.clientId,
-      metadata: { scopes, refreshed: Boolean(parentTokenId), jti: accessTokenId }
-    });
+    if (recordAudit) {
+      await recordTokenIssued({
+        client,
+        account,
+        scopes,
+        refreshed: Boolean(parentTokenId),
+        accessTokenId
+      });
+    }
 
     return response;
   }
@@ -1030,7 +1450,10 @@ function createProviderService({
   function buildUserClaims({ account, scopes }) {
     const baseClaims = {
       name: account.name,
-      preferred_username: account.username || null,
+      // OIDC calls this value "preferred", not unique. An externally linked
+      // account can therefore preserve its upstream display username without
+      // using that value as the local account-binding key.
+      preferred_username: account.username || account.attributes?.external_preferred_username || null,
       picture: account.picture,
       email: account.email,
       email_verified: account.emailVerified,
@@ -1056,14 +1479,23 @@ function createProviderService({
    */
   async function userinfo({ accessToken }) {
     const verified = await verifyAccessToken(accessToken);
-    if (!verified.claims.scope || !decodeScopes(verified.claims.scope).includes("openid")) {
+    const scopes = decodeScopes(verified.claims.scope);
+    if (!verified.claims.scope || !scopes.includes("openid")) {
       // Section 5.3.1: UserInfo requires an access token issued with `openid`.
       throw invalidToken("This access token was not issued with the openid scope");
     }
 
+    const currentClient = await clients.findByClientId(verified.claims.client_id);
     const account = await accounts.findById(verified.claims.sub);
-    if (!account || account.status === accounts.STATUS.DISABLED) {
-      throw invalidToken("That account is no longer available");
+    const grant = currentClient
+      ? await prisma.grant.findUnique({
+          where: {
+            userId_clientId: { userId: verified.claims.sub, clientId: currentClient.clientId }
+          }
+        })
+      : null;
+    if (!scopesRemainAllowed(account, currentClient, grant, scopes)) {
+      throw invalidToken("This access token is no longer authorized");
     }
 
     // The same three lines introspection already had.
@@ -1081,9 +1513,15 @@ function createProviderService({
     const session = verified.claims.sid
       ? await prisma.oidcSession.findUnique({ where: { id: verified.claims.sid } })
       : null;
-    if (session?.revokedAt) throw invalidToken("That session has been ended");
+    if (
+      !session ||
+      session.revokedAt ||
+      session.userId !== account.id ||
+      session.clientId !== currentClient.clientId
+    ) {
+      throw invalidToken("That session has ended or is no longer available");
+    }
 
-    const scopes = decodeScopes(verified.claims.scope);
     return {
       sub: account.id,
       ...buildUserClaims({ account, scopes })
@@ -1169,18 +1607,32 @@ function createProviderService({
     // Only the client the token was issued to may introspect it.
     if (!safeEqual(claims.client_id || "", client.clientId)) return { active: false };
 
-    const session = claims.sid ? await prisma.oidcSession.findUnique({ where: { id: claims.sid } }) : null;
-    if (session?.revokedAt) return { active: false };
-
+    const scopes = decodeScopes(claims.scope);
+    const currentClient = await clients.findByClientId(client.clientId);
     const account = await accounts.findById(claims.sub);
-    if (!account || account.status === accounts.STATUS.DISABLED) return { active: false };
+    const grant = currentClient
+      ? await prisma.grant.findUnique({
+          where: { userId_clientId: { userId: claims.sub, clientId: currentClient.clientId } }
+        })
+      : null;
+    if (!scopesRemainAllowed(account, currentClient, grant, scopes)) return { active: false };
+
+    const session = claims.sid ? await prisma.oidcSession.findUnique({ where: { id: claims.sid } }) : null;
+    if (
+      !session ||
+      session.revokedAt ||
+      session.userId !== account.id ||
+      session.clientId !== currentClient.clientId
+    ) {
+      return { active: false };
+    }
 
     return {
       active: true,
       scope: claims.scope,
       client_id: claims.client_id,
       // RFC 7662 section 2.2 lists `username` as a human-readable identifier.
-      username: account.username || account.email,
+      username: account.username || account.attributes?.external_preferred_username || account.email,
       token_type: "Bearer",
       exp: claims.exp,
       iat: claims.iat,
@@ -1199,14 +1651,33 @@ function createProviderService({
     if (!safeEqual(record.clientId, client.clientId)) return { active: false };
     if (record.revokedAt || record.usedAt || record.expiresAt <= now()) return { active: false };
 
+    const scopes = decodeScopes(record.scopes);
+    const currentClient = await clients.findByClientId(client.clientId);
     const account = await accounts.findById(record.userId);
-    if (!account || account.status === accounts.STATUS.DISABLED) return { active: false };
+    const grant = currentClient
+      ? await prisma.grant.findUnique({
+          where: { userId_clientId: { userId: record.userId, clientId: currentClient.clientId } }
+        })
+      : null;
+    if (
+      !currentClient?.allowedGrantTypes.includes("refresh_token") ||
+      !scopesRemainAllowed(account, currentClient, grant, scopes)
+    ) {
+      return { active: false };
+    }
+
+    const session = await prisma.oidcSession.findUnique({
+      where: {
+        sessionId_clientId: { sessionId: record.sessionId, clientId: currentClient.clientId }
+      }
+    });
+    if (!session || session.revokedAt || session.userId !== account.id) return { active: false };
 
     return {
       active: true,
-      scope: decodeScopes(record.scopes).join(" "),
+      scope: scopes.join(" "),
       client_id: record.clientId,
-      username: account.username || account.email,
+      username: account.username || account.attributes?.external_preferred_username || account.email,
       token_type: "Bearer",
       exp: epoch(record.expiresAt),
       iat: epoch(record.createdAt),
@@ -1242,51 +1713,100 @@ function createProviderService({
       return { revoked: true };
     }
 
-    // An access token is a self-contained JWT and cannot be withdrawn before it
-    // expires. Revoking the family behind it is the honest interpretation of the
-    // request, and its short lifetime is what bounds the exposure.
+    // A resource server validating a JWT offline cannot observe revocation until
+    // expiry. This issuer can: UserInfo and introspection both consult the OIDC
+    // session, so ending that session makes the presented token inactive here
+    // and also retires refresh tokens descended from the same browser session.
+    let claims;
     try {
-      const claims = await verifyIssuedJwt(token);
-      if (claims.token_use === "access" && safeEqual(claims.client_id || "", client.clientId)) {
-        await prisma.refreshToken.updateMany({
-          where: { userId: claims.sub, clientId: client.clientId, revokedAt: null },
-          data: { revokedAt: now() }
-        });
-        await auditLog?.record({
-          action: "oauth.token.revoked",
-          actorUserId: claims.sub,
-          targetType: "client",
-          targetId: client.clientId,
-          metadata: { token_use: "access" }
-        });
-      }
+      claims = await verifyIssuedJwt(token);
     } catch {
       // An unknown or malformed token is not an error here, per RFC 7009.
+      return { revoked: true };
+    }
+    if (claims.token_use === "access" && safeEqual(claims.client_id || "", client.clientId)) {
+      const session = claims.sid
+        ? await prisma.oidcSession.findUnique({ where: { id: String(claims.sid) } })
+        : null;
+      if (
+        session &&
+        session.clientId === client.clientId &&
+        session.userId === claims.sub
+      ) {
+        await revokeTokensForSession({
+          sessionId: session.sessionId,
+          clientId: client.clientId,
+          userId: claims.sub,
+          reason: "client_revoked"
+        });
+      }
+      await auditLog?.record({
+        action: "oauth.token.revoked",
+        actorUserId: claims.sub,
+        targetType: "client",
+        targetId: client.clientId,
+        metadata: { token_use: "access" }
+      });
     }
     return { revoked: true };
   }
 
   async function revokeFamily(familyId, reason) {
-    await prisma.refreshToken.updateMany({
-      where: { familyId, revokedAt: null },
-      data: { revokedAt: now() }
+    const family = await prisma.refreshToken.findFirst({
+      where: { familyId: String(familyId) },
+      select: { clientId: true, userId: true }
     });
+    if (!family) return { revoked: 0 };
+
+    const timestamp = now();
+    const revoked = await prisma.$transaction(async (database) => {
+      // Refresh issuance takes these locks in the same order. Whichever side
+      // obtains the Grant lock first completes its whole state transition before
+      // the other can inspect or change the family, so a replacement token
+      // cannot be inserted just after this update and escape revocation.
+      const client = await lockClient(database, family.clientId);
+      if (!client) return 0;
+      const user = await lockUser(database, family.userId);
+      if (!user) return 0;
+      await lockGrant(database, { userId: family.userId, clientId: family.clientId });
+
+      const result = await database.refreshToken.updateMany({
+        where: { familyId: String(familyId), revokedAt: null },
+        data: { revokedAt: timestamp }
+      });
+      return result.count;
+    });
+
     await auditLog?.record({
       action: "oauth.refresh.family_revoked",
       targetType: "refresh_family",
       targetId: familyId,
       metadata: { reason }
     });
+    return { revoked };
   }
 
-  async function revokeTokensForSession({ sessionId, clientId, reason }) {
-    await prisma.refreshToken.updateMany({
-      where: { sessionId, clientId, revokedAt: null },
-      data: { revokedAt: now() }
-    });
-    await prisma.oidcSession.updateMany({
-      where: { sessionId, clientId, revokedAt: null },
-      data: { revokedAt: now(), revocationReason: reason }
+  async function revokeTokensForSession({ sessionId, clientId, userId, reason }) {
+    const timestamp = now();
+    await prisma.$transaction(async (database) => {
+      // Code-replay containment is one transition. If either write fails, a
+      // caller may retry the replay response without leaving a live refresh
+      // family behind a revoked OIDC session, or the inverse.
+      const client = await lockClient(database, clientId);
+      if (!client) return;
+      const user = await lockUser(database, userId);
+      if (!user) return;
+      await lockGrant(database, { userId, clientId });
+      await lockBrowserSession(database, { sessionId, userId, validAt: null });
+
+      await database.refreshToken.updateMany({
+        where: { sessionId, clientId, revokedAt: null },
+        data: { revokedAt: timestamp }
+      });
+      await database.oidcSession.updateMany({
+        where: { sessionId, clientId, revokedAt: null },
+        data: { revokedAt: timestamp, revocationReason: reason }
+      });
     });
   }
 
@@ -1332,44 +1852,67 @@ function createProviderService({
    * rather than discovering it on its next refresh.
    */
   async function revokeGrant({ userId, clientId, reason = "user_revoked", actorUserId = null }) {
-    const grant = await prisma.grant.findUnique({
-      where: { userId_clientId: { userId: String(userId), clientId: String(clientId) } }
-    });
-    if (!grant || grant.revokedAt) return { revoked: false };
-
+    const ownerId = String(userId);
+    const relyingPartyId = String(clientId);
     const timestamp = now();
-    await prisma.grant.update({
-      where: { id: grant.id },
-      data: { revokedAt: timestamp, version: grant.version + 1 }
-    });
-    await prisma.refreshToken.updateMany({
-      where: { userId: grant.userId, clientId: grant.clientId, revokedAt: null },
-      data: { revokedAt: timestamp }
-    });
-    await prisma.authorizationCode.updateMany({
-      where: { userId: grant.userId, clientId: grant.clientId, usedAt: null },
-      data: { usedAt: timestamp }
-    });
+    const revoked = await prisma.$transaction(async (database) => {
+      // Match authorization and refresh issuance's stable lock order. A grant
+      // that is being withdrawn cannot be widened, used for a new code, or used
+      // for a replacement refresh token after this transaction has observed it.
+      const client = await lockClient(database, relyingPartyId);
+      if (!client) return null;
+      const user = await lockUser(database, ownerId);
+      if (!user) return null;
+      const grant = await lockGrant(database, { userId: ownerId, clientId: relyingPartyId });
+      if (!grant || grant.revokedAt) return null;
 
-    const oidcSessions = await prisma.oidcSession.findMany({
-      where: { userId: grant.userId, clientId: grant.clientId, revokedAt: null }
-    });
-    await prisma.oidcSession.updateMany({
-      where: { userId: grant.userId, clientId: grant.clientId, revokedAt: null },
-      data: { revokedAt: timestamp, revocationReason: reason }
-    });
-
-    for (const session of oidcSessions) {
-      await backchannel?.enqueue({
-        clientId: grant.clientId,
-        // `session.id`, not `session.sessionId`: the ID token published the
-        // former as `sid`, and that is what the relying party indexed by.
-        sid: session.id,
-        userId: grant.userId,
-        subject: grant.userId,
-        reason
+      // The row lock serializes concurrent withdrawal requests; the conditional
+      // update keeps the operation idempotent if a different path already
+      // completed the transition before this transaction obtained its locks.
+      const claimed = await database.grant.updateMany({
+        where: { id: grant.id, revokedAt: null },
+        data: { revokedAt: timestamp, version: { increment: 1 } }
       });
-    }
+      if (!claimed.count) return null;
+
+      await database.refreshToken.updateMany({
+        where: { userId: grant.userId, clientId: grant.clientId, revokedAt: null },
+        data: { revokedAt: timestamp }
+      });
+      await database.authorizationCode.updateMany({
+        where: { userId: grant.userId, clientId: grant.clientId, usedAt: null },
+        data: { usedAt: timestamp }
+      });
+
+      const oidcSessions = await database.oidcSession.findMany({
+        where: { userId: grant.userId, clientId: grant.clientId, revokedAt: null }
+      });
+      await database.oidcSession.updateMany({
+        where: { userId: grant.userId, clientId: grant.clientId, revokedAt: null },
+        data: { revokedAt: timestamp, revocationReason: reason }
+      });
+
+      // The outbox rows are part of the withdrawal commit. A database failure
+      // while recording delivery intent rolls the Grant, tokens, codes, and OIDC
+      // sessions back as well, so a committed logout can never be silently lost.
+      for (const session of oidcSessions) {
+        await backchannel?.enqueue(
+          {
+            clientId: grant.clientId,
+            // `session.id`, not `session.sessionId`: the ID token published the
+            // former as `sid`, and that is what the relying party indexed by.
+            sid: session.id,
+            userId: grant.userId,
+            subject: grant.userId,
+            reason
+          },
+          database
+        );
+      }
+      return { grant };
+    });
+    if (!revoked) return { revoked: false };
+    const { grant } = revoked;
 
     await auditLog?.record({
       action: "oauth.grant.revoked",
@@ -1445,42 +1988,125 @@ function createProviderService({
       throw new TypeError("endSessions requires a userId: it is what scopes the revocation to its owner");
     }
 
-    const where = { sessionId: String(sessionId), userId: String(userId), revokedAt: null };
-    const oidcSessions = await prisma.oidcSession.findMany({ where });
-    if (!oidcSessions.length) return { notified: 0 };
+    const ownerId = String(userId);
+    const browserSessionId = String(sessionId);
+    const timestamp = now();
+    const ended = await prisma.$transaction(async (database) => {
+      // User -> Browser Session is the shared lock order used by account-wide
+      // revocation. `validAt: null` deliberately allows an operator-requested
+      // logout to clean up an expired row as well as an active one.
+      const user = await lockUser(database, ownerId);
+      if (!user) return null;
+      const browserSession = await lockBrowserSession(database, {
+        sessionId: browserSessionId,
+        userId: ownerId,
+        validAt: null
+      });
+      if (!browserSession) return null;
 
-    await prisma.oidcSession.updateMany({
-      where,
-      data: { revokedAt: now(), revocationReason: reason }
+      const where = { sessionId: browserSession.id, userId: ownerId, revokedAt: null };
+      const oidcSessions = await database.oidcSession.findMany({ where });
+
+      // Delete the browser credential in the same commit as the client-facing
+      // revocation state. Even a session with no OIDC rows is still a real
+      // browser credential and must report revoked=true once removed.
+      const removed = await database.session.deleteMany({
+        where: { id: browserSession.id, userId: ownerId }
+      });
+      if (!removed.count) return null;
+
+      await database.oidcSession.updateMany({
+        where,
+        data: { revokedAt: timestamp, revocationReason: reason }
+      });
+
+      let notified = 0;
+      for (const session of oidcSessions) {
+        const queued = await backchannel?.enqueue(
+          {
+            clientId: session.clientId,
+            // `session.id`, not `session.sessionId`: see the note on enqueue. The
+            // rows here were selected by browser session, so `sessionId` is the
+            // same value for every one of them — which is what made the mistake
+            // look plausible.
+            sid: session.id,
+            userId: session.userId,
+            subject: session.userId,
+            reason
+          },
+          database
+        );
+        if (queued) notified += 1;
+      }
+      return { browserSession, oidcSessions, notified };
     });
 
-    let notified = 0;
-    for (const session of oidcSessions) {
-      const queued = await backchannel?.enqueue({
-        clientId: session.clientId,
-        // `session.id`, not `session.sessionId`: see the note on enqueue. The
-        // rows here were selected by browser session, so `sessionId` is the
-        // same value for every one of them — which is what made the mistake
-        // look plausible.
-        sid: session.id,
-        userId: session.userId,
-        subject: session.userId,
-        reason
-      });
-      if (queued) notified += 1;
-    }
+    if (!ended) return { revoked: false, notified: 0 };
+    const { browserSession, oidcSessions, notified } = ended;
 
     await auditLog?.record({
       action: "oauth.session.ended",
       actorUserId: userId,
       targetType: "session",
-      targetId: String(sessionId),
+      targetId: browserSession.id,
       metadata: { reason, clients: oidcSessions.length }
     });
-    return { notified };
+    return { revoked: true, notified };
   }
 
   // --- Housekeeping --------------------------------------------------------
+
+  async function pruneStaleOidcSessions(cutoff) {
+    const staleBefore = new Date(
+      cutoff.getTime() - Math.max(ttl.accessTokenSeconds, ttl.refreshTokenSeconds) * 1000
+    );
+    const batchSize = 500;
+    let afterId = null;
+    let count = 0;
+
+    for (;;) {
+      const candidates = await prisma.oidcSession.findMany({
+        where: {
+          lastSeenAt: { lt: staleBefore },
+          ...(afterId ? { id: { gt: afterId } } : {})
+        },
+        orderBy: { id: "asc" },
+        take: batchSize,
+        select: { id: true, sessionId: true }
+      });
+      if (!candidates.length) break;
+      afterId = candidates[candidates.length - 1].id;
+
+      // A remembered browser session can outlive every token it previously
+      // issued. Keep its per-client row so a later logout can still fan out a
+      // back-channel notification. There is intentionally no foreign key: a
+      // revoked OIDC row must outlive the deleted browser session until all
+      // signed tokens that name it have expired.
+      const activeBrowserSessions = await prisma.session.findMany({
+        where: {
+          id: { in: [...new Set(candidates.map((candidate) => candidate.sessionId))] },
+          expiresAt: { gt: cutoff }
+        },
+        select: { id: true }
+      });
+      const activeIds = new Set(activeBrowserSessions.map((session) => session.id));
+      const removable = candidates
+        .filter((candidate) => !activeIds.has(candidate.sessionId))
+        .map((candidate) => candidate.id);
+      if (removable.length) {
+        // A token exchange can refresh lastSeenAt after the candidate read.
+        // Re-check the cutoff in the delete so a newly active session cannot be
+        // removed from underneath the access token that just refreshed it.
+        const deleted = await prisma.oidcSession.deleteMany({
+          where: { id: { in: removable }, lastSeenAt: { lt: staleBefore } }
+        });
+        count += deleted.count;
+      }
+      if (candidates.length < batchSize) break;
+    }
+
+    return { count };
+  }
 
   /**
    * Deletes spent and expired protocol records. Not scheduled automatically: a
@@ -1490,31 +2116,27 @@ function createProviderService({
    */
   async function pruneExpired() {
     const cutoff = now();
+    // A used code is the replay detector for every credential descended from
+    // its first exchange. Keep it until the longest possible access/refresh
+    // credential can no longer be alive; deleting it immediately turns a replay
+    // into an ordinary invalid_grant and skips containment of those descendants.
+    const codeReplayBefore = new Date(
+      cutoff.getTime() - Math.max(ttl.accessTokenSeconds, ttl.refreshTokenSeconds) * 1000
+    );
     const [requests, codes, tokens, sessions] = await Promise.all([
       prisma.authorizationRequest.deleteMany({
         where: { OR: [{ expiresAt: { lt: cutoff } }, { consumedAt: { not: null } }] }
       }),
       prisma.authorizationCode.deleteMany({
-        where: { OR: [{ expiresAt: { lt: cutoff } }, { usedAt: { not: null } }] }
+        where: {
+          OR: [
+            { usedAt: null, expiresAt: { lt: cutoff } },
+            { usedAt: { lt: codeReplayBefore } }
+          ]
+        }
       }),
       prisma.refreshToken.deleteMany({ where: { expiresAt: { lt: cutoff } } }),
-      // The per-client session view, which nothing deleted.
-      //
-      // It has no expiry column and no foreign key to the browser session, so
-      // pruning that one cascaded to nothing here: a row survived per
-      // (browser session, client) for the life of the database.
-      //
-      // The cutoff is the refresh-token lifetime, and it cannot be shorter.
-      // Introspection reports a token inactive by looking this row up by the
-      // ID token's `sid` and reading `revokedAt` — so deleting a *revoked* row
-      // makes the tokens it revoked answer as active again. Only once nothing
-      // that could reference it is still alive is the row safe to remove, and
-      // the longest-lived reference is a refresh token. `lastSeenAt` is
-      // rewritten on every issuance, so a session still in use is never inside
-      // this window.
-      prisma.oidcSession.deleteMany({
-        where: { lastSeenAt: { lt: new Date(cutoff.getTime() - ttl.refreshTokenSeconds * 1000) } }
-      })
+      pruneStaleOidcSessions(cutoff)
     ]);
     return {
       authorizationRequests: requests.count,

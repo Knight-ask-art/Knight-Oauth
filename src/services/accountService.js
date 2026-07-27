@@ -37,6 +37,10 @@ const PASSWORD_MAX_LENGTH = 1024; // scrypt cost is linear in input; cap the wor
 const STATUS = { PENDING: "PENDING", ACTIVE: "ACTIVE", DISABLED: "DISABLED" };
 const ROLE = { USER: "USER", ADMIN: "ADMIN" };
 
+class AccountStateChanged extends Error {}
+class PasswordChangedConcurrently extends Error {}
+class ResetTokenChangedConcurrently extends Error {}
+
 /**
  * Normalizes an email for storage and comparison.
  *
@@ -347,11 +351,19 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
   // A fixed hash of a value nobody can supply. Verifying against it costs the
   // same as a real check, which is the point.
   let dummyHashPromise = null;
-  function burnPasswordTime(password) {
+  async function burnPasswordTime(password) {
     if (!dummyHashPromise) {
-      dummyHashPromise = hashPassword(`unused-${randomToken(16)}`);
+      dummyHashPromise = hashPassword(`unused-${randomToken(16)}`).catch((error) => {
+        // A full scrypt queue is temporary. Caching its rejected promise would
+        // make every later unknown-account attempt skip the KDF permanently,
+        // while real accounts resume paying the KDF cost, recreating the timing
+        // oracle this dummy hash exists to close.
+        dummyHashPromise = null;
+        throw error;
+      });
     }
-    return dummyHashPromise.then((hash) => verifyPassword(String(password ?? "x"), hash)).catch(() => false);
+    const hash = await dummyHashPromise;
+    return verifyPassword(String(password ?? "x"), hash);
   }
 
   // --- Email verification --------------------------------------------------
@@ -516,27 +528,52 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
     const passwordHash = await hashPassword(newPassword);
     const timestamp = now();
 
-    const claimed = await prisma.passwordResetToken.updateMany({
-      where: { id: record.id, usedAt: null },
-      data: { usedAt: timestamp }
-    });
-    if (!claimed.count) return { ok: false, reason: "invalid_token", account: null };
+    let updated;
+    try {
+      updated = await prisma.$transaction(async (transaction) => {
+        // The status check must be part of the write. An administrator can
+        // disable the account after the preflight read above; writing that old
+        // ACTIVE value back would silently undo the administrative action. It
+        // is also intentionally the first write in this transaction: account
+        // disabling locks the user before revoking credentials, so using the
+        // same order here avoids a user/reset-token lock inversion.
+        const changed = await transaction.user.updateMany({
+          where: { id: record.userId, status: { not: STATUS.DISABLED } },
+          data: { passwordHash, emailVerifiedAt: timestamp }
+        });
+        if (!changed.count) throw new AccountStateChanged();
+        await transaction.user.updateMany({
+          where: { id: record.userId, status: STATUS.PENDING },
+          data: { status: STATUS.ACTIVE }
+        });
 
-    const updated = await prisma.user.update({
-      where: { id: record.userId },
-      data: {
-        passwordHash,
-        // Completing a reset proves control of the address, so it doubles as
-        // email verification.
-        emailVerifiedAt: timestamp,
-        // Promotes a PENDING account and leaves anything else where it is.
-        // DISABLED cannot reach here — it was refused above — and writing
-        // ACTIVE unconditionally is what made that reachable in the first place.
-        status: holder.status === STATUS.PENDING ? STATUS.ACTIVE : holder.status
+        // Keep the current reset token claim behind Session/refresh/code/OIDC
+        // revocation. Every account-wide credential transition uses the same
+        // lock order, while excluding this one row keeps it available for the
+        // conditional single-use claim below.
+        await revokeAllCredentialsWith(transaction, record.userId, "password_reset", timestamp, {
+          preservePasswordResetTokenId: record.id
+        });
+
+        const claimed = await transaction.passwordResetToken.updateMany({
+          where: { id: record.id, usedAt: null },
+          data: { usedAt: timestamp }
+        });
+        // Throw rather than return: every write above must roll back when a
+        // concurrent request consumed the link after the preflight read.
+        if (!claimed.count) throw new ResetTokenChangedConcurrently();
+        return transaction.user.findUnique({ where: { id: record.userId } });
+      });
+    } catch (error) {
+      if (error instanceof AccountStateChanged) {
+        return { ok: false, reason: "disabled", account: null };
       }
-    });
+      if (error instanceof ResetTokenChangedConcurrently) {
+        return { ok: false, reason: "invalid_token", account: null };
+      }
+      throw error;
+    }
 
-    await revokeAllCredentials(record.userId, "password_reset");
     await auditLog?.record({
       action: "account.password.reset",
       actorUserId: record.userId,
@@ -571,11 +608,23 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
     }
 
     const validated = assertValidPassword(newPassword, { minLength: minPasswordLength });
-    await prisma.user.update({
-      where: { id: record.id },
-      data: { passwordHash: await hashPassword(validated) }
-    });
-    await revokeAllCredentials(record.id, "password_change");
+    const passwordHash = await hashPassword(validated);
+    const timestamp = now();
+    try {
+      await prisma.$transaction(async (transaction) => {
+        const changed = await transaction.user.updateMany({
+          where: { id: record.id, passwordHash: record.passwordHash },
+          data: { passwordHash }
+        });
+        if (!changed.count) throw new PasswordChangedConcurrently();
+        await revokeAllCredentialsWith(transaction, record.id, "password_change", timestamp);
+      });
+    } catch (error) {
+      if (error instanceof PasswordChangedConcurrently) {
+        return { ok: false, reason: "bad_password" };
+      }
+      throw error;
+    }
     await auditLog?.record({
       action: "account.password.changed",
       actorUserId: record.id,
@@ -595,19 +644,60 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
    */
   async function revokeAllCredentials(userId, reason) {
     const timestamp = now();
-    await prisma.refreshToken.updateMany({
-      where: { userId, revokedAt: null },
+    await prisma.$transaction((transaction) =>
+      revokeAllCredentialsWith(transaction, userId, reason, timestamp)
+    );
+  }
+
+  async function lockCredentialOwnerWith(transaction, userId) {
+    const id = String(userId || "");
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const owner = await transaction.user.findUnique({
+        where: { id },
+        select: { id: true, updatedAt: true }
+      });
+      if (!owner) return false;
+
+      // A conditional no-op update obtains the User row lock without changing
+      // profile or account state. Supplying updatedAt explicitly prevents
+      // Prisma's @updatedAt behavior from making credential revocation look
+      // like a profile change, while the CAS retries if another account update
+      // committed after the read.
+      const locked = await transaction.user.updateMany({
+        where: { id: owner.id, updatedAt: owner.updatedAt },
+        data: { updatedAt: owner.updatedAt }
+      });
+      if (locked.count) return true;
+    }
+    throw new Error("The account changed while its credentials were being revoked");
+  }
+
+  async function revokeAllCredentialsWith(
+    transaction,
+    userId,
+    reason,
+    timestamp,
+    { preservePasswordResetTokenId = null } = {}
+  ) {
+    const id = String(userId || "");
+    if (!(await lockCredentialOwnerWith(transaction, id))) return false;
+
+    // Shared lock order with browser logout/revoke: Session always precedes
+    // OIDC. Account-wide paths additionally start at User, then take every
+    // credential class in one fixed order to avoid cross-flow deadlocks.
+    await transaction.session.deleteMany({ where: { userId: id } });
+    await transaction.refreshToken.updateMany({
+      where: { userId: id, revokedAt: null },
       data: { revokedAt: timestamp }
     });
-    await prisma.authorizationCode.updateMany({
-      where: { userId, usedAt: null },
+    await transaction.authorizationCode.updateMany({
+      where: { userId: id, usedAt: null },
       data: { usedAt: timestamp }
     });
-    await prisma.oidcSession.updateMany({
-      where: { userId, revokedAt: null },
+    await transaction.oidcSession.updateMany({
+      where: { userId: id, revokedAt: null },
       data: { revokedAt: timestamp, revocationReason: reason }
     });
-    await prisma.session.deleteMany({ where: { userId } });
 
     // Outstanding reset and verification links are credentials too, and leaving
     // them alive let a reset survive the remedy for it.
@@ -619,14 +709,21 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
     // untouched, still unused and valid for the rest of its hour, and using it
     // locks the user back out. A 24-hour verification link had the same
     // property.
-    await prisma.passwordResetToken.updateMany({
-      where: { userId, usedAt: null },
+    await transaction.passwordResetToken.updateMany({
+      where: {
+        userId: id,
+        usedAt: null,
+        ...(preservePasswordResetTokenId
+          ? { id: { not: String(preservePasswordResetTokenId) } }
+          : {})
+      },
       data: { usedAt: timestamp }
     });
-    await prisma.emailVerificationToken.updateMany({
-      where: { userId, usedAt: null },
+    await transaction.emailVerificationToken.updateMany({
+      where: { userId: id, usedAt: null },
       data: { usedAt: timestamp }
     });
+    return true;
   }
 
   // --- Profile and administration -----------------------------------------
@@ -670,17 +767,20 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
   async function setStatus({ userId, status, reason, actorUserId } = {}) {
     if (!Object.values(STATUS).includes(status)) throw invalidRequest("Unknown account status");
     const timestamp = now();
-    const record = await prisma.user.update({
-      where: { id: String(userId) },
-      data: {
-        status,
-        disabledAt: status === STATUS.DISABLED ? timestamp : null,
-        disabledReason: status === STATUS.DISABLED ? String(reason || "").trim() || null : null
+    const record = await prisma.$transaction(async (transaction) => {
+      const updated = await transaction.user.update({
+        where: { id: String(userId) },
+        data: {
+          status,
+          disabledAt: status === STATUS.DISABLED ? timestamp : null,
+          disabledReason: status === STATUS.DISABLED ? String(reason || "").trim() || null : null
+        }
+      });
+      if (status === STATUS.DISABLED) {
+        await revokeAllCredentialsWith(transaction, updated.id, "account_disabled", timestamp);
       }
+      return updated;
     });
-    if (status === STATUS.DISABLED) {
-      await revokeAllCredentials(record.id, "account_disabled");
-    }
     await auditLog?.record({
       action: "account.status.changed",
       actorUserId,

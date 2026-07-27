@@ -453,15 +453,17 @@ function createAccountController({ config, accounts, sessions, provider, clients
         for (const session of all) {
           if (session.id === req.session?.id) continue;
           await provider.endSessions({ sessionId: session.id, userId: req.currentUser.id, reason: "user_revoked" });
-          await sessions.revoke({ sessionId: session.id, userId: req.currentUser.id });
         }
         return res.redirect("/account?notice=sessions-ended");
       }
 
       // Scoped to the caller's own id, so one user cannot end another's session
       // by guessing an identifier.
-      await provider.endSessions({ sessionId, userId: req.currentUser.id, reason: "user_revoked" });
-      const result = await sessions.revoke({ sessionId, userId: req.currentUser.id });
+      const result = await provider.endSessions({
+        sessionId,
+        userId: req.currentUser.id,
+        reason: "user_revoked"
+      });
       if (result.revoked && sessionId === req.session?.id) return res.redirect("/");
       return res.redirect("/account?notice=sessions-ended");
     } catch (error) {

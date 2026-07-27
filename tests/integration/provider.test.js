@@ -7,6 +7,7 @@ const { after, before, describe, it } = require("node:test");
 const { withDatabase } = require("../helpers/database");
 const { loadEnv } = require("../../src/config/env");
 const { createScopeRegistry } = require("../../src/lib/scopes");
+const { hashToken } = require("../../src/lib/crypto");
 const { decodeJwt } = require("../../src/lib/jwt");
 const { createAccountService } = require("../../src/services/accountService");
 const { createAuditService } = require("../../src/services/auditService");
@@ -64,6 +65,8 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
 
     config = loadEnv({
       PUBLIC_BASE_URL: "http://127.0.0.1:3010",
+      DATABASE_PROVIDER: db.provider,
+      DATABASE_URL: db.url,
       OAUTH_ALLOW_GENERATED_KEYS: "true",
       OAUTH_CLIENT_REQUIRE_APPROVAL: "false",
       OAUTH_DYNAMIC_REGISTRATION_ENABLED: "true",
@@ -75,6 +78,11 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
           name: "credits.read",
           description: "Read your credit balance",
           claims: ["knight_uid"]
+        },
+        {
+          name: "credits.admin",
+          description: "Administer credits",
+          adminOnly: true
         }
       ])
     });
@@ -162,7 +170,10 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
   });
 
   /** Drives a full authorization request through to a redirect carrying a code. */
-  async function authorize(overrides = {}, { client = confidential, approve = true } = {}) {
+  async function authorize(
+    overrides = {},
+    { client = confidential, approve = true, browserSession = session, authorizationAccount = account } = {}
+  ) {
     const challenge = overrides.code_challenge === undefined ? pkce() : null;
     const params = {
       client_id: client.clientId,
@@ -176,14 +187,23 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     const requestToken = await provider.persistAuthorizationRequest(request);
 
     const loaded = await provider.loadAuthorizationRequest(requestToken);
-    const decision = await provider.resolveAuthorization({ request: loaded, account, session });
+    const decision = await provider.resolveAuthorization({
+      request: loaded,
+      account: authorizationAccount,
+      session: browserSession
+    });
 
+    const approvedScopes = Object.prototype.hasOwnProperty.call(overrides, "approvedScopes")
+      ? overrides.approvedScopes
+      : decision.action === "consent"
+        ? loaded.scopes
+        : null;
     const result = approve
       ? await provider.completeAuthorization({
           requestToken,
-          account,
-          session,
-          approvedScopes: overrides.approvedScopes || null
+          account: authorizationAccount,
+          session: browserSession,
+          approvedScopes
         })
       : await provider.denyAuthorization({ requestToken });
 
@@ -535,6 +555,515 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     assert.equal(header.alg, (await keys.ensureKeyRing()).activeKey.alg);
   });
 
+  it("rolls back authorization completion when storing the code fails", async () => {
+    const browser = await sessions.login({ userId: account.id });
+    const challenge = pkce();
+    const request = await provider.parseAuthorizationRequest({
+      client_id: confidential.clientId,
+      redirect_uri: confidential.redirectUris[0],
+      response_type: "code",
+      scope: "openid",
+      state: "retry-after-code-write-failure",
+      code_challenge: challenge.challenge,
+      code_challenge_method: "S256"
+    });
+    const requestToken = await provider.persistAuthorizationRequest(request);
+
+    let failNextCodeCreate = true;
+    const transactionClient = (client) =>
+      new Proxy(client, {
+        get(target, prop) {
+          if (prop === "authorizationCode") {
+            return new Proxy(target.authorizationCode, {
+              get(model, method) {
+                if (method === "create") {
+                  return async (...args) => {
+                    if (failNextCodeCreate) {
+                      failNextCodeCreate = false;
+                      throw new Error("simulated authorization-code write failure");
+                    }
+                    return model.create(...args);
+                  };
+                }
+                const value = model[method];
+                return typeof value === "function" ? value.bind(model) : value;
+              }
+            });
+          }
+          const value = target[prop];
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    const failingPrisma = new Proxy(prisma, {
+      get(target, prop) {
+        if (prop === "$transaction") {
+          return (callback, ...args) =>
+            target.$transaction((tx) => callback(transactionClient(tx)), ...args);
+        }
+        const value = target[prop];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const failingProvider = createProviderService({
+      prisma: failingPrisma,
+      config,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+
+    await assert.rejects(
+      failingProvider.completeAuthorization({
+        requestToken,
+        account,
+        session: browser.session
+      }),
+      /simulated authorization-code write failure/
+    );
+
+    const afterFailure = await prisma.authorizationRequest.findUnique({
+      where: { requestTokenHash: hashToken(requestToken) }
+    });
+    assert.equal(afterFailure.consumedAt, null, "the failed code write consumed the request");
+    assert.equal(
+      await prisma.oidcSession.findUnique({
+        where: {
+          sessionId_clientId: {
+            sessionId: browser.session.id,
+            clientId: confidential.clientId
+          }
+        }
+      }),
+      null,
+      "the failed code write left a partial OIDC session"
+    );
+    assert.equal(
+      await prisma.authorizationCode.count({
+        where: { sessionId: browser.session.id, clientId: confidential.clientId }
+      }),
+      0
+    );
+
+    const retried = await provider.completeAuthorization({
+      requestToken,
+      account,
+      session: browser.session
+    });
+    const retriedCode = new URL(retried.redirectUrl).searchParams.get("code");
+    assert.ok(retriedCode, "the same request was not retryable");
+
+    const afterRetry = await prisma.authorizationRequest.findUnique({
+      where: { id: afterFailure.id }
+    });
+    assert.ok(afterRetry.consumedAt, "the successful retry did not consume the request");
+    assert.ok(
+      await prisma.oidcSession.findUnique({
+        where: {
+          sessionId_clientId: {
+            sessionId: browser.session.id,
+            clientId: confidential.clientId
+          }
+        }
+      }),
+      "the successful retry did not establish its OIDC session"
+    );
+    const tokens = await provider.token({
+      headers: basicAuth(confidential.clientId, confidentialSecret),
+      body: {
+        grant_type: "authorization_code",
+        code: retriedCode,
+        redirect_uri: confidential.redirectUris[0],
+        code_verifier: challenge.verifier
+      }
+    });
+    assert.ok(tokens.access_token, "the retried request produced an unusable authorization code");
+  });
+
+  it("does not recreate an active client session after the grant is withdrawn", async () => {
+    const revocable = await clients.create(
+      {
+        name: "Consent Withdrawal Race",
+        clientType: "confidential",
+        redirectUris: ["https://consent-race.example/callback"],
+        scopes: ["openid"],
+        grantTypes: ["authorization_code"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        requireConsent: true
+      },
+      { status: "APPROVED" }
+    );
+    const browser = await sessions.login({ userId: account.id });
+    const challenge = pkce();
+    const request = await provider.parseAuthorizationRequest({
+      client_id: revocable.client.clientId,
+      redirect_uri: revocable.client.redirectUris[0],
+      response_type: "code",
+      scope: "openid",
+      code_challenge: challenge.challenge,
+      code_challenge_method: "S256"
+    });
+    const requestToken = await provider.persistAuthorizationRequest(request);
+
+    let withdrawBeforeTransaction = true;
+    const racingPrisma = new Proxy(prisma, {
+      get(target, property) {
+        if (property === "$transaction") {
+          return async (callback, ...args) => {
+            if (withdrawBeforeTransaction) {
+              withdrawBeforeTransaction = false;
+              await provider.revokeGrant({
+                userId: account.id,
+                clientId: revocable.client.clientId,
+                reason: "concurrent_user_revocation"
+              });
+            }
+            return target.$transaction(callback, ...args);
+          };
+        }
+        const value = target[property];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const racingProvider = createProviderService({
+      prisma: racingPrisma,
+      config,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+
+    await assert.rejects(
+      racingProvider.completeAuthorization({
+        requestToken,
+        account,
+        session: browser.session
+      }),
+      (error) => {
+        assert.equal(error.code, "access_denied");
+        return true;
+      }
+    );
+
+    const storedRequest = await prisma.authorizationRequest.findUnique({
+      where: { requestTokenHash: hashToken(requestToken) }
+    });
+    assert.equal(storedRequest.consumedAt, null, "a rejected completion consumed the request");
+    assert.equal(
+      await prisma.authorizationCode.count({
+        where: { userId: account.id, clientId: revocable.client.clientId }
+      }),
+      0,
+      "a code was issued after the grant was withdrawn"
+    );
+    assert.equal(
+      await prisma.oidcSession.count({
+        where: { userId: account.id, clientId: revocable.client.clientId, revokedAt: null }
+      }),
+      0,
+      "grant withdrawal was undone by recreating an active OIDC session"
+    );
+  });
+
+  it("does not reactivate a withdrawn stored grant without fresh consent", async () => {
+    const revocable = await clients.create(
+      {
+        name: "Stored Grant Withdrawal",
+        clientType: "confidential",
+        redirectUris: ["https://stored-grant.example/callback"],
+        scopes: ["openid"],
+        grantTypes: ["authorization_code"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        requireConsent: true
+      },
+      { status: "APPROVED" }
+    );
+    await authorize({ scope: "openid" }, { client: revocable.client });
+
+    const challenge = pkce();
+    const request = await provider.parseAuthorizationRequest({
+      client_id: revocable.client.clientId,
+      redirect_uri: revocable.client.redirectUris[0],
+      response_type: "code",
+      scope: "openid",
+      code_challenge: challenge.challenge,
+      code_challenge_method: "S256"
+    });
+    const requestToken = await provider.persistAuthorizationRequest(request);
+    const loaded = await provider.loadAuthorizationRequest(requestToken);
+    const decision = await provider.resolveAuthorization({ request: loaded, account, session });
+    assert.equal(decision.action, "issue", "the regression requires stored-grant reuse");
+
+    await provider.revokeGrant({
+      userId: account.id,
+      clientId: revocable.client.clientId,
+      reason: "withdrawn_after_resolution"
+    });
+
+    await assert.rejects(
+      provider.completeAuthorization({ requestToken, account, session, approvedScopes: null }),
+      (error) => {
+        assert.equal(error.code, "access_denied");
+        return true;
+      }
+    );
+    const grant = await prisma.grant.findUnique({
+      where: { userId_clientId: { userId: account.id, clientId: revocable.client.clientId } }
+    });
+    assert.ok(grant.revokedAt, "silent completion reactivated the withdrawn grant");
+  });
+
+  it("does not issue a code from a stale browser-session snapshot", async () => {
+    const client = await clients.create(
+      {
+        name: "Stale Browser Session",
+        clientType: "confidential",
+        redirectUris: ["https://stale-session.example/callback"],
+        scopes: ["openid"],
+        grantTypes: ["authorization_code"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        isFirstParty: true,
+        requireConsent: false
+      },
+      { status: "APPROVED" }
+    );
+    const browser = await sessions.create({ userId: account.id });
+    const challenge = pkce();
+    const request = await provider.parseAuthorizationRequest({
+      client_id: client.client.clientId,
+      redirect_uri: client.client.redirectUris[0],
+      response_type: "code",
+      scope: "openid",
+      code_challenge: challenge.challenge,
+      code_challenge_method: "S256"
+    });
+    const requestToken = await provider.persistAuthorizationRequest(request);
+    await prisma.session.delete({ where: { id: browser.session.id } });
+
+    await assert.rejects(
+      provider.completeAuthorization({
+        requestToken,
+        account,
+        session: browser.session,
+        approvedScopes: null
+      }),
+      (error) => {
+        assert.equal(error.code, "access_denied");
+        return true;
+      }
+    );
+    assert.equal(
+      await prisma.authorizationCode.count({
+        where: { sessionId: browser.session.id, clientId: client.client.clientId }
+      }),
+      0,
+      "a deleted browser session still produced an authorization code"
+    );
+  });
+
+  it("checks authorization-request expiry in the consume operation", async () => {
+    const client = await clients.create(
+      {
+        name: "Authorization Request Boundary",
+        clientType: "confidential",
+        redirectUris: ["https://request-boundary.example/callback"],
+        scopes: ["openid"],
+        grantTypes: ["authorization_code"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        isFirstParty: true,
+        requireConsent: false
+      },
+      { status: "APPROVED" }
+    );
+    const challenge = pkce();
+    const request = await provider.parseAuthorizationRequest({
+      client_id: client.client.clientId,
+      redirect_uri: client.client.redirectUris[0],
+      response_type: "code",
+      scope: "openid",
+      code_challenge: challenge.challenge,
+      code_challenge_method: "S256"
+    });
+    const requestToken = await provider.persistAuthorizationRequest(request);
+    const boundary = new Date(Date.now() + 60_000);
+    await prisma.authorizationRequest.update({
+      where: { requestTokenHash: hashToken(requestToken) },
+      data: { expiresAt: boundary }
+    });
+
+    let clockReads = 0;
+    const boundaryProvider = createProviderService({
+      prisma,
+      config,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } }),
+      now: () => {
+        clockReads += 1;
+        return clockReads === 1
+          ? new Date(boundary.getTime() - 1)
+          : new Date(boundary.getTime() + 1);
+      }
+    });
+
+    await assert.rejects(
+      boundaryProvider.completeAuthorization({ requestToken, account, session, approvedScopes: null }),
+      (error) => {
+        assert.equal(error.code, "invalid_request");
+        return true;
+      }
+    );
+    const stored = await prisma.authorizationRequest.findUnique({
+      where: { requestTokenHash: hashToken(requestToken) }
+    });
+    assert.equal(stored.consumedAt, null, "an expired request was consumed after its pre-check");
+  });
+
+  it("checks authorization-request expiry when recording a denial", async () => {
+    const challenge = pkce();
+    const request = await provider.parseAuthorizationRequest({
+      client_id: confidential.clientId,
+      redirect_uri: confidential.redirectUris[0],
+      response_type: "code",
+      scope: "openid",
+      code_challenge: challenge.challenge,
+      code_challenge_method: "S256"
+    });
+    const requestToken = await provider.persistAuthorizationRequest(request);
+    const boundary = new Date(Date.now() + 60_000);
+    await prisma.authorizationRequest.update({
+      where: { requestTokenHash: hashToken(requestToken) },
+      data: { expiresAt: boundary }
+    });
+
+    let clockReads = 0;
+    const boundaryProvider = createProviderService({
+      prisma,
+      config,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } }),
+      now: () => {
+        clockReads += 1;
+        return clockReads === 1
+          ? new Date(boundary.getTime() - 1)
+          : new Date(boundary.getTime() + 1);
+      }
+    });
+
+    await assert.rejects(
+      boundaryProvider.denyAuthorization({ requestToken }),
+      (error) => {
+        assert.equal(error.code, "invalid_request");
+        return true;
+      }
+    );
+    const stored = await prisma.authorizationRequest.findUnique({
+      where: { requestTokenHash: hashToken(requestToken) }
+    });
+    assert.equal(stored.consumedAt, null, "an expired denial consumed the request");
+  });
+
+  it("rechecks admin-only scope eligibility immediately before issuing a code", async () => {
+    const adminClient = await clients.create(
+      {
+        name: "Authorization Eligibility Boundary",
+        clientType: "confidential",
+        redirectUris: ["https://authorization-eligibility.example/callback"],
+        scopes: ["openid", "credits.admin"],
+        grantTypes: ["authorization_code"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        requireConsent: true
+      },
+      { status: "APPROVED" }
+    );
+    await authorize({ scope: "openid credits.admin" }, { client: adminClient.client });
+
+    const challenge = pkce();
+    const request = await provider.parseAuthorizationRequest({
+      client_id: adminClient.client.clientId,
+      redirect_uri: adminClient.client.redirectUris[0],
+      response_type: "code",
+      scope: "openid credits.admin",
+      code_challenge: challenge.challenge,
+      code_challenge_method: "S256"
+    });
+    const requestToken = await provider.persistAuthorizationRequest(request);
+    const loaded = await provider.loadAuthorizationRequest(requestToken);
+    assert.equal(
+      (await provider.resolveAuthorization({ request: loaded, account, session })).action,
+      "issue"
+    );
+
+    await prisma.user.update({ where: { id: account.id }, data: { role: "USER" } });
+    try {
+      await assert.rejects(
+        provider.completeAuthorization({ requestToken, account, session, approvedScopes: null }),
+        (error) => {
+          assert.equal(error.code, "invalid_scope");
+          return true;
+        }
+      );
+    } finally {
+      await prisma.user.update({ where: { id: account.id }, data: { role: "ADMIN" } });
+    }
+  });
+
+  it("does not issue a code to a callback removed after authorization resolution", async () => {
+    const client = await clients.create(
+      {
+        name: "Authorization Callback Removal",
+        clientType: "confidential",
+        redirectUris: ["https://authorization-callback.example/callback"],
+        scopes: ["openid"],
+        grantTypes: ["authorization_code"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        requireConsent: true
+      },
+      { status: "APPROVED" }
+    );
+    await authorize({ scope: "openid" }, { client: client.client });
+
+    const challenge = pkce();
+    const request = await provider.parseAuthorizationRequest({
+      client_id: client.client.clientId,
+      redirect_uri: client.client.redirectUris[0],
+      response_type: "code",
+      scope: "openid",
+      code_challenge: challenge.challenge,
+      code_challenge_method: "S256"
+    });
+    const requestToken = await provider.persistAuthorizationRequest(request);
+    const loaded = await provider.loadAuthorizationRequest(requestToken);
+    assert.equal(
+      (await provider.resolveAuthorization({ request: loaded, account, session })).action,
+      "issue"
+    );
+    await prisma.oAuthClient.update({
+      where: { clientId: client.client.clientId },
+      data: { redirectUris: "https://authorization-callback.example/replacement" }
+    });
+
+    await assert.rejects(
+      provider.completeAuthorization({ requestToken, account, session, approvedScopes: null }),
+      (error) => {
+        assert.equal(error.code, "access_denied");
+        return true;
+      }
+    );
+  });
+
   it("accepts client_secret_post as well as client_secret_basic", async () => {
     // Registered for basic, so post must be refused — but the parse path is what
     // is under test, and a client registered for post must be able to use it.
@@ -746,7 +1275,8 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
   });
 
   it("rejects a code redeemed by a different client", async () => {
-    const flow = await authorize({ scope: "openid" });
+    const browser = await sessions.create({ userId: account.id });
+    const flow = await authorize({ scope: "openid" }, { browserSession: browser.session });
     const other = await clients.create(
       {
         name: "Other Client",
@@ -823,6 +1353,131 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     );
   });
 
+  it("rechecks current client scopes before exchanging an authorization code", async () => {
+    const scopedClient = await clients.create(
+      {
+        name: "Code Scope Downgrade",
+        clientType: "confidential",
+        redirectUris: ["https://code-scope-downgrade.example/callback"],
+        scopes: ["openid", "credits.read"],
+        grantTypes: ["authorization_code"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        requireConsent: true
+      },
+      { status: "APPROVED" }
+    );
+    const flow = await authorize(
+      { scope: "openid credits.read" },
+      { client: scopedClient.client }
+    );
+    await prisma.oAuthClient.update({
+      where: { clientId: scopedClient.client.clientId },
+      data: { allowedScopes: "openid" }
+    });
+
+    await assert.rejects(
+      provider.token({
+        headers: basicAuth(scopedClient.client.clientId, scopedClient.clientSecret),
+        body: {
+          grant_type: "authorization_code",
+          code: flow.code,
+          redirect_uri: flow.redirectUri,
+          code_verifier: flow.verifier
+        }
+      }),
+      (error) => {
+        assert.equal(error.code, "invalid_grant");
+        return true;
+      }
+    );
+    const code = await prisma.authorizationCode.findUnique({
+      where: { codeHash: hashToken(flow.code) }
+    });
+    assert.equal(code.usedAt, null, "client-scope downgrade burned a code before rejecting it");
+  });
+
+  it("does not exchange a code after its callback registration is removed", async () => {
+    const callbackClient = await clients.create(
+      {
+        name: "Code Callback Removal",
+        clientType: "confidential",
+        redirectUris: ["https://code-callback.example/callback"],
+        scopes: ["openid"],
+        grantTypes: ["authorization_code"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        requireConsent: true
+      },
+      { status: "APPROVED" }
+    );
+    const flow = await authorize({ scope: "openid" }, { client: callbackClient.client });
+    await prisma.oAuthClient.update({
+      where: { clientId: callbackClient.client.clientId },
+      data: { redirectUris: "https://code-callback.example/replacement" }
+    });
+
+    await assert.rejects(
+      provider.token({
+        headers: basicAuth(callbackClient.client.clientId, callbackClient.clientSecret),
+        body: {
+          grant_type: "authorization_code",
+          code: flow.code,
+          redirect_uri: flow.redirectUri,
+          code_verifier: flow.verifier
+        }
+      }),
+      (error) => {
+        assert.equal(error.code, "invalid_grant");
+        return true;
+      }
+    );
+  });
+
+  it("rechecks admin-only scope eligibility before exchanging an authorization code", async () => {
+    const user = await prisma.user.create({
+      data: {
+        id: crypto.randomUUID(),
+        email: `code-admin-${crypto.randomUUID()}@example.test`,
+        role: "ADMIN",
+        status: "ACTIVE"
+      }
+    });
+    const authorizationAccount = accounts.toAccount(user);
+    const browserSession = (await sessions.create({ userId: user.id })).session;
+    const adminClient = await clients.create(
+      {
+        name: "Code Admin Downgrade",
+        clientType: "confidential",
+        redirectUris: ["https://code-admin-downgrade.example/callback"],
+        scopes: ["openid", "credits.admin"],
+        grantTypes: ["authorization_code"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        requireConsent: true
+      },
+      { status: "APPROVED" }
+    );
+    const flow = await authorize(
+      { scope: "openid credits.admin" },
+      { client: adminClient.client, authorizationAccount, browserSession }
+    );
+    await prisma.user.update({ where: { id: user.id }, data: { role: "USER" } });
+
+    await assert.rejects(
+      provider.token({
+        headers: basicAuth(adminClient.client.clientId, adminClient.clientSecret),
+        body: {
+          grant_type: "authorization_code",
+          code: flow.code,
+          redirect_uri: flow.redirectUri,
+          code_verifier: flow.verifier
+        }
+      }),
+      (error) => {
+        assert.equal(error.code, "invalid_grant");
+        return true;
+      }
+    );
+  });
+
   // --- Refresh tokens -----------------------------------------------------
 
   it("rotates a refresh token and revokes the family on a replay", async () => {
@@ -862,6 +1517,282 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
         body: { grant_type: "refresh_token", refresh_token: second.refresh_token }
       }),
       /revoked/
+    );
+  });
+
+  it("rolls back a refresh rotation when issuing the replacement fails", async () => {
+    const flow = await authorize({ scope: "openid offline_access" });
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const first = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+
+    let failNextCreate = true;
+    const failingRefreshModel = (model) =>
+      new Proxy(model, {
+        get(target, prop) {
+          if (prop === "create") {
+            return async (...args) => {
+              if (failNextCreate) {
+                failNextCreate = false;
+                throw new Error("simulated replacement-token write failure");
+              }
+              return target.create(...args);
+            };
+          }
+          const value = target[prop];
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    const transactionClient = (client) =>
+      new Proxy(client, {
+        get(target, prop) {
+          if (prop === "refreshToken") return failingRefreshModel(target.refreshToken);
+          const value = target[prop];
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    const failingPrisma = new Proxy(prisma, {
+      get(target, prop) {
+        if (prop === "refreshToken") return failingRefreshModel(target.refreshToken);
+        if (prop === "$transaction") {
+          return (callback, ...args) =>
+            target.$transaction((tx) => callback(transactionClient(tx)), ...args);
+        }
+        const value = target[prop];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const failingProvider = createProviderService({
+      prisma: failingPrisma,
+      config,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+
+    await assert.rejects(
+      failingProvider.token({
+        headers,
+        body: { grant_type: "refresh_token", refresh_token: first.refresh_token }
+      }),
+      /simulated replacement-token write failure/
+    );
+
+    const retried = await provider.token({
+      headers,
+      body: { grant_type: "refresh_token", refresh_token: first.refresh_token }
+    });
+    assert.ok(retried.refresh_token, "the original token must remain usable after a rolled-back write");
+  });
+
+  it("reuses one refresh token without partial writes when rotation is disabled", async () => {
+    const nonRotatingConfig = {
+      ...config,
+      security: { ...config.security, rotateRefreshTokens: false }
+    };
+    const nonRotatingProvider = createProviderService({
+      prisma,
+      config: nonRotatingConfig,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+    const flow = await authorize({ scope: "openid offline_access" });
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const initial = await nonRotatingProvider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+    const original = await prisma.refreshToken.findUnique({
+      where: { tokenHash: hashToken(initial.refresh_token) }
+    });
+    assert.ok(original);
+
+    let failNextSessionTouch = true;
+    const failingOidcSessionModel = (model) =>
+      new Proxy(model, {
+        get(target, method) {
+          if (method === "updateMany") {
+            return async (...args) => {
+              if (failNextSessionTouch) {
+                failNextSessionTouch = false;
+                throw new Error("simulated session-touch failure");
+              }
+              return target.updateMany(...args);
+            };
+          }
+          const value = target[method];
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    const transactionClient = (client) =>
+      new Proxy(client, {
+        get(target, property) {
+          if (property === "oidcSession") return failingOidcSessionModel(target.oidcSession);
+          const value = target[property];
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    const failingPrisma = new Proxy(prisma, {
+      get(target, prop) {
+        if (prop === "oidcSession") return failingOidcSessionModel(target.oidcSession);
+        if (prop === "$transaction") {
+          return (callback, ...args) =>
+            target.$transaction((tx) => callback(transactionClient(tx)), ...args);
+        }
+        const value = target[prop];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const partiallyFailingProvider = createProviderService({
+      prisma: failingPrisma,
+      config: nonRotatingConfig,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+
+    await assert.rejects(
+      partiallyFailingProvider.token({
+        headers,
+        body: { grant_type: "refresh_token", refresh_token: initial.refresh_token }
+      }),
+      /simulated session-touch failure/
+    );
+    assert.equal(
+      await prisma.refreshToken.count({ where: { parentTokenId: original.id } }),
+      0,
+      "a failed non-rotating exchange left a partial refresh-token write"
+    );
+
+    const replayAuditBefore = await prisma.auditLog.count({ where: { action: "oauth.refresh.replayed" } });
+    const firstRetry = await nonRotatingProvider.token({
+      headers,
+      body: { grant_type: "refresh_token", refresh_token: initial.refresh_token }
+    });
+    const secondRetry = await nonRotatingProvider.token({
+      headers,
+      body: { grant_type: "refresh_token", refresh_token: initial.refresh_token }
+    });
+    assert.equal(firstRetry.refresh_token, undefined);
+    assert.equal(secondRetry.refresh_token, undefined);
+    assert.equal(
+      await prisma.refreshToken.count({ where: { parentTokenId: original.id } }),
+      0,
+      "non-rotating reuse created unnecessary sibling tokens"
+    );
+    const reusable = await prisma.refreshToken.findUnique({ where: { id: original.id } });
+    assert.equal(reusable.usedAt, null);
+    assert.equal(reusable.revokedAt, null);
+    assert.equal(
+      await prisma.auditLog.count({ where: { action: "oauth.refresh.replayed" } }),
+      replayAuditBefore,
+      "non-rotating mode cannot classify reuse as replay"
+    );
+  });
+
+  it("does not issue from a non-rotating refresh token revoked after the initial read", async () => {
+    const nonRotatingConfig = {
+      ...config,
+      security: { ...config.security, rotateRefreshTokens: false }
+    };
+    const nonRotatingProvider = createProviderService({
+      prisma,
+      config: nonRotatingConfig,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+    const flow = await authorize({ scope: "openid offline_access" });
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const initial = await nonRotatingProvider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+
+    let revokeAfterRead = true;
+    const revokingRefreshModel = new Proxy(prisma.refreshToken, {
+      get(target, property) {
+        if (property === "findUnique") {
+          return async (args) => {
+            const row = await target.findUnique(args);
+            if (row && revokeAfterRead) {
+              revokeAfterRead = false;
+              await target.updateMany({
+                where: { familyId: row.familyId, revokedAt: null },
+                data: { revokedAt: new Date() }
+              });
+            }
+            return row;
+          };
+        }
+        const value = target[property];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const revokingPrisma = new Proxy(prisma, {
+      get(target, property) {
+        if (property === "refreshToken") return revokingRefreshModel;
+        const value = target[property];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const racingProvider = createProviderService({
+      prisma: revokingPrisma,
+      config: nonRotatingConfig,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+    const issuedBefore = await prisma.auditLog.count({ where: { action: "oauth.token.issued" } });
+
+    await assert.rejects(
+      racingProvider.token({
+        headers,
+        body: { grant_type: "refresh_token", refresh_token: initial.refresh_token }
+      }),
+      (error) => {
+        assert.equal(error.code, "invalid_grant");
+        return true;
+      }
+    );
+    assert.equal(revokeAfterRead, false, "the revocation race was not exercised");
+    assert.equal(
+      await prisma.auditLog.count({ where: { action: "oauth.token.issued" } }),
+      issuedBefore,
+      "a revoked non-rotating refresh token was recorded as a successful issuance"
     );
   });
 
@@ -916,6 +1847,129 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     assert.equal(narrowed.scope, "openid offline_access");
   });
 
+  it("fails refresh, UserInfo, and introspection closed after an admin-only scope downgrade", async () => {
+    const user = await prisma.user.create({
+      data: {
+        id: crypto.randomUUID(),
+        email: `refresh-admin-${crypto.randomUUID()}@example.test`,
+        role: "ADMIN",
+        status: "ACTIVE"
+      }
+    });
+    const authorizationAccount = accounts.toAccount(user);
+    const browserSession = (await sessions.create({ userId: user.id })).session;
+    const adminClient = await clients.create(
+      {
+        name: "Refresh Admin Downgrade",
+        clientType: "confidential",
+        redirectUris: ["https://refresh-admin-downgrade.example/callback"],
+        scopes: ["openid", "offline_access", "credits.admin"],
+        grantTypes: ["authorization_code", "refresh_token"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        requireConsent: true
+      },
+      { status: "APPROVED" }
+    );
+    const flow = await authorize(
+      { scope: "openid offline_access credits.admin" },
+      { client: adminClient.client, authorizationAccount, browserSession }
+    );
+    const headers = basicAuth(adminClient.client.clientId, adminClient.clientSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+    await prisma.user.update({ where: { id: user.id }, data: { role: "USER" } });
+
+    const access = await provider.introspect({ headers, body: { token: tokens.access_token } });
+    const refresh = await provider.introspect({
+      headers,
+      body: { token: tokens.refresh_token, token_type_hint: "refresh_token" }
+    });
+    assert.equal(access.active, false);
+    assert.equal(refresh.active, false);
+    await assert.rejects(
+      provider.userinfo({ accessToken: tokens.access_token }),
+      (error) => {
+        assert.equal(error.code, "invalid_token");
+        return true;
+      }
+    );
+    await assert.rejects(
+      provider.token({
+        headers,
+        body: { grant_type: "refresh_token", refresh_token: tokens.refresh_token }
+      }),
+      (error) => {
+        assert.equal(error.code, "invalid_grant");
+        return true;
+      }
+    );
+  });
+
+  it("fails refresh, UserInfo, and introspection closed after client scope removal", async () => {
+    const scopedClient = await clients.create(
+      {
+        name: "Refresh Client Scope Removal",
+        clientType: "confidential",
+        redirectUris: ["https://refresh-client-scope.example/callback"],
+        scopes: ["openid", "offline_access", "credits.read"],
+        grantTypes: ["authorization_code", "refresh_token"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        requireConsent: true
+      },
+      { status: "APPROVED" }
+    );
+    const flow = await authorize(
+      { scope: "openid offline_access credits.read" },
+      { client: scopedClient.client }
+    );
+    const headers = basicAuth(scopedClient.client.clientId, scopedClient.clientSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+    await prisma.oAuthClient.update({
+      where: { clientId: scopedClient.client.clientId },
+      data: { allowedScopes: "openid offline_access" }
+    });
+
+    const access = await provider.introspect({ headers, body: { token: tokens.access_token } });
+    const refresh = await provider.introspect({
+      headers,
+      body: { token: tokens.refresh_token, token_type_hint: "refresh_token" }
+    });
+    assert.equal(access.active, false);
+    assert.equal(refresh.active, false);
+    await assert.rejects(
+      provider.userinfo({ accessToken: tokens.access_token }),
+      (error) => {
+        assert.equal(error.code, "invalid_token");
+        return true;
+      }
+    );
+    await assert.rejects(
+      provider.token({
+        headers,
+        body: { grant_type: "refresh_token", refresh_token: tokens.refresh_token }
+      }),
+      (error) => {
+        assert.equal(error.code, "invalid_grant");
+        return true;
+      }
+    );
+  });
+
   it("stops a refresh token working once the user revokes the grant", async () => {
     const revocable = await clients.create(
       {
@@ -956,6 +2010,237 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     );
   });
 
+  it("rolls back every credential when grant withdrawal fails", async () => {
+    const revocable = await clients.create(
+      {
+        name: "Transactional Revocation Client",
+        clientType: "confidential",
+        redirectUris: ["https://transactional-revoke.example/callback"],
+        scopes: ["openid", "offline_access"],
+        grantTypes: ["authorization_code", "refresh_token"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        requireConsent: false
+      },
+      { status: "APPROVED" }
+    );
+    const headers = basicAuth(revocable.client.clientId, revocable.clientSecret);
+    const issuedFlow = await authorize({ scope: "openid offline_access" }, { client: revocable.client });
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: issuedFlow.code,
+        redirect_uri: issuedFlow.redirectUri,
+        code_verifier: issuedFlow.verifier
+      }
+    });
+    const pendingFlow = await authorize({ scope: "openid offline_access" }, { client: revocable.client });
+
+    let failed = false;
+    const transactionClient = (client) =>
+      new Proxy(client, {
+        get(target, property) {
+          if (property === "oidcSession") {
+            return new Proxy(target.oidcSession, {
+              get(model, method) {
+                if (method === "updateMany") {
+                  return async (...args) => {
+                    if (!failed) {
+                      failed = true;
+                      throw new Error("simulated grant-revocation failure");
+                    }
+                    return model.updateMany(...args);
+                  };
+                }
+                const value = model[method];
+                return typeof value === "function" ? value.bind(model) : value;
+              }
+            });
+          }
+          const value = target[property];
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    const failingPrisma = new Proxy(prisma, {
+      get(target, property) {
+        if (property === "$transaction") {
+          return (callback, ...args) => target.$transaction((tx) => callback(transactionClient(tx)), ...args);
+        }
+        const value = target[property];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const failingProvider = createProviderService({
+      prisma: failingPrisma,
+      config,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+
+    await assert.rejects(
+      failingProvider.revokeGrant({ userId: account.id, clientId: revocable.client.clientId }),
+      /simulated grant-revocation failure/
+    );
+    assert.equal(failed, true);
+
+    const grant = await prisma.grant.findUnique({
+      where: { userId_clientId: { userId: account.id, clientId: revocable.client.clientId } }
+    });
+    const refresh = await prisma.refreshToken.findUnique({
+      where: { tokenHash: hashToken(tokens.refresh_token) }
+    });
+    const code = await prisma.authorizationCode.findUnique({
+      where: { codeHash: hashToken(pendingFlow.code) }
+    });
+    const oidcSession = await prisma.oidcSession.findUnique({
+      where: { sessionId_clientId: { sessionId: session.id, clientId: revocable.client.clientId } }
+    });
+    assert.equal(grant.revokedAt, null, "the grant was partially revoked");
+    assert.equal(refresh.revokedAt, null, "the refresh token was partially revoked");
+    assert.equal(code.usedAt, null, "the authorization code was partially consumed");
+    assert.equal(oidcSession.revokedAt, null, "the OIDC session was partially revoked");
+
+    assert.equal(
+      (await provider.revokeGrant({ userId: account.id, clientId: revocable.client.clientId })).revoked,
+      true,
+      "the rolled-back withdrawal could not be retried"
+    );
+  });
+
+  it("rolls back grant withdrawal when its back-channel outbox write fails", async () => {
+    const revocable = await clients.create(
+      {
+        name: "Transactional Logout Outbox Client",
+        clientType: "confidential",
+        redirectUris: ["https://transactional-outbox.example/callback"],
+        backchannelLogoutUri: "https://transactional-outbox.example/logout",
+        scopes: ["openid", "offline_access"],
+        grantTypes: ["authorization_code", "refresh_token"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        requireConsent: false
+      },
+      { status: "APPROVED" }
+    );
+    const browser = await sessions.create({ userId: account.id });
+    const headers = basicAuth(revocable.client.clientId, revocable.clientSecret);
+    const issuedFlow = await authorize(
+      { scope: "openid offline_access" },
+      { client: revocable.client, browserSession: browser.session }
+    );
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: issuedFlow.code,
+        redirect_uri: issuedFlow.redirectUri,
+        code_verifier: issuedFlow.verifier
+      }
+    });
+    const pendingFlow = await authorize(
+      { scope: "openid offline_access" },
+      { client: revocable.client, browserSession: browser.session }
+    );
+    const oidcSession = await prisma.oidcSession.findUnique({
+      where: {
+        sessionId_clientId: {
+          sessionId: browser.session.id,
+          clientId: revocable.client.clientId
+        }
+      }
+    });
+
+    let failOutboxWrite = true;
+    const transactionClient = (client) =>
+      new Proxy(client, {
+        get(target, property) {
+          if (property === "backchannelLogout") {
+            return new Proxy(target.backchannelLogout, {
+              get(model, method) {
+                if (method === "create") {
+                  return async (...args) => {
+                    if (failOutboxWrite) {
+                      failOutboxWrite = false;
+                      throw new Error("simulated grant outbox failure");
+                    }
+                    return model.create(...args);
+                  };
+                }
+                const value = model[method];
+                return typeof value === "function" ? value.bind(model) : value;
+              }
+            });
+          }
+          const value = target[property];
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    const failingPrisma = new Proxy(prisma, {
+      get(target, property) {
+        if (property === "$transaction") {
+          return (callback, ...args) =>
+            target.$transaction((tx) => callback(transactionClient(tx)), ...args);
+        }
+        const value = target[property];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const failingBackchannel = createBackchannelService({ prisma, config, clients, keys });
+    const failingProvider = createProviderService({
+      prisma: failingPrisma,
+      config,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } }),
+      backchannel: failingBackchannel
+    });
+
+    await assert.rejects(
+      failingProvider.revokeGrant({ userId: account.id, clientId: revocable.client.clientId }),
+      /simulated grant outbox failure/
+    );
+    assert.equal(failOutboxWrite, false, "the outbox failure was not exercised");
+
+    const grant = await prisma.grant.findUnique({
+      where: { userId_clientId: { userId: account.id, clientId: revocable.client.clientId } }
+    });
+    const refresh = await prisma.refreshToken.findUnique({
+      where: { tokenHash: hashToken(tokens.refresh_token) }
+    });
+    const pendingCode = await prisma.authorizationCode.findUnique({
+      where: { codeHash: hashToken(pendingFlow.code) }
+    });
+    assert.equal(grant.revokedAt, null, "the grant committed without its outbox intent");
+    assert.equal(refresh.revokedAt, null, "refresh revocation committed without its outbox intent");
+    assert.equal(pendingCode.usedAt, null, "code containment committed without its outbox intent");
+    assert.equal(
+      (await prisma.oidcSession.findUnique({ where: { id: oidcSession.id } })).revokedAt,
+      null,
+      "OIDC revocation committed without its outbox intent"
+    );
+    assert.equal(
+      await prisma.backchannelLogout.count({ where: { sessionId: oidcSession.id } }),
+      0,
+      "the failed transaction left a partial outbox row"
+    );
+
+    assert.equal(
+      (await provider.revokeGrant({ userId: account.id, clientId: revocable.client.clientId })).revoked,
+      true
+    );
+    assert.equal(
+      await prisma.backchannelLogout.count({ where: { sessionId: oidcSession.id } }),
+      1,
+      "the successful retry did not commit its logout intent"
+    );
+  });
+
   it("rejects an unsupported grant type", async () => {
     await assert.rejects(
       provider.token({
@@ -992,6 +2277,37 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     assert.equal(claims.email_verified, false);
     assert.equal(claims.name, "Ada Lovelace");
     assert.equal(claims.preferred_username, "owner");
+  });
+
+  it("returns a handoff username without using it as the local account key", async () => {
+    const registered = await accounts.register({
+      email: "external-profile@example.com",
+      password: "external-profile-password"
+    });
+    const externalAccount = await accounts.setAttributes({
+      userId: registered.account.id,
+      attributes: { external_preferred_username: "knight-member" }
+    });
+    const externalSession = (await sessions.login({ userId: externalAccount.id })).session;
+    const flow = await authorize(
+      { scope: "openid profile" },
+      { authorizationAccount: externalAccount, browserSession: externalSession }
+    );
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+
+    const claims = await provider.userinfo({ accessToken: tokens.access_token });
+    assert.equal(claims.preferred_username, "knight-member");
+    assert.equal((await provider.introspect({ headers, body: { token: tokens.access_token } })).username, "knight-member");
+    assert.equal(externalAccount.username, null, "the upstream display username became a local binding key");
   });
 
   it("releases only the claims the granted scopes cover", async () => {
@@ -1057,7 +2373,11 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     // email and name for the rest of its lifetime — and the same token handed
     // to introspection came back inactive, so the issuer disagreed with itself
     // about one token.
-    const flow = await authorize({ scope: "openid profile email" });
+    const browser = await sessions.create({ userId: account.id });
+    const flow = await authorize(
+      { scope: "openid profile email" },
+      { browserSession: browser.session }
+    );
     const headers = basicAuth(confidential.clientId, confidentialSecret);
     const tokens = await provider.token({
       headers,
@@ -1072,7 +2392,12 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     const before = await provider.userinfo({ accessToken: tokens.access_token });
     assert.equal(before.email, "owner@example.com", "the token has to work before it is revoked");
 
-    await provider.endSessions({ sessionId: session.id, userId: account.id, reason: "user_revoked" });
+    const ended = await provider.endSessions({
+      sessionId: browser.session.id,
+      userId: account.id,
+      reason: "user_revoked"
+    });
+    assert.equal(ended.revoked, true);
 
     const introspected = await provider.introspect({
       headers,
@@ -1084,6 +2409,95 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
       assert.equal(error.code, "invalid_token");
       return true;
     });
+  });
+
+  it("fails closed when the session behind an access token is missing", async () => {
+    const flow = await authorize({ scope: "openid profile" });
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+    const sid = decodeJwt(tokens.access_token).payload.sid;
+    assert.ok(sid, "a user access token must identify its server-side session");
+
+    await prisma.oidcSession.delete({ where: { id: sid } });
+
+    await assert.rejects(
+      provider.userinfo({ accessToken: tokens.access_token }),
+      /session.*(ended|available)/i
+    );
+    const inspected = await provider.introspect({
+      headers,
+      body: { token: tokens.access_token, token_type_hint: "access_token" }
+    });
+    assert.deepEqual(inspected, { active: false });
+  });
+
+  it("does not consume an authorization code when its OIDC session is missing", async () => {
+    const flow = await authorize({ scope: "openid" });
+    const record = await prisma.authorizationCode.findUnique({
+      where: { codeHash: hashToken(flow.code) }
+    });
+    await prisma.oidcSession.deleteMany({
+      where: { sessionId: record.sessionId, clientId: confidential.clientId }
+    });
+
+    await assert.rejects(
+      provider.token({
+        headers: basicAuth(confidential.clientId, confidentialSecret),
+        body: {
+          grant_type: "authorization_code",
+          code: flow.code,
+          redirect_uri: flow.redirectUri,
+          code_verifier: flow.verifier
+        }
+      }),
+      /session has been ended/i
+    );
+
+    const untouched = await prisma.authorizationCode.findUnique({ where: { id: record.id } });
+    assert.equal(untouched.usedAt, null, "a failed session check burned the authorization code");
+  });
+
+  it("fails refresh exchange and introspection closed when the OIDC session is missing", async () => {
+    const flow = await authorize({ scope: "openid offline_access" });
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+    const sid = decodeJwt(tokens.access_token).payload.sid;
+    await prisma.oidcSession.delete({ where: { id: sid } });
+
+    const inspected = await provider.introspect({
+      headers,
+      body: { token: tokens.refresh_token, token_type_hint: "refresh_token" }
+    });
+    assert.deepEqual(inspected, { active: false });
+
+    await assert.rejects(
+      provider.token({
+        headers,
+        body: { grant_type: "refresh_token", refresh_token: tokens.refresh_token }
+      }),
+      /session has been ended/i
+    );
+    const stored = await prisma.refreshToken.findUnique({
+      where: { tokenHash: hashToken(tokens.refresh_token) }
+    });
+    assert.equal(stored.usedAt, null, "the missing-session refresh was consumed");
+    assert.ok(stored.revokedAt, "the unusable refresh family was not revoked");
   });
 
   it("refuses UserInfo for a token issued without openid", async () => {
@@ -1241,6 +2655,258 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     assert.deepEqual(result, { revoked: true });
   });
 
+  it("revokes an access token centrally and retires its session refresh token", async () => {
+    const browser = await sessions.create({ userId: account.id });
+    const flow = await authorize(
+      { scope: "openid offline_access" },
+      { browserSession: browser.session }
+    );
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+
+    assert.equal(
+      (await provider.introspect({ headers, body: { token: tokens.access_token } })).active,
+      true
+    );
+    await provider.revoke({ headers, body: { token: tokens.access_token } });
+    assert.equal(
+      (await provider.introspect({ headers, body: { token: tokens.access_token } })).active,
+      false
+    );
+    await assert.rejects(
+      provider.token({
+        headers,
+        body: { grant_type: "refresh_token", refresh_token: tokens.refresh_token }
+      }),
+      /revoked/
+    );
+  });
+
+  it("does not swallow a storage failure while revoking an access token", async () => {
+    const browser = await sessions.create({ userId: account.id });
+    const flow = await authorize({ scope: "openid" }, { browserSession: browser.session });
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+    const failingPrisma = new Proxy(prisma, {
+      get(target, property) {
+        if (property === "oidcSession") {
+          return new Proxy(target.oidcSession, {
+            get(model, method) {
+              if (method === "findUnique") {
+                return async () => {
+                  throw new Error("simulated access-token revocation storage failure");
+                };
+              }
+              const value = model[method];
+              return typeof value === "function" ? value.bind(model) : value;
+            }
+          });
+        }
+        const value = target[property];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const failingProvider = createProviderService({
+      prisma: failingPrisma,
+      config,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+
+    await assert.rejects(
+      failingProvider.revoke({ headers, body: { token: tokens.access_token } }),
+      /simulated access-token revocation storage failure/
+    );
+  });
+
+  it("revokes a refresh family under the shared Client, User, Grant lock order", async () => {
+    const browser = await sessions.create({ userId: account.id });
+    const flow = await authorize(
+      { scope: "openid offline_access" },
+      { browserSession: browser.session }
+    );
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+
+    const trace = [];
+    const traceLock = (sql) => {
+      if (sql.includes('"oauth_clients"')) trace.push("client");
+      else if (sql.includes('"users"')) trace.push("user");
+      else if (sql.includes('"grants"')) trace.push("grant");
+    };
+    const transactionClient = (client) =>
+      new Proxy(client, {
+        get(target, property) {
+          if (property === "$executeRawUnsafe" || property === "$queryRawUnsafe") {
+            return async (sql, ...args) => {
+              traceLock(sql);
+              return target[property](sql, ...args);
+            };
+          }
+          if (property === "refreshToken") {
+            return new Proxy(target.refreshToken, {
+              get(model, method) {
+                if (method === "updateMany") {
+                  return async (...args) => {
+                    trace.push("refresh");
+                    return model.updateMany(...args);
+                  };
+                }
+                const value = model[method];
+                return typeof value === "function" ? value.bind(model) : value;
+              }
+            });
+          }
+          const value = target[property];
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    const tracedPrisma = new Proxy(prisma, {
+      get(target, property) {
+        if (property === "$transaction") {
+          return (callback, ...args) =>
+            target.$transaction((tx) => callback(transactionClient(tx)), ...args);
+        }
+        const value = target[property];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const tracedProvider = createProviderService({
+      prisma: tracedPrisma,
+      config,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+
+    await tracedProvider.revoke({ headers, body: { token: tokens.refresh_token } });
+    assert.deepEqual(
+      trace,
+      ["client", "user", "grant", "refresh"],
+      "family revocation did not share issuance's stable lock contract"
+    );
+  });
+
+  it("rolls back both halves of code-replay containment when one write fails", async () => {
+    const browser = await sessions.create({ userId: account.id });
+    const flow = await authorize(
+      { scope: "openid offline_access" },
+      { browserSession: browser.session }
+    );
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const body = {
+      grant_type: "authorization_code",
+      code: flow.code,
+      redirect_uri: flow.redirectUri,
+      code_verifier: flow.verifier
+    };
+    const tokens = await provider.token({ headers, body });
+    const oidcSessionId = decodeJwt(tokens.access_token).payload.sid;
+
+    let failOidcWrite = true;
+    const transactionClient = (client) =>
+      new Proxy(client, {
+        get(target, property) {
+          if (property === "oidcSession") {
+            return new Proxy(target.oidcSession, {
+              get(model, method) {
+                if (method === "updateMany") {
+                  return async (...args) => {
+                    if (failOidcWrite) {
+                      failOidcWrite = false;
+                      throw new Error("simulated code-replay containment failure");
+                    }
+                    return model.updateMany(...args);
+                  };
+                }
+                const value = model[method];
+                return typeof value === "function" ? value.bind(model) : value;
+              }
+            });
+          }
+          const value = target[property];
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    const failingPrisma = new Proxy(prisma, {
+      get(target, property) {
+        if (property === "$transaction") {
+          return (callback, ...args) =>
+            target.$transaction((tx) => callback(transactionClient(tx)), ...args);
+        }
+        const value = target[property];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const failingProvider = createProviderService({
+      prisma: failingPrisma,
+      config,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+
+    await assert.rejects(
+      failingProvider.token({ headers, body }),
+      /simulated code-replay containment failure/
+    );
+    assert.equal(failOidcWrite, false, "the injected containment failure was not exercised");
+
+    const refreshAfterFailure = await prisma.refreshToken.findUnique({
+      where: { tokenHash: hashToken(tokens.refresh_token) }
+    });
+    const oidcAfterFailure = await prisma.oidcSession.findUnique({ where: { id: oidcSessionId } });
+    assert.equal(refreshAfterFailure.revokedAt, null, "refresh containment committed by itself");
+    assert.equal(oidcAfterFailure.revokedAt, null, "OIDC containment committed by itself");
+
+    await assert.rejects(provider.token({ headers, body }), (error) => {
+      assert.equal(error.code, "invalid_grant");
+      return true;
+    });
+    assert.ok(
+      (await prisma.refreshToken.findUnique({ where: { id: refreshAfterFailure.id } })).revokedAt,
+      "a retry did not contain the refresh family"
+    );
+    assert.ok(
+      (await prisma.oidcSession.findUnique({ where: { id: oidcSessionId } })).revokedAt,
+      "a retry did not contain the OIDC session"
+    );
+  });
+
   // --- Grant management ---------------------------------------------------
 
   it("lists the applications a user has authorized, with readable permissions", async () => {
@@ -1306,7 +2972,8 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     // each of them — by submitting an identifier that was not theirs. The
     // caller passed `userId` and its own comment said the call was scoped by
     // it; only the audit entry ever read it.
-    const flow = await authorize({ scope: "openid" });
+    const browser = await sessions.create({ userId: account.id });
+    const flow = await authorize({ scope: "openid" }, { browserSession: browser.session });
     await provider.token({
       headers: basicAuth(confidential.clientId, confidentialSecret),
       body: {
@@ -1317,33 +2984,139 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
       }
     });
 
-    const live = await prisma.oidcSession.count({ where: { sessionId: session.id, revokedAt: null } });
+    const live = await prisma.oidcSession.count({
+      where: { sessionId: browser.session.id, revokedAt: null }
+    });
     assert.ok(live >= 1, "a live session is needed for the attempt to mean anything");
 
     const result = await provider.endSessions({
-      sessionId: session.id,
+      sessionId: browser.session.id,
       userId: "some-other-user-entirely",
       reason: "user_revoked"
     });
+    assert.equal(result.revoked, false, "a stranger's browser session was deleted");
     assert.equal(result.notified, 0, "a stranger's session was notified");
     assert.equal(
-      await prisma.oidcSession.count({ where: { sessionId: session.id, revokedAt: null } }),
+      await prisma.oidcSession.count({
+        where: { sessionId: browser.session.id, revokedAt: null }
+      }),
       live,
       "a stranger's session was revoked"
+    );
+    assert.ok(
+      await prisma.session.findUnique({ where: { id: browser.session.id } }),
+      "a stranger's browser session was deleted"
     );
   });
 
   it("refuses to end sessions without an owner to scope the revocation to", async () => {
     // An absent scope is the defect itself, so it fails loudly rather than
     // falling back to matching every user — which is what it used to do.
+    const browser = await sessions.create({ userId: account.id });
     await assert.rejects(
-      () => provider.endSessions({ sessionId: session.id }),
+      () => provider.endSessions({ sessionId: browser.session.id }),
       /requires a userId/
     );
   });
 
+  it("rolls browser and OIDC sessions back when the logout outbox write fails", async () => {
+    const browser = await sessions.create({ userId: account.id });
+    const flow = await authorize({ scope: "openid" }, { browserSession: browser.session });
+    const tokens = await provider.token({
+      headers: basicAuth(confidential.clientId, confidentialSecret),
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+    const oidcSessionId = decodeJwt(tokens.id_token).payload.sid;
+
+    let failOutboxWrite = true;
+    const transactionClient = (client) =>
+      new Proxy(client, {
+        get(target, property) {
+          if (property === "backchannelLogout") {
+            return new Proxy(target.backchannelLogout, {
+              get(model, method) {
+                if (method === "create") {
+                  return async (...args) => {
+                    if (failOutboxWrite) {
+                      failOutboxWrite = false;
+                      throw new Error("simulated browser logout outbox failure");
+                    }
+                    return model.create(...args);
+                  };
+                }
+                const value = model[method];
+                return typeof value === "function" ? value.bind(model) : value;
+              }
+            });
+          }
+          const value = target[property];
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    const failingPrisma = new Proxy(prisma, {
+      get(target, property) {
+        if (property === "$transaction") {
+          return (callback, ...args) =>
+            target.$transaction((tx) => callback(transactionClient(tx)), ...args);
+        }
+        const value = target[property];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const failingProvider = createProviderService({
+      prisma: failingPrisma,
+      config,
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } }),
+      backchannel: createBackchannelService({ prisma, config, clients, keys })
+    });
+
+    await assert.rejects(
+      failingProvider.endSessions({ sessionId: browser.session.id, userId: account.id }),
+      /simulated browser logout outbox failure/
+    );
+    assert.equal(failOutboxWrite, false, "the logout outbox failure was not exercised");
+    assert.ok(
+      await prisma.session.findUnique({ where: { id: browser.session.id } }),
+      "the browser credential was deleted without a durable logout intent"
+    );
+    assert.equal(
+      (await prisma.oidcSession.findUnique({ where: { id: oidcSessionId } })).revokedAt,
+      null,
+      "the OIDC session was revoked without a durable logout intent"
+    );
+    assert.equal(
+      await prisma.backchannelLogout.count({ where: { sessionId: oidcSessionId } }),
+      0,
+      "the failed logout left a partial outbox row"
+    );
+
+    const retried = await provider.endSessions({
+      sessionId: browser.session.id,
+      userId: account.id
+    });
+    assert.equal(retried.revoked, true);
+    assert.ok(retried.notified >= 1);
+    assert.equal(await prisma.session.findUnique({ where: { id: browser.session.id } }), null);
+    assert.ok((await prisma.oidcSession.findUnique({ where: { id: oidcSessionId } })).revokedAt);
+    assert.equal(
+      await prisma.backchannelLogout.count({ where: { sessionId: oidcSessionId } }),
+      1
+    );
+  });
+
   it("notifies a client by back channel when the session ends", async () => {
-    const flow = await authorize({ scope: "openid" });
+    const browser = await sessions.create({ userId: account.id });
+    const flow = await authorize({ scope: "openid" }, { browserSession: browser.session });
     const tokens = await provider.token({
       headers: basicAuth(confidential.clientId, confidentialSecret),
       body: {
@@ -1360,8 +3133,17 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     assert.ok(idTokenSid);
 
     const before = backchannelPosts.length;
-    const { notified } = await provider.endSessions({ sessionId: session.id, userId: account.id });
+    const { revoked, notified } = await provider.endSessions({
+      sessionId: browser.session.id,
+      userId: account.id
+    });
+    assert.equal(revoked, true);
     assert.ok(notified >= 1, "a client with a registered endpoint must be queued");
+    assert.equal(
+      await prisma.session.findUnique({ where: { id: browser.session.id } }),
+      null,
+      "ending the browser session left its bearer credential active"
+    );
 
     const backchannel = createBackchannelService({
       prisma,
@@ -1479,11 +3261,265 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
 
   // --- Housekeeping -------------------------------------------------------
 
-  it("prunes spent and expired protocol records", async () => {
-    const result = await provider.pruneExpired();
-    assert.ok(result.codes >= 1, "used codes are removed");
-    assert.ok(Number.isInteger(result.authorizationRequests));
-    assert.ok(Number.isInteger(result.refreshTokens));
+  it("retains used codes for replay containment and prunes them after the risk window", async () => {
+    const browser = await sessions.create({ userId: account.id });
+    const usedFlow = await authorize(
+      { scope: "openid" },
+      { browserSession: browser.session }
+    );
+    await provider.token({
+      headers: basicAuth(confidential.clientId, confidentialSecret),
+      body: {
+        grant_type: "authorization_code",
+        code: usedFlow.code,
+        redirect_uri: usedFlow.redirectUri,
+        code_verifier: usedFlow.verifier
+      }
+    });
+    const usedCode = await prisma.authorizationCode.findUnique({
+      where: { codeHash: hashToken(usedFlow.code) }
+    });
+
+    const unusedFlow = await authorize(
+      { scope: "openid" },
+      { browserSession: browser.session }
+    );
+    const unusedCode = await prisma.authorizationCode.findUnique({
+      where: { codeHash: hashToken(unusedFlow.code) }
+    });
+    await prisma.authorizationCode.update({
+      where: { id: unusedCode.id },
+      data: { expiresAt: new Date(Date.now() - 1000) }
+    });
+
+    const first = await provider.pruneExpired();
+    assert.ok(Number.isInteger(first.authorizationRequests));
+    assert.ok(Number.isInteger(first.refreshTokens));
+    assert.ok(
+      await prisma.authorizationCode.findUnique({ where: { id: usedCode.id } }),
+      "a fresh used code was removed before its descendants could expire"
+    );
+    assert.equal(
+      await prisma.authorizationCode.findUnique({ where: { id: unusedCode.id } }),
+      null,
+      "an unused expired code was retained"
+    );
+
+    const replayWindowSeconds = Math.max(
+      config.ttl.accessTokenSeconds,
+      config.ttl.refreshTokenSeconds
+    );
+    await prisma.authorizationCode.update({
+      where: { id: usedCode.id },
+      data: { usedAt: new Date(Date.now() - replayWindowSeconds * 1000 - 1000) }
+    });
+    const second = await provider.pruneExpired();
+    assert.ok(second.codes >= 1);
+    assert.equal(
+      await prisma.authorizationCode.findUnique({ where: { id: usedCode.id } }),
+      null,
+      "a used code outlived every credential it could contain"
+    );
+  });
+
+  it("still contains a code replay after housekeeping runs", async () => {
+    const browser = await sessions.create({ userId: account.id });
+    const flow = await authorize(
+      { scope: "openid offline_access" },
+      { browserSession: browser.session }
+    );
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const body = {
+      grant_type: "authorization_code",
+      code: flow.code,
+      redirect_uri: flow.redirectUri,
+      code_verifier: flow.verifier
+    };
+    const tokens = await provider.token({ headers, body });
+    const code = await prisma.authorizationCode.findUnique({
+      where: { codeHash: hashToken(flow.code) }
+    });
+    const oidcSessionId = decodeJwt(tokens.access_token).payload.sid;
+
+    await provider.pruneExpired();
+    assert.ok(
+      await prisma.authorizationCode.findUnique({ where: { id: code.id } }),
+      "housekeeping removed the replay detector while descendants were live"
+    );
+
+    await assert.rejects(provider.token({ headers, body }), (error) => {
+      assert.equal(error.code, "invalid_grant");
+      return true;
+    });
+    assert.ok(
+      (await prisma.refreshToken.findUnique({
+        where: { tokenHash: hashToken(tokens.refresh_token) }
+      })).revokedAt,
+      "the post-prune replay did not revoke its refresh family"
+    );
+    assert.ok(
+      (await prisma.oidcSession.findUnique({ where: { id: oidcSessionId } })).revokedAt,
+      "the post-prune replay did not revoke its OIDC session"
+    );
+  });
+
+  it("keeps session revocation state for the longest token lifetime", async () => {
+    const flow = await authorize({ scope: "openid" });
+    const tokens = await provider.token({
+      headers: basicAuth(confidential.clientId, confidentialSecret),
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+    const candidate = await prisma.oidcSession.findUnique({
+      where: { id: decodeJwt(tokens.access_token).payload.sid }
+    });
+    assert.ok(candidate, "the test needs an OIDC session to age");
+
+    const ninetyMinutesAgo = new Date(Date.now() - 90 * 60 * 1000);
+    await prisma.oidcSession.update({
+      where: { id: candidate.id },
+      data: { lastSeenAt: ninetyMinutesAgo }
+    });
+
+    const unevenTtlProvider = createProviderService({
+      prisma,
+      config: {
+        ...config,
+        ttl: { ...config.ttl, accessTokenSeconds: 2 * 60 * 60, refreshTokenSeconds: 60 * 60 }
+      },
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+    await unevenTtlProvider.pruneExpired();
+
+    assert.ok(
+      await prisma.oidcSession.findUnique({ where: { id: candidate.id } }),
+      "an access token can still reference this session for another 30 minutes"
+    );
+  });
+
+  it("keeps OIDC state while its remembered browser session is still active", async () => {
+    const browser = await sessions.create({ userId: account.id, remember: true });
+    const flow = await authorize(
+      { scope: "openid" },
+      { browserSession: browser.session }
+    );
+    const tokens = await provider.token({
+      headers: basicAuth(confidential.clientId, confidentialSecret),
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+    const oidcSession = await prisma.oidcSession.findUnique({
+      where: { id: decodeJwt(tokens.access_token).payload.sid }
+    });
+    await prisma.oidcSession.update({
+      where: { id: oidcSession.id },
+      data: { lastSeenAt: new Date(Date.now() - 2 * 60 * 60 * 1000) }
+    });
+
+    const shortTokenProvider = createProviderService({
+      prisma,
+      config: {
+        ...config,
+        ttl: { ...config.ttl, accessTokenSeconds: 60 * 60, refreshTokenSeconds: 60 * 60 }
+      },
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+    await shortTokenProvider.pruneExpired();
+    assert.ok(
+      await prisma.oidcSession.findUnique({ where: { id: oidcSession.id } }),
+      "pruning broke logout fan-out for an active remembered browser session"
+    );
+
+    await prisma.session.delete({ where: { id: browser.session.id } });
+    await shortTokenProvider.pruneExpired();
+    assert.equal(await prisma.oidcSession.findUnique({ where: { id: oidcSession.id } }), null);
+  });
+
+  it("does not prune an OIDC session refreshed after the stale candidate read", async () => {
+    const browser = await sessions.create({ userId: account.id, remember: false });
+    const flow = await authorize({ scope: "openid" }, { browserSession: browser.session });
+    const tokens = await provider.token({
+      headers: basicAuth(confidential.clientId, confidentialSecret),
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+    const oidcSession = await prisma.oidcSession.findUnique({
+      where: { id: decodeJwt(tokens.access_token).payload.sid }
+    });
+    await prisma.session.delete({ where: { id: browser.session.id } });
+    await prisma.oidcSession.update({
+      where: { id: oidcSession.id },
+      data: { lastSeenAt: new Date(Date.now() - 2 * 60 * 60 * 1000) }
+    });
+
+    let refreshedBeforeDelete = false;
+    const racingOidcSessions = new Proxy(prisma.oidcSession, {
+      get(target, property) {
+        if (property === "deleteMany") {
+          return async (args) => {
+            if (!refreshedBeforeDelete && args?.where?.id?.in?.includes(oidcSession.id)) {
+              refreshedBeforeDelete = true;
+              await target.update({
+                where: { id: oidcSession.id },
+                data: { lastSeenAt: new Date() }
+              });
+            }
+            return target.deleteMany(args);
+          };
+        }
+        const value = target[property];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const racingPrisma = new Proxy(prisma, {
+      get(target, property) {
+        if (property === "oidcSession") return racingOidcSessions;
+        const value = target[property];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    const shortTokenProvider = createProviderService({
+      prisma: racingPrisma,
+      config: {
+        ...config,
+        ttl: { ...config.ttl, accessTokenSeconds: 60 * 60, refreshTokenSeconds: 60 * 60 }
+      },
+      scopeRegistry,
+      clients,
+      accounts,
+      sessions,
+      keys,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+
+    await shortTokenProvider.pruneExpired();
+    assert.equal(refreshedBeforeDelete, true, "the delete race was not exercised");
+    assert.ok(
+      await prisma.oidcSession.findUnique({ where: { id: oidcSession.id } }),
+      "pruning deleted a session that became active after candidate selection"
+    );
   });
 
   it("stores no code, token, or verifier in the clear", async () => {

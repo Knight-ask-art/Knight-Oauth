@@ -42,6 +42,15 @@ function csrfFrom(html) {
   return match[1];
 }
 
+function assertPrivateBrowserResponse(response, path) {
+  assert.match(response.headers["cache-control"] || "", /(?:^|,)\s*no-store(?:,|$)/i, `${path} was cacheable`);
+  assert.equal(response.headers.pragma, "no-cache", `${path} had no legacy cache guard`);
+  const vary = String(response.headers.vary || "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase());
+  assert.ok(vary.includes("cookie"), `${path} did not vary on Cookie`);
+}
+
 function pkce() {
   const verifier = crypto.randomBytes(32).toString("base64url");
   return {
@@ -70,6 +79,8 @@ describe("the HTTP surface", () => {
 
     config = loadEnv({
       PUBLIC_BASE_URL: "http://127.0.0.1:3010",
+      DATABASE_PROVIDER: db.provider,
+      DATABASE_URL: db.url,
       OAUTH_ALLOW_GENERATED_KEYS: "true",
       // Every request in this suite arrives from one address, so the shipped
       // default of 10 sign-ins a minute throttles the suite itself rather than
@@ -241,6 +252,43 @@ describe("the HTTP surface", () => {
     }
   });
 
+  it("keeps public machine endpoints outside the browser cookie boundary", async () => {
+    for (const path of [
+      "/.well-known/openid-configuration",
+      "/.well-known/oauth-authorization-server",
+      "/oauth2/jwks",
+      "/.well-known/jwks.json"
+    ]) {
+      const response = await request(app).get(path).set("Cookie", "koauth_session=not-a-session").expect(200);
+      assert.equal(response.headers["set-cookie"], undefined, `${path} issued a browser cookie`);
+      assert.equal(response.headers["cache-control"], "public, max-age=300");
+    }
+
+    const health = await request(app)
+      .get("/healthz")
+      .set("Cookie", "koauth_session=not-a-session")
+      .expect(200);
+    assert.equal(health.headers["set-cookie"], undefined, "/healthz issued a browser cookie");
+    assert.match(health.headers["cache-control"] || "", /(?:^|,)\s*no-store(?:,|$)/i);
+  });
+
+  it("keeps stateless protocol endpoints outside browser session state", async () => {
+    const account = await accounts.findByEmail("user@example.com");
+    const sessions = app.locals.services.sessions;
+    const { sid, session } = await sessions.create({ userId: account.id });
+    const nearExpiry = new Date(Date.now() + 1_000);
+    await db.prisma.session.update({ where: { id: session.id }, data: { expiresAt: nearExpiry } });
+
+    const response = await request(app)
+      .get("/oauth2/userinfo")
+      .set("Cookie", `${sessions.cookieName}=${sid}`)
+      .expect(401);
+
+    assert.equal(response.headers["set-cookie"], undefined, "UserInfo refreshed a browser session cookie");
+    const untouched = await db.prisma.session.findUnique({ where: { id: session.id } });
+    assert.equal(untouched.expiresAt.getTime(), nearExpiry.getTime(), "UserInfo touched browser session state");
+  });
+
   it("answers a cross-origin request on the endpoints a browser client reads", async () => {
     // A single-page application fetches these from the browser. `*` is safe
     // here only because none of them authenticates by cookie — which is the
@@ -275,6 +323,7 @@ describe("the HTTP surface", () => {
     for (const [path, expected] of pages) {
       const response = await request(app).get(path).expect(200);
       assert.match(response.text, expected, `${path} did not render as expected`);
+      assertPrivateBrowserResponse(response, path);
       // The minimum a user is told must be the one that will be enforced.
       if (/password/.test(response.text) && /At least/.test(response.text)) {
         assert.match(response.text, new RegExp(`At least ${config.accounts.minPasswordLength} characters`));
@@ -290,6 +339,7 @@ describe("the HTTP surface", () => {
     for (const [path, expected] of pages) {
       const response = await user.get(path).expect(200);
       assert.match(response.text, expected, `${path} did not render as expected`);
+      assertPrivateBrowserResponse(response, path);
     }
   });
 
@@ -297,6 +347,7 @@ describe("the HTTP surface", () => {
     for (const path of ["/admin/applications", "/admin/users"]) {
       const allowed = await admin.get(path).expect(200);
       assert.match(allowed.text, /Third Party Web App|admin@example.com/);
+      assertPrivateBrowserResponse(allowed, path);
       // A non-administrator gets a page saying so, not a redirect loop and not
       // a stack trace.
       const refused = await user.get(path).expect(403);
@@ -422,6 +473,7 @@ describe("the HTTP surface", () => {
     assert.match(redirected.headers.location, /^\/oauth2\/consent\?request=/);
 
     const consent = await user.get(redirected.headers.location).expect(200);
+    assertPrivateBrowserResponse(consent, "/oauth2/consent");
     assert.match(consent.text, /Third Party Web App/);
     // The origin the result is going to, which is the answer to "who am I
     // actually giving this to".
@@ -718,7 +770,12 @@ describe("the HTTP surface", () => {
     const own = await withDatabase();
     const quiet = { error() {}, warn() {}, info() {} };
     const isolated = createApp({
-      env: loadEnv({ PUBLIC_BASE_URL: "http://127.0.0.1:3010", OAUTH_ALLOW_GENERATED_KEYS: "true" }),
+      env: loadEnv({
+        PUBLIC_BASE_URL: "http://127.0.0.1:3010",
+        DATABASE_PROVIDER: own.provider,
+        DATABASE_URL: own.url,
+        OAUTH_ALLOW_GENERATED_KEYS: "true"
+      }),
       prisma: own.prisma,
       logger: quiet,
       mailer: {
@@ -757,6 +814,8 @@ describe("the HTTP surface", () => {
     const secureApp = createApp({
       env: loadEnv({
         PUBLIC_BASE_URL: "https://issuer.example",
+        DATABASE_PROVIDER: db.provider,
+        DATABASE_URL: db.url,
         OAUTH_ALLOW_GENERATED_KEYS: "true"
       }),
       prisma: db.prisma,
@@ -832,6 +891,8 @@ describe("the HTTP surface", () => {
     const limited = createApp({
       env: loadEnv({
         PUBLIC_BASE_URL: "http://127.0.0.1:3010",
+        DATABASE_PROVIDER: db.provider,
+        DATABASE_URL: db.url,
         OAUTH_ALLOW_GENERATED_KEYS: "true",
         OAUTH_LOGIN_RATE_LIMIT_PER_MINUTE: "2"
       }),

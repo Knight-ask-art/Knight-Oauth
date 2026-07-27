@@ -484,6 +484,9 @@ function createOAuthController({ config, provider, clients, scopeRegistry, accou
 
   /** Health check. Reports the signing key source, which is what usually breaks. */
   async function health(req, res) {
+    // A cached success can keep a dead instance in rotation, while a cached
+    // failure can hold a recovered one out. Readiness must always be current.
+    noStore(res);
     try {
       // The database, first, and not because it is the more likely failure.
       //
