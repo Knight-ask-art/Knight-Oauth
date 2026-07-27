@@ -79,6 +79,8 @@ describe("the HTTP surface", () => {
 
     config = loadEnv({
       PUBLIC_BASE_URL: "http://127.0.0.1:3010",
+      DATABASE_PROVIDER: db.provider,
+      DATABASE_URL: db.url,
       OAUTH_ALLOW_GENERATED_KEYS: "true",
       // Every request in this suite arrives from one address, so the shipped
       // default of 10 sign-ins a minute throttles the suite itself rather than
@@ -768,7 +770,12 @@ describe("the HTTP surface", () => {
     const own = await withDatabase();
     const quiet = { error() {}, warn() {}, info() {} };
     const isolated = createApp({
-      env: loadEnv({ PUBLIC_BASE_URL: "http://127.0.0.1:3010", OAUTH_ALLOW_GENERATED_KEYS: "true" }),
+      env: loadEnv({
+        PUBLIC_BASE_URL: "http://127.0.0.1:3010",
+        DATABASE_PROVIDER: own.provider,
+        DATABASE_URL: own.url,
+        OAUTH_ALLOW_GENERATED_KEYS: "true"
+      }),
       prisma: own.prisma,
       logger: quiet,
       mailer: {
@@ -807,6 +814,8 @@ describe("the HTTP surface", () => {
     const secureApp = createApp({
       env: loadEnv({
         PUBLIC_BASE_URL: "https://issuer.example",
+        DATABASE_PROVIDER: db.provider,
+        DATABASE_URL: db.url,
         OAUTH_ALLOW_GENERATED_KEYS: "true"
       }),
       prisma: db.prisma,
@@ -882,6 +891,8 @@ describe("the HTTP surface", () => {
     const limited = createApp({
       env: loadEnv({
         PUBLIC_BASE_URL: "http://127.0.0.1:3010",
+        DATABASE_PROVIDER: db.provider,
+        DATABASE_URL: db.url,
         OAUTH_ALLOW_GENERATED_KEYS: "true",
         OAUTH_LOGIN_RATE_LIMIT_PER_MINUTE: "2"
       }),

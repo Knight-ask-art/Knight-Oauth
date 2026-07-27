@@ -65,7 +65,8 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
 
     config = loadEnv({
       PUBLIC_BASE_URL: "http://127.0.0.1:3010",
-      DATABASE_PROVIDER: process.env.DATABASE_PROVIDER || "sqlite",
+      DATABASE_PROVIDER: db.provider,
+      DATABASE_URL: db.url,
       OAUTH_ALLOW_GENERATED_KEYS: "true",
       OAUTH_CLIENT_REQUIRE_APPROVAL: "false",
       OAUTH_DYNAMIC_REGISTRATION_ENABLED: "true",
