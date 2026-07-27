@@ -327,7 +327,12 @@ OAUTH_CUSTOM_SCOPES=[
     "description": "Read your invoices",   // shown on the consent screen
     "claims": ["tenant_id"]                // released from the account's attributes
   },
-  { "name": "billing.admin", "description": "Administer billing", "adminOnly": true }
+  {
+    "name": "billing.admin",
+    "description": "Administer billing",
+    "adminOnly": true,
+    "introspectionClaim": "billing_admin"
+  }
 ]
 ```
 
@@ -335,6 +340,17 @@ Write the description the way the user reads it — *"Read your invoices"*, not
 `billing.read`. A custom scope may not shadow a standard scope and may not
 declare a reserved claim (`sub`, `iss`, `aud`, `exp`, …), so it can never forge
 an identity; the server refuses to start if one tries.
+
+`introspectionClaim` is an issuer-computed boolean on active access-token
+introspection responses. It is true only when that token was granted the owning
+scope and the account still satisfies the scope's live `adminOnly` rule; it is
+false otherwise. It may only be configured on an `adminOnly` scope and is never
+read from account attributes or copied from the JWT. A privileged resource
+server should require both the scope and this live boolean rather than treating
+either one alone as sufficient authority.
+If a restricted scope has no `introspectionClaim`, losing its live eligibility
+keeps the older fail-closed behavior and makes introspection report the token
+inactive; the issuer never leaves a stale privileged scope unqualified.
 
 ---
 
@@ -707,13 +723,26 @@ Prisma 无法从环境变量读取 `datasource provider`，所以由
 ```jsonc
 OAUTH_CUSTOM_SCOPES=[
   { "name": "billing.read", "description": "查看你的账单", "claims": ["tenant_id"] },
-  { "name": "billing.admin", "description": "管理所有账单", "adminOnly": true }
+  {
+    "name": "billing.admin",
+    "description": "管理所有账单",
+    "adminOnly": true,
+    "introspectionClaim": "billing_admin"
+  }
 ]
 ```
 
 `description` 要按用户读到的方式写（「查看你的账单」而不是 `billing.read`）。
 自定义 scope 不能覆盖标准 scope，也不能声明保留 claim（`sub`、`iss`、`aud`、
 `exp` 等），因此它永远无法伪造身份；一旦尝试，服务器拒绝启动。
+
+`introspectionClaim` 是活跃 Access Token 内省响应中的、由 Issuer 实时计算的布尔值。
+只有该 Token 已获得对应 scope，且账户仍满足该 scope 的 `adminOnly` 规则时才为 true，
+其他情况均为 false。它只能配置在 `adminOnly` scope 上，既不读取账户
+attributes，也不从 JWT 复制。受保护的管理接口应同时要求 scope 和这个
+实时布尔值，不能把其中任意一个单独当作最终权限。
+如果受限 scope 没有配置 `introspectionClaim`，失去实时资格时仍按旧逻辑
+fail-closed，内省会把 Token 报告为 inactive，不会留下无实时限制的旧管理 scope。
 
 ## 复用已有站点的登录体系
 

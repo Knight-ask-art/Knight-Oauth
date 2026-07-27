@@ -187,6 +187,37 @@ test("a custom scope may not shadow a standard one or forge a reserved claim", (
   assert.throws(() => loadEnv(custom([{ description: "no name" }])), /requires a name/);
 });
 
+test("a custom scope introspection claim cannot collide or be ambiguous", () => {
+  const custom = (entries) => ({ OAUTH_CUSTOM_SCOPES: JSON.stringify(entries) });
+
+  assert.throws(
+    () => loadEnv(custom([{ name: "billing.admin", adminOnly: true, introspectionClaim: "active" }])),
+    /standard response field/
+  );
+  assert.throws(
+    () => loadEnv(custom([{ name: "billing.admin", adminOnly: true, introspectionClaim: "constructor" }])),
+    /standard response field/
+  );
+  assert.throws(
+    () => loadEnv(custom([{ name: "billing.admin", adminOnly: true, introspectionClaim: "not a claim" }])),
+    /Invalid introspection claim name/
+  );
+  assert.throws(
+    () => loadEnv(custom([{ name: "billing.admin", introspectionClaim: "billing_admin" }])),
+    /requires adminOnly=true/
+  );
+  assert.throws(
+    () =>
+      loadEnv(
+        custom([
+          { name: "billing.admin", adminOnly: true, introspectionClaim: "billing_admin" },
+          { name: "ledger.admin", adminOnly: true, introspectionClaim: "billing_admin" }
+        ])
+      ),
+    /duplicate introspection claim/
+  );
+});
+
 test("TRUST_PROXY resolves to a hop count rather than to blanket trust", () => {
   // `req.ip` is what the rate limiter counts against and what the audit log
   // records a sign-in as coming from. Express reads the left-most
@@ -255,7 +286,12 @@ test("a custom scope reads its claims from the account's attributes", () => {
   const env = loadEnv({
     OAUTH_CUSTOM_SCOPES: JSON.stringify([
       { name: "credits.read", description: "Read your balance", claims: ["knight_uid"] },
-      { name: "credits.admin", claims: [], adminOnly: true }
+      {
+        name: "credits.admin",
+        claims: [],
+        adminOnly: true,
+        introspectionClaim: "credits_admin"
+      }
     ])
   });
 
@@ -268,6 +304,7 @@ test("a custom scope reads its claims from the account's attributes", () => {
   assert.equal(read.allowFor, null);
 
   assert.equal(admin.adminOnly, true);
+  assert.equal(admin.introspectionClaim, "credits_admin");
   assert.equal(admin.allowFor({ role: "ADMIN" }), true);
   assert.equal(admin.allowFor({ role: "USER" }), false);
   // A scope with no claims gets no claim source at all, rather than one that

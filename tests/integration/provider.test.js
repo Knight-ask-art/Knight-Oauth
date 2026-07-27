@@ -82,6 +82,12 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
         {
           name: "credits.admin",
           description: "Administer credits",
+          adminOnly: true,
+          introspectionClaim: "credits_admin"
+        },
+        {
+          name: "legacy.admin",
+          description: "Legacy administration without a live authority claim",
           adminOnly: true
         }
       ])
@@ -1847,7 +1853,7 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     assert.equal(narrowed.scope, "openid offline_access");
   });
 
-  it("fails refresh, UserInfo, and introspection closed after an admin-only scope downgrade", async () => {
+  it("drops live admin authority after downgrade without reviving it through refresh rotation", async () => {
     const user = await prisma.user.create({
       data: {
         id: crypto.randomUUID(),
@@ -1884,17 +1890,50 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
         code_verifier: flow.verifier
       }
     });
+
+    const beforeDowngrade = await provider.introspect({
+      headers,
+      body: { token: tokens.access_token }
+    });
+    assert.equal(beforeDowngrade.active, true);
+    assert.equal(beforeDowngrade.credits_admin, true);
+    assert.equal(beforeDowngrade.iss, config.issuer);
+    assert.equal(beforeDowngrade.sub, user.id);
+    assert.equal(beforeDowngrade.aud, config.issuer);
+    assert.equal(beforeDowngrade.client_id, adminClient.client.clientId);
+    assert.equal(beforeDowngrade.token_use, "access");
+    assert.equal(beforeDowngrade.scope, "openid offline_access credits.admin");
+    assert.ok(beforeDowngrade.sid);
+    assert.ok(beforeDowngrade.jti);
+    assert.ok(Number.isInteger(beforeDowngrade.iat));
+    assert.ok(Number.isInteger(beforeDowngrade.exp));
+
+    const rotated = await provider.token({
+      headers,
+      body: { grant_type: "refresh_token", refresh_token: tokens.refresh_token }
+    });
+    const rotatedBeforeDowngrade = await provider.introspect({
+      headers,
+      body: { token: rotated.access_token }
+    });
+    assert.equal(rotatedBeforeDowngrade.active, true);
+    assert.equal(rotatedBeforeDowngrade.credits_admin, true);
+
     await prisma.user.update({ where: { id: user.id }, data: { role: "USER" } });
 
-    const access = await provider.introspect({ headers, body: { token: tokens.access_token } });
+    const originalAccess = await provider.introspect({ headers, body: { token: tokens.access_token } });
+    const rotatedAccess = await provider.introspect({ headers, body: { token: rotated.access_token } });
     const refresh = await provider.introspect({
       headers,
-      body: { token: tokens.refresh_token, token_type_hint: "refresh_token" }
+      body: { token: rotated.refresh_token, token_type_hint: "refresh_token" }
     });
-    assert.equal(access.active, false);
+    assert.equal(originalAccess.active, true);
+    assert.equal(originalAccess.credits_admin, false);
+    assert.equal(rotatedAccess.active, true);
+    assert.equal(rotatedAccess.credits_admin, false);
     assert.equal(refresh.active, false);
     await assert.rejects(
-      provider.userinfo({ accessToken: tokens.access_token }),
+      provider.userinfo({ accessToken: rotated.access_token }),
       (error) => {
         assert.equal(error.code, "invalid_token");
         return true;
@@ -1903,12 +1942,67 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     await assert.rejects(
       provider.token({
         headers,
-        body: { grant_type: "refresh_token", refresh_token: tokens.refresh_token }
+        body: { grant_type: "refresh_token", refresh_token: rotated.refresh_token }
       }),
       (error) => {
         assert.equal(error.code, "invalid_grant");
         return true;
       }
+    );
+    const afterRejectedRefresh = await provider.introspect({
+      headers,
+      body: { token: rotated.access_token }
+    });
+    assert.equal(afterRejectedRefresh.active, true);
+    assert.equal(afterRejectedRefresh.credits_admin, false);
+  });
+
+  it("keeps a restricted scope fail-closed when no live introspection claim represents it", async () => {
+    const user = await prisma.user.create({
+      data: {
+        id: crypto.randomUUID(),
+        email: `legacy-admin-${crypto.randomUUID()}@example.test`,
+        role: "ADMIN",
+        status: "ACTIVE"
+      }
+    });
+    const authorizationAccount = accounts.toAccount(user);
+    const browserSession = (await sessions.create({ userId: user.id })).session;
+    const legacyClient = await clients.create(
+      {
+        name: "Legacy Restricted Scope",
+        clientType: "confidential",
+        redirectUris: ["https://legacy-admin.example/callback"],
+        scopes: ["openid", "legacy.admin"],
+        grantTypes: ["authorization_code"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        requireConsent: true
+      },
+      { status: "APPROVED" }
+    );
+    const flow = await authorize(
+      { scope: "openid legacy.admin" },
+      { client: legacyClient.client, authorizationAccount, browserSession }
+    );
+    const headers = basicAuth(legacyClient.client.clientId, legacyClient.clientSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+    assert.equal(
+      (await provider.introspect({ headers, body: { token: tokens.access_token } })).active,
+      true
+    );
+
+    await prisma.user.update({ where: { id: user.id }, data: { role: "USER" } });
+    assert.deepEqual(
+      await provider.introspect({ headers, body: { token: tokens.access_token } }),
+      { active: false }
     );
   });
 
@@ -2563,7 +2657,39 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     assert.equal(introspected.client_id, confidential.clientId);
     assert.equal(introspected.scope, "openid profile");
     assert.equal(introspected.token_type, "Bearer");
+    assert.equal(account.role, "ADMIN");
+    assert.equal(introspected.credits_admin, false, "an admin without the scope gained live authority");
     assert.ok(Number.isInteger(introspected.exp));
+  });
+
+  it("reports live admin authority false for an ordinary user", async () => {
+    const registered = await accounts.register({
+      email: `ordinary-${crypto.randomUUID()}@example.test`,
+      password: "ordinary-user-password"
+    });
+    assert.equal(registered.account.role, "USER");
+    const browserSession = (await sessions.create({ userId: registered.account.id })).session;
+    const flow = await authorize(
+      { scope: "openid" },
+      { authorizationAccount: registered.account, browserSession }
+    );
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+
+    const introspected = await provider.introspect({
+      headers,
+      body: { token: tokens.access_token }
+    });
+    assert.equal(introspected.active, true);
+    assert.equal(introspected.credits_admin, false);
   });
 
   it("tells another client nothing about a token that is not theirs", async () => {

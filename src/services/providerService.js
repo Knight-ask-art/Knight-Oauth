@@ -242,11 +242,17 @@ function createProviderService({
     }
   }
 
-  function scopesRemainAllowed(account, client, grant, scopes) {
+  function grantRemainsActive(account, client, grant, scopes) {
     if (!account || account.status === accounts.STATUS.DISABLED) return false;
     if (!client || client.status !== clients.STATUS.APPROVED) return false;
+    if (!scopes.every((scope) => scopeRegistry.has(scope))) return false;
     if (!scopeRegistry.covers(client.allowedScopes, scopes)) return false;
     if (!grant || grant.revokedAt || !scopeRegistry.covers(decodeScopes(grant.scopes), scopes)) return false;
+    return true;
+  }
+
+  function scopesRemainAllowed(account, client, grant, scopes) {
+    if (!grantRemainsActive(account, client, grant, scopes)) return false;
     try {
       scopeRegistry.assertAllowedForUser(account, scopes);
       return true;
@@ -1615,7 +1621,14 @@ function createProviderService({
           where: { userId_clientId: { userId: claims.sub, clientId: currentClient.clientId } }
         })
       : null;
-    if (!scopesRemainAllowed(account, currentClient, grant, scopes)) return { active: false };
+    // Keep token activity separate from live deployment authority. Losing an
+    // admin-only role does not silently revoke unrelated scopes on the same
+    // token; the issuer instead returns an issuer-computed boolean below. A
+    // revoked grant, disabled account/client, removed scope, or ended session
+    // still makes the token inactive.
+    if (!grantRemainsActive(account, currentClient, grant, scopes)) return { active: false };
+    const authority = scopeRegistry.introspectionAuthorityFor({ user: account, scopes });
+    if (!authority.canRemainActive) return { active: false };
 
     const session = claims.sid ? await prisma.oidcSession.findUnique({ where: { id: claims.sid } }) : null;
     if (
@@ -1641,7 +1654,8 @@ function createProviderService({
       iss: issuer,
       jti: claims.jti,
       sid: claims.sid,
-      token_use: "access"
+      token_use: "access",
+      ...authority.claims
     };
   }
 

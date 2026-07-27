@@ -3,7 +3,12 @@
 const path = require("node:path");
 
 const { SUPPORTED_ALGORITHMS, DEFAULT_ALGORITHM } = require("../lib/jwt");
-const { ACCOUNT_CLAIMS, RESERVED_CLAIMS, STANDARD_SCOPES } = require("../lib/scopes");
+const {
+  ACCOUNT_CLAIMS,
+  RESERVED_CLAIMS,
+  STANDARD_SCOPES,
+  assertIntrospectionClaimName
+} = require("../lib/scopes");
 const { normalizeIssuer, parseHttpsUrl } = require("../lib/uri");
 const { ROOT: PROJECT_ROOT } = require("./dotenv");
 
@@ -91,7 +96,8 @@ function parseTrustProxy(value) {
  *       "name": "credits.read",
  *       "description": "Read your credit balance",
  *       "claims": ["knight_uid"],
- *       "adminOnly": false
+ *       "adminOnly": false,
+ *       "introspectionClaim": null
  *     }
  *   ]
  *
@@ -119,11 +125,18 @@ function parseCustomScopes(value) {
     if (!name) throw new Error("Each OAUTH_CUSTOM_SCOPES entry requires a name");
     const claims = Array.isArray(entry.claims) ? entry.claims.map((claim) => text(claim)).filter(Boolean) : [];
     const adminOnly = bool(entry.adminOnly, false);
+    const introspectionClaim = text(entry.introspectionClaim) || null;
+    if (introspectionClaim && !adminOnly) {
+      throw new Error(
+        `OAUTH_CUSTOM_SCOPES entry "${name}" requires adminOnly=true when introspectionClaim is configured`
+      );
+    }
     return {
       name,
       description: text(entry.description) || name,
       claims,
       adminOnly,
+      introspectionClaim,
       allowFor: adminOnly ? (user) => user?.role === "ADMIN" : null,
       // Claims are read from the account's `attributes` map, so a deployment
       // populates them through its identity adapter rather than through code.
@@ -502,6 +515,12 @@ function loadEnv(source = process.env) {
   if (new Set(scopeNames).size !== scopeNames.length) {
     throw new Error("OAUTH_CUSTOM_SCOPES contains a duplicate scope name");
   }
+  const introspectionClaims = env.customScopes
+    .map((scope) => scope.introspectionClaim)
+    .filter(Boolean);
+  if (new Set(introspectionClaims).size !== introspectionClaims.length) {
+    throw new Error("OAUTH_CUSTOM_SCOPES contains a duplicate introspection claim");
+  }
 
   // The scope registry rejects these too, but it is built after the first
   // request rather than at boot. Failing here means a deployment that would
@@ -511,6 +530,9 @@ function loadEnv(source = process.env) {
       throw new Error(
         `OAUTH_CUSTOM_SCOPES entry "${scope.name}" collides with a standard OIDC scope`
       );
+    }
+    if (scope.introspectionClaim) {
+      assertIntrospectionClaimName(scope.introspectionClaim);
     }
     for (const claim of scope.claims) {
       if (RESERVED_CLAIMS.has(claim)) {
