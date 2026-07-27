@@ -562,6 +562,11 @@ jobs:
       # A throwaway credential for a database that exists for the length of this
       # job and is never reachable from outside the runner.
       POSTGRES_PASSWORD: ci-only-not-a-real-credential
+      # This job deliberately exercises the database-backed signing-key path and
+      # verifies that the key survives replacing only the application container.
+      # Production defaults fail closed and require an externally managed key;
+      # the opt-in here is scoped to this disposable CI database.
+      OAUTH_ALLOW_GENERATED_KEYS: "true"
       COMPOSE_FILE: compose.postgres.yml
 
     steps:

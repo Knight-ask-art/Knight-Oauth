@@ -3,6 +3,12 @@
 const { createKeyRing, generateKey, normalizeKey, DEFAULT_ALGORITHM, SUPPORTED_ALGORITHMS } = require("../lib/jwt");
 const { randomId } = require("../lib/crypto");
 
+// A deterministic primary key turns first-boot key creation into a database
+// singleton. `kid` cannot do that because each process generates a different
+// key before it writes. This id is only used for the initial generated key;
+// rotated keys keep random ids.
+const BOOTSTRAP_KEY_ID = "oauth-signing-key-bootstrap";
+
 // Where signing keys come from, in precedence order:
 //
 //   1. OAUTH_SIGNING_KEYS_JSON — an explicit key set in the environment. A
@@ -64,25 +70,43 @@ function createKeyService({ prisma, config, now = () => new Date() } = {}) {
   /** Keys still needed for verification: the active one plus any not yet expired. */
   async function loadStoredKeys() {
     if (!prisma?.signingKey?.findMany) return [];
-    const records = await prisma.signingKey.findMany({ orderBy: { createdAt: "desc" } });
+    const records = await prisma.signingKey.findMany({
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }]
+    });
     const current = now();
     return records.filter((record) => record.isActive || !record.expiresAt || record.expiresAt > current);
   }
 
-  async function persistGeneratedKey() {
+  function generatedKeyData(id = randomId()) {
     const key = generateKey({ alg: algorithm });
     const privateJwk = key.privateKey.export({ format: "jwk" });
-    await prisma.signingKey.create({
-      data: {
-        id: randomId(),
-        kid: key.kid,
-        alg: key.alg,
-        privateJwkJson: JSON.stringify(privateJwk),
-        publicJwkJson: JSON.stringify(key.publicJwk),
-        isActive: true
-      }
+    return {
+      id,
+      kid: key.kid,
+      alg: key.alg,
+      privateJwkJson: JSON.stringify(privateJwk),
+      publicJwkJson: JSON.stringify(key.publicJwk),
+      isActive: true
+    };
+  }
+
+  async function persistGeneratedKey() {
+    const record = await prisma.signingKey.create({ data: generatedKeyData() });
+    return toKeyEntry(record);
+  }
+
+  async function persistBootstrapKey() {
+    if (!prisma?.signingKey?.upsert) {
+      throw new Error("Generated signing keys require a database-backed key store with upsert support");
+    }
+    const record = await prisma.signingKey.upsert({
+      where: { id: BOOTSTRAP_KEY_ID },
+      // A non-empty no-op update keeps this eligible for Prisma's native
+      // INSERT ... ON CONFLICT path on both SQLite and PostgreSQL.
+      update: { id: BOOTSTRAP_KEY_ID },
+      create: generatedKeyData(BOOTSTRAP_KEY_ID)
     });
-    return { kid: key.kid, alg: key.alg, privateJwk };
+    return toKeyEntry(record);
   }
 
   /**
@@ -123,10 +147,10 @@ function createKeyService({ prisma, config, now = () => new Date() } = {}) {
       return keyRing;
     }
 
-    // Two replicas booting into an empty table can both generate. The unique
-    // constraint on `kid` will not catch it, since the kids differ, so re-read
-    // and let whichever row is active win rather than trusting the local write.
-    const generated = await persistGeneratedKey();
+    // Two replicas can both observe an empty table. The fixed bootstrap id and
+    // atomic upsert make the database choose one row; every caller uses the row
+    // returned by that upsert rather than its locally generated candidate.
+    const generated = await persistBootstrapKey();
     const settled = await loadStoredKeys();
     const keys = settled.length ? settled.map(toKeyEntry) : [generated];
     const active = settled.find((record) => record.isActive);

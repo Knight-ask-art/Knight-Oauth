@@ -34,7 +34,9 @@ ready for a client.
 - [Configuration](#configuration)
 - [Custom scopes and claims](#custom-scopes-and-claims)
 - [External identity providers](#external-identity-providers)
+- [Knight handoff contract](docs/KNIGHT_HANDOFF_CONTRACT.md)
 - [Production notes](#production-notes)
+- [Production runbook](docs/PRODUCTION_RUNBOOK.md)
 - [Docker](#docker)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -47,7 +49,7 @@ ready for a client.
 
 | Specification | Status |
 | --- | --- |
-| OAuth 2.0 Authorization Framework (RFC 6749) | Authorization code grant, refresh token grant, client credentials |
+| OAuth 2.0 Authorization Framework (RFC 6749) | Authorization code grant and refresh token grant |
 | PKCE (RFC 7636) | **S256 only.** Mandatory for public clients, on by default for confidential ones |
 | OpenID Connect Core 1.0 | ID tokens, UserInfo, `nonce`, `auth_time`, `max_age`, `prompt`, `login_hint`, `sid` |
 | OpenID Connect Discovery 1.0 | `/.well-known/openid-configuration` |
@@ -114,7 +116,7 @@ unconfigured client library work. `HS256` and `none` are rejected.
 | `/oauth2/revoke` | Token revocation |
 | `/oauth2/register` | Dynamic registration, and `/{client_id}` for management |
 | `/oauth2/logout` | RP-initiated logout |
-| `/healthz` | Liveness |
+| `/healthz` | Readiness |
 
 ---
 
@@ -362,19 +364,56 @@ would mean trusting whatever identity an anonymous caller claimed.
 Local accounts and external providers coexist — configuring one does not turn
 off the other.
 
+For the exact independent integration contract used by `knight-app`, including
+the redirect parameters, signed-ticket claims, failure rules, and acceptance
+matrix, see [Knight handoff contract](docs/KNIGHT_HANDOFF_CONTRACT.md).
+
 ---
 
 ## Production notes
 
+For the ordered single-instance release, Cloudflare, readiness, rollback, and
+sanitized-evidence procedure, follow the [production runbook](docs/PRODUCTION_RUNBOOK.md).
+
+The recommended initial Knight production topology is **one application
+instance with SQLite on one local persistent Docker volume**. It keeps the
+service to one Node process with no database sidecar, Redis, queue, or worker.
+That recommendation has hard limits:
+
+- Run exactly one application instance. Do not horizontally scale SQLite.
+- Keep the SQLite volume on local storage so SQLite file locking remains valid;
+  do not place it on a shared or network filesystem.
+- This topology provides no application high availability and no shared-write
+  capability. A host outage is a service outage.
+- Take protected, consistent backups and prove an isolated restore before each
+  release that changes data or schema.
+- Inject an operator-owned signing key and apply every production override in
+  the runbook; the zero-config Compose defaults are for loopback evaluation.
+
+PostgreSQL is the scale and operational-resilience alternative, not the
+lightweight default. It adds a database service, separate migration ownership,
+database-native backup and rollback work, and a larger resource budget.
+
 - **Use HTTPS.** The server refuses a plaintext issuer in production unless you
   explicitly set `OAUTH_ALLOW_INSECURE_HTTP=true`, which you should not.
-- **Hold your own signing key** if you run more than one replica. Generate it
-  with `npm run keys:generate`, put it in `OAUTH_SIGNING_KEYS_JSON`, and set
-  `OAUTH_ALLOW_GENERATED_KEYS=false`. Otherwise each replica generates its own
-  and tokens signed by one are rejected by the next.
+- **Bootstrap the administrator before opening public traffic.** A fresh
+  database with both `OAUTH_REGISTRATION_ENABLED=true` and
+  `OAUTH_FIRST_USER_IS_ADMIN=true` gives the first registrant administrator
+  access. Keep the edge restricted to the operator until the intended account
+  is verified, then turn first-user promotion off and decide whether public
+  registration should remain enabled.
+- **Hold your own signing key in production.** Generate it with
+  `npm run keys:generate`, inject it as `OAUTH_SIGNING_KEYS_JSON`, and leave
+  `OAUTH_ALLOW_GENERATED_KEYS=false`. Database-generated keys converge safely
+  during concurrent first boot, but they keep private key material in the
+  application database and cannot be rotated independently of it.
 - **`TRUST_PROXY=true` only behind a proxy you control.** It makes the app trust
   `X-Forwarded-*`, and a directly exposed process would let a caller spoof its
   own address past the rate limiter and into the audit log.
+- **Do not log URL query strings at the edge or origin proxy.** Authorization
+  requests and external-login callbacks carry short-lived security values in
+  the query. Record the path and safe correlation metadata only, and configure
+  Cloudflare Logpush or equivalent exports the same way.
 - **Upgrading to a release that adds the `__Host-` cookie prefix signs everyone
   out once.** On an https issuer the session and CSRF cookies are named
   `__Host-koauth_session` and `__Host-koauth_csrf`, which browsers only accept
@@ -385,8 +424,6 @@ off the other.
   price of closing that.
 - **Never change `OAUTH_ISSUER` on a live deployment.** Clients compare `iss`
   byte for byte; changing it invalidates every token already issued.
-- **Back up the database.** It holds the accounts, the grants, and — unless you
-  supplied one — the signing key.
 - **Access tokens are self-contained JWTs and cannot be withdrawn early.**
   Revoking one, or a refresh-token replay that revokes its whole family, ends the
   grant — but an access token already issued stays verifiable until it expires,
@@ -425,10 +462,15 @@ set `PUBLIC_BASE_URL` to the `https` address, supply a key through
 `OAUTH_SIGNING_KEYS_JSON` from a secret manager, and set both back to `false`.
 
 For PostgreSQL, use `compose.postgres.yml`. Set `POSTGRES_PASSWORD` in `.env` and
-run the migration once by hand before starting the service:
+inject `OAUTH_SIGNING_KEYS_JSON` from a secret manager, then run the migration
+once by hand before starting the service. This compose file leaves
+`OAUTH_ALLOW_GENERATED_KEYS=false` by default and fails closed when signing
+material is absent:
 
 ```bash
-echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> .env
+umask 077
+touch .env && chmod 600 .env
+printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 24)" >> .env
 docker compose -f compose.postgres.yml build
 docker compose -f compose.postgres.yml run --rm knight-oauth \
     node scripts/prisma.js migrate deploy
@@ -549,7 +591,7 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 Report a vulnerability privately through GitHub's security advisories rather than
 a public issue. See [SECURITY.md](SECURITY.md).
 
-If you deploy this: HTTPS, your own signing key for multi-replica deployments,
+If you deploy this: HTTPS, your own signing key,
 and `OAUTH_DYNAMIC_REGISTRATION_ENABLED` left off unless you need it and have set
 an initial access token.
 
@@ -586,7 +628,7 @@ npm start
 
 | 规范 | 说明 |
 | --- | --- |
-| OAuth 2.0（RFC 6749） | 授权码模式、刷新令牌、客户端凭据 |
+| OAuth 2.0（RFC 6749） | 授权码模式、刷新令牌 |
 | PKCE（RFC 7636） | **仅支持 S256**。公开客户端强制要求，机密客户端默认开启 |
 | OpenID Connect Core 1.0 | ID Token、UserInfo、`nonce`、`auth_time`、`max_age`、`prompt`、`sid` |
 | OIDC Discovery 1.0 | `/.well-known/openid-configuration` |
@@ -681,19 +723,43 @@ OAUTH_CUSTOM_SCOPES=[
 
 本地账号和外部身份源可以共存，配置其中一个不会关闭另一个。
 
+`knight-app` 的独立接入协议（重定向参数、签名票据 claim、失败处理与验收矩阵）见
+[Knight handoff contract](docs/KNIGHT_HANDOFF_CONTRACT.md)。
+
 ## 生产部署要点
+
+Knight 初期生产推荐使用**单个应用实例 + 本地持久化 Docker 卷中的 SQLite**。这是资源
+占用最低的受支持拓扑：只有一个 Node 进程，不需要数据库 sidecar、Redis、队列或 worker。
+它有以下硬限制：
+
+- 只能运行 1 个应用实例，不得横向扩展 SQLite。
+- SQLite 卷必须位于本地存储，以保证文件锁语义；不得放到共享或网络文件系统。
+- 不提供应用高可用和共享写入能力，宿主机故障即服务中断。
+- 每次涉及数据或 schema 的发布前，都要制作受保护的一致性备份，并完成隔离恢复演练。
+- 必须从受控密钥源注入签名密钥，并应用 Runbook 中的全部生产覆盖项；零配置 Compose
+  默认值只适合回环地址上的功能验证。
+
+PostgreSQL 是面向扩展和运维韧性的替代方案，不是轻量默认方案。它会增加数据库进程、
+独立迁移责任、数据库级备份／回滚工作以及 CPU、内存和磁盘预算。
 
 - **用 HTTPS。** 生产环境下明文 issuer 会被拒绝，除非显式设置
   `OAUTH_ALLOW_INSECURE_HTTP=true`——不要这么做。
-- **多副本部署必须自己持有签名密钥。** 用 `npm run keys:generate` 生成，放进
-  `OAUTH_SIGNING_KEYS_JSON`，并设置 `OAUTH_ALLOW_GENERATED_KEYS=false`。否则每
-  个副本各自生成一份密钥，一个副本签发的令牌会被另一个拒绝。
+- **开放公网流量前先完成管理员初始化。** 新数据库同时使用
+  `OAUTH_REGISTRATION_ENABLED=true` 和 `OAUTH_FIRST_USER_IS_ADMIN=true` 时，首个
+  注册者会获得管理员权限。边缘层必须只允许受控运维人员访问，确认预期管理员后关闭
+  首用户提权，并明确决定是否继续开放公共注册。
+- **生产部署必须自己持有签名密钥。** 用 `npm run keys:generate` 生成，通过
+  `OAUTH_SIGNING_KEYS_JSON` 注入，并保持 `OAUTH_ALLOW_GENERATED_KEYS=false`。
+  数据库自动生成模式在并发首启时会安全收敛到同一行，但私钥会留在应用数据库里，
+  也无法独立于数据库轮换。
 - **只有在你自己掌控的反向代理后面才开 `TRUST_PROXY=true`。** 它会让应用信任
   `X-Forwarded-*`；直接暴露的进程开了它，调用方就能伪造自己的来源 IP，绕过限流
   并污染审计日志。
+- **边缘层和源站反向代理不得记录 URL 查询字符串。** 授权请求和外部登录回调会在
+  query 中携带短时效安全值。日志只能记录路径和安全关联元数据，Cloudflare Logpush
+  等导出也必须遵守相同规则。
 - **不要修改已上线部署的 `OAUTH_ISSUER`。** 客户端会逐字节比对 `iss`，改了会让
   所有已签发的令牌失效。
-- **备份数据库。** 里面有账号、授权记录，以及（如果你没自己提供）签名密钥。
 - **访问令牌是自包含 JWT，无法提前撤销。** 撤销令牌、或刷新令牌被重放导致整个
   family 被吊销，都会终止这次授权；但已经签发出去的访问令牌在过期前仍然可以验签
   通过，内省也会继续返回 `active: true`。真正限制这个窗口的是
@@ -725,10 +791,14 @@ root 运行，所以 bind mount 的目录必须先存在、并且属主为 uid 1
 `OAUTH_SIGNING_KEYS_JSON` 从密钥管理服务注入密钥，然后把这两项改回 `false`。
 
 切换到 PostgreSQL 时请改用 `compose.postgres.yml`。在 `.env` 中设置
-`POSTGRES_PASSWORD`，并在启动服务前手动执行一次迁移：
+`POSTGRES_PASSWORD`，从密钥管理服务注入 `OAUTH_SIGNING_KEYS_JSON`，并在启动服务前
+手动执行一次迁移。该 compose 默认保持 `OAUTH_ALLOW_GENERATED_KEYS=false`，缺少签名
+材料时会直接启动失败：
 
 ```bash
-echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> .env
+umask 077
+touch .env && chmod 600 .env
+printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 24)" >> .env
 docker compose -f compose.postgres.yml build
 docker compose -f compose.postgres.yml run --rm knight-oauth \
     node scripts/prisma.js migrate deploy

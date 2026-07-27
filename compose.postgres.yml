@@ -1,6 +1,8 @@
 # Knight OAuth on PostgreSQL.
 #
-#   echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> .env
+#   umask 077
+#   touch .env && chmod 600 .env
+#   printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 24)" >> .env
 #   docker compose -f compose.postgres.yml build
 #   docker compose -f compose.postgres.yml run --rm knight-oauth \
 #       node scripts/prisma.js migrate deploy
@@ -18,17 +20,14 @@ services:
   knight-oauth:
     build:
       context: .
-      # Read from the environment rather than pinned, and defaulted to the
-      # provider this file exists for.
-      #
       # Prisma cannot take `datasource provider` from an environment variable, so
       # the client is generated for one provider at build time and the choice is
-      # baked into the image. Pinning this to a literal is how an image ends up
-      # holding the SQLite client while DATABASE_URL below points at PostgreSQL:
-      # the service starts, answers discovery, and fails every request that
-      # touches a table.
+      # baked into the image. This file is PostgreSQL-only, so the build argument
+      # is intentionally literal: a generic `.env` commonly contains
+      # DATABASE_PROVIDER=sqlite, and allowing that value to override the build
+      # would create a SQLite client while the runtime below uses PostgreSQL.
       args:
-        DATABASE_PROVIDER: ${DATABASE_PROVIDER:-postgresql}
+        DATABASE_PROVIDER: postgresql
     # A distinct tag, so building this file cannot silently replace the image
     # built from compose.yml, or be replaced by it.
     image: knight-oauth:postgres
@@ -51,23 +50,14 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:3010}
       NODE_ENV: ${NODE_ENV:-production}
 
-      # The two settings below are what make this file work out of the box, and
-      # both are safety defaults that NODE_ENV=production deliberately turns off.
-      # They are set here, explicitly and overridably, rather than by weakening
-      # the defaults themselves.
-      #
-      # Change both when putting this on a real domain: serve HTTPS and set
-      # PUBLIC_BASE_URL to the https address, then supply a key through
-      # OAUTH_SIGNING_KEYS_JSON from a secret manager and set these to false.
-      #
       # http is only tolerable because the port below is bound to loopback. On a
       # reachable address it exposes every token in transit.
       OAUTH_ALLOW_INSECURE_HTTP: ${OAUTH_ALLOW_INSECURE_HTTP:-true}
-      # The generated key is stored in PostgreSQL, so it already survives the
-      # container being replaced. With more than one replica, or when the key
-      # should be rotatable independently of the data, configure
-      # OAUTH_SIGNING_KEYS_JSON instead.
-      OAUTH_ALLOW_GENERATED_KEYS: ${OAUTH_ALLOW_GENERATED_KEYS:-true}
+      # PostgreSQL is the production-oriented stack, so missing externally
+      # managed signing material must stop startup. Inject
+      # OAUTH_SIGNING_KEYS_JSON through the env file or a secret manager. Set
+      # this true only for an intentional database-backed single-node install.
+      OAUTH_ALLOW_GENERATED_KEYS: ${OAUTH_ALLOW_GENERATED_KEYS:-false}
       # Behind a reverse proxy that terminates TLS, set TRUST_PROXY=true and
       # PUBLIC_BASE_URL to the https address. Leave it false when the port below
       # is exposed directly: with no proxy in front, a client can spoof its own
@@ -87,8 +77,10 @@ services:
       # only once that is true.
       - "127.0.0.1:3010:3010"
 
-    # No volume. On PostgreSQL the container writes nothing to disk — the
-    # database, and the signing key inside it, live in the postgres service.
+    # No volume. On PostgreSQL the container writes nothing to disk. Application
+    # data lives in the postgres service; signing material remains in the
+    # operator's secret source unless generated-key storage is explicitly
+    # enabled for a single-node deployment or disposable CI job.
 
     read_only: true
     tmpfs:
@@ -139,7 +131,7 @@ services:
       retries: 5
 
 volumes:
-  # The accounts, the issued grants, and the signing key. `docker compose -f
-  # compose.postgres.yml down` keeps it; adding -v deletes it, and every token
-  # already issued becomes unverifiable.
+  # The accounts and issued grants. A database-backed signing key is present only
+  # when OAUTH_ALLOW_GENERATED_KEYS=true. `docker compose -f
+  # compose.postgres.yml down` keeps the volume; adding -v deletes its data.
   postgres-data:

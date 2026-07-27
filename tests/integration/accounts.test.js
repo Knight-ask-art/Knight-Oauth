@@ -6,6 +6,7 @@ const { after, before, describe, it } = require("node:test");
 
 const { withDatabase } = require("../helpers/database");
 const { loadEnv } = require("../../src/config/env");
+const { hashToken, verifyPassword } = require("../../src/lib/crypto");
 const { createAccountService } = require("../../src/services/accountService");
 const { createAuditService } = require("../../src/services/auditService");
 const { createSessionService } = require("../../src/services/sessionService");
@@ -32,6 +33,210 @@ function ticketPayload(overrides = {}) {
     jti: crypto.randomUUID(),
     state: "handoff-state-value",
     ...overrides
+  };
+}
+
+/**
+ * Wraps Prisma so one selected write fails inside an interactive transaction.
+ * The real database still performs every earlier write, which makes rollback
+ * behavior observable instead of replacing it with a hand-written database
+ * double.
+ */
+function failOnceInTransaction(prisma, { model, method }) {
+  let failed = false;
+
+  function wrap(client) {
+    return new Proxy(client, {
+      get(target, property) {
+        if (property === "$transaction") {
+          return (operation, options) => {
+            if (typeof operation !== "function") {
+              return target.$transaction(operation, options);
+            }
+            return target.$transaction((transaction) => operation(wrap(transaction)), options);
+          };
+        }
+
+        const value = target[property];
+        if (property !== model || !value) {
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+
+        return new Proxy(value, {
+          get(delegate, delegateMethod) {
+            const delegateValue = delegate[delegateMethod];
+            if (delegateMethod !== method || typeof delegateValue !== "function") {
+              return typeof delegateValue === "function" ? delegateValue.bind(delegate) : delegateValue;
+            }
+            return async (...args) => {
+              if (!failed) {
+                failed = true;
+                throw new Error("injected transaction failure");
+              }
+              return delegateValue.apply(delegate, args);
+            };
+          }
+        });
+      }
+    });
+  }
+
+  return { prisma: wrap(prisma), didFail: () => failed };
+}
+
+/** Records database writes made through an interactive transaction. */
+function observeTransactionWrites(prisma) {
+  const writes = [];
+  const writeMethods = new Set(["create", "createMany", "update", "updateMany", "delete", "deleteMany"]);
+
+  function wrapTransaction(client) {
+    return new Proxy(client, {
+      get(target, model) {
+        const delegate = target[model];
+        if (!delegate || typeof delegate !== "object") {
+          return typeof delegate === "function" ? delegate.bind(target) : delegate;
+        }
+        return new Proxy(delegate, {
+          get(modelDelegate, method) {
+            const operation = modelDelegate[method];
+            if (typeof operation !== "function") return operation;
+            return async (...args) => {
+              if (writeMethods.has(method)) writes.push(`${String(model)}.${String(method)}`);
+              return operation.apply(modelDelegate, args);
+            };
+          }
+        });
+      }
+    });
+  }
+
+  const observed = new Proxy(prisma, {
+    get(target, property) {
+      if (property === "$transaction") {
+        return (operation, options) => {
+          if (typeof operation !== "function") return target.$transaction(operation, options);
+          return target.$transaction((transaction) => operation(wrapTransaction(transaction)), options);
+        };
+      }
+      const value = target[property];
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+  return { prisma: observed, writes };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+/** Pauses the first selected read after the database returned its snapshot. */
+function pauseOnceAfterRead(prisma, { model, method }) {
+  const reached = deferred();
+  const resume = deferred();
+  let paused = false;
+  const delegate = prisma[model];
+  const wrappedDelegate = new Proxy(delegate, {
+    get(target, property) {
+      const value = target[property];
+      if (property !== method || typeof value !== "function") {
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return async (...args) => {
+        const result = await value.apply(target, args);
+        if (!paused) {
+          paused = true;
+          reached.resolve();
+          await resume.promise;
+        }
+        return result;
+      };
+    }
+  });
+  const wrappedPrisma = new Proxy(prisma, {
+    get(target, property) {
+      if (property === model) return wrappedDelegate;
+      const value = target[property];
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+  return { prisma: wrappedPrisma, reached: reached.promise, resume: resume.resolve };
+}
+
+/** Makes every participant receive its database snapshot before any proceeds. */
+function synchronizeReads(prisma, { model, method, participants }) {
+  const release = deferred();
+  let arrived = 0;
+  const delegate = prisma[model];
+  const wrappedDelegate = new Proxy(delegate, {
+    get(target, property) {
+      const value = target[property];
+      if (property !== method || typeof value !== "function") {
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return async (...args) => {
+        const result = await value.apply(target, args);
+        arrived += 1;
+        if (arrived === participants) release.resolve();
+        await release.promise;
+        return result;
+      };
+    }
+  });
+  return new Proxy(prisma, {
+    get(target, property) {
+      if (property === model) return wrappedDelegate;
+      const value = target[property];
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+}
+
+async function seedRevocableCredentials({ prisma, sessions, userId }) {
+  const { sid, session } = await sessions.create({ userId });
+  const suffix = crypto.randomUUID();
+  const clientId = `transaction-client-${suffix}`;
+  await prisma.oAuthClient.create({
+    data: {
+      id: crypto.randomUUID(),
+      clientId,
+      name: "Transaction regression client",
+      redirectUris: "https://client.test/callback",
+      allowedScopes: "openid",
+      status: "APPROVED"
+    }
+  });
+  const refreshToken = await prisma.refreshToken.create({
+    data: {
+      id: crypto.randomUUID(),
+      tokenHash: crypto.createHash("sha256").update(crypto.randomUUID()).digest("hex"),
+      familyId: crypto.randomUUID(),
+      clientId,
+      userId,
+      sessionId: session.id,
+      scopes: "openid",
+      authTime: new Date(),
+      expiresAt: new Date(Date.now() + 60_000)
+    }
+  });
+  const oidcSession = await prisma.oidcSession.create({
+    data: {
+      id: crypto.randomUUID(),
+      sessionId: session.id,
+      clientId,
+      userId,
+      authTime: session.authTime,
+      lastSeenAt: new Date()
+    }
+  });
+  return {
+    sid,
+    sessionId: session.id,
+    refreshTokenId: refreshToken.id,
+    oidcSessionId: oidcSession.id
   };
 }
 
@@ -155,6 +360,70 @@ describe("local accounts and external identity", () => {
     assert.equal(unknown.account, null);
   });
 
+  it("reports scrypt saturation identically and rebuilds a failed dummy hash", async () => {
+    await accounts.register({
+      email: "saturation-known@example.com",
+      password: "saturation-known-password",
+      username: "saturation-known"
+    });
+
+    const original = crypto.scrypt;
+    let firstCallback = null;
+    let calls = 0;
+
+    crypto.scrypt = (password, salt, keylen, options, callback) => {
+      calls += 1;
+      if (calls === 1) {
+        firstCallback = callback;
+        return;
+      }
+      setImmediate(() => callback(null, Buffer.alloc(keylen, 7)));
+    };
+
+    try {
+      const salt = Buffer.from("bounded-scrypt-salt").toString("base64url");
+      const expected = Buffer.alloc(16, 7).toString("base64url");
+      const stored = `scrypt$16384$8$1$${salt}$${expected}`;
+      const accepted = Array.from({ length: 65 }, () => verifyPassword("password", stored));
+
+      // A fresh service has not built its dummy hash yet. Both a real account
+      // and an unknown one arrive while the shared KDF queue is full and must
+      // surface the same temporary failure.
+      const isolated = createAccountService({
+        prisma,
+        config,
+        mailer: null,
+        auditLog: { record: async () => {} }
+      });
+      const knownBusy = assert.rejects(
+        isolated.authenticate({ identifier: "saturation-known", password: "not-the-password" }),
+        (error) => error?.statusCode === 503
+      );
+      const unknownBusy = assert.rejects(
+        isolated.authenticate({ identifier: "nobody@example.com", password: "not-the-password" }),
+        (error) => error?.statusCode === 503
+      );
+      await Promise.all([knownBusy, unknownBusy]);
+
+      while (!firstCallback) await new Promise((resolve) => setImmediate(resolve));
+      firstCallback(null, Buffer.alloc(16, 7));
+      await Promise.all(accepted);
+
+      // The failed dummy-hash promise must have been discarded. Otherwise this
+      // would either stay rejected forever or skip the KDF and return
+      // immediately, restoring an account-enumeration timing difference.
+      const recovered = await isolated.authenticate({
+        identifier: "nobody@example.com",
+        password: "not-the-password"
+      });
+      assert.equal(recovered.ok, false);
+      assert.equal(recovered.reason, "unknown_identifier");
+      assert.ok(calls >= 3, "the unknown-account path did not rebuild and verify its dummy hash");
+    } finally {
+      crypto.scrypt = original;
+    }
+  });
+
   it("resets a password and invalidates the link afterwards", async () => {
     sentMail.length = 0;
     const requested = await accounts.requestPasswordReset({ email: "second@example.com" });
@@ -199,6 +468,248 @@ describe("local accounts and external identity", () => {
     assert.equal(await sessions.find(sid), null);
   });
 
+  it("rolls back a password reset when credential revocation fails", async () => {
+    sentMail.length = 0;
+    const { account } = await accounts.register({
+      email: "reset-transaction@example.com",
+      password: "original-reset-password"
+    });
+    await accounts.requestPasswordReset({ email: account.email });
+    const resetMail = sentMail.find((entry) => entry.kind === "reset");
+    assert.ok(resetMail?.token);
+
+    const credentials = await seedRevocableCredentials({ prisma, sessions, userId: account.id });
+    const fault = failOnceInTransaction(prisma, { model: "session", method: "deleteMany" });
+    const failingAccounts = createAccountService({ prisma: fault.prisma, config });
+
+    await assert.rejects(
+      failingAccounts.resetPassword({ token: resetMail.token, password: "replacement-reset-password" }),
+      /injected transaction failure/
+    );
+    assert.equal(fault.didFail(), true);
+    assert.ok(await sessions.find(credentials.sid), "the old browser session was partially revoked");
+    assert.equal(
+      (await prisma.refreshToken.findUnique({ where: { id: credentials.refreshTokenId } })).revokedAt,
+      null,
+      "the refresh token was partially revoked"
+    );
+    assert.equal(
+      (await accounts.authenticate({ identifier: account.email, password: "original-reset-password" })).ok,
+      true,
+      "the password changed despite the failed revocation"
+    );
+    assert.equal(
+      (await accounts.authenticate({ identifier: account.email, password: "replacement-reset-password" })).ok,
+      false
+    );
+
+    const retry = await accounts.resetPassword({
+      token: resetMail.token,
+      password: "replacement-reset-password"
+    });
+    assert.equal(retry.ok, true, "the reset link was consumed by a rolled-back reset");
+  });
+
+  it("rolls back a signed-in password change when credential revocation fails", async () => {
+    const { account } = await accounts.register({
+      email: "change-transaction@example.com",
+      password: "original-change-password"
+    });
+    const credentials = await seedRevocableCredentials({ prisma, sessions, userId: account.id });
+    const fault = failOnceInTransaction(prisma, { model: "session", method: "deleteMany" });
+    const failingAccounts = createAccountService({ prisma: fault.prisma, config });
+
+    await assert.rejects(
+      failingAccounts.changePassword({
+        userId: account.id,
+        currentPassword: "original-change-password",
+        newPassword: "replacement-change-password"
+      }),
+      /injected transaction failure/
+    );
+    assert.equal(fault.didFail(), true);
+    assert.ok(await sessions.find(credentials.sid), "the old browser session was partially revoked");
+    assert.equal(
+      (await prisma.refreshToken.findUnique({ where: { id: credentials.refreshTokenId } })).revokedAt,
+      null,
+      "the refresh token was partially revoked"
+    );
+    assert.equal(
+      (await accounts.authenticate({ identifier: account.email, password: "original-change-password" })).ok,
+      true,
+      "the password changed despite the failed revocation"
+    );
+    assert.equal(
+      (await accounts.authenticate({ identifier: account.email, password: "replacement-change-password" })).ok,
+      false
+    );
+  });
+
+  it("rolls back every credential class when revokeAllCredentials fails", async () => {
+    const { account } = await accounts.register({
+      email: "revoke-transaction@example.com",
+      password: "revoke-transaction-password"
+    });
+    const credentials = await seedRevocableCredentials({ prisma, sessions, userId: account.id });
+    const fault = failOnceInTransaction(prisma, { model: "session", method: "deleteMany" });
+    const failingAccounts = createAccountService({ prisma: fault.prisma, config });
+
+    await assert.rejects(
+      failingAccounts.revokeAllCredentials(account.id, "transaction_regression"),
+      /injected transaction failure/
+    );
+    assert.equal(fault.didFail(), true);
+    assert.ok(await sessions.find(credentials.sid), "the browser session was partially revoked");
+    assert.equal(
+      (await prisma.refreshToken.findUnique({ where: { id: credentials.refreshTokenId } })).revokedAt,
+      null,
+      "the refresh token was partially revoked"
+    );
+  });
+
+  it("locks account credentials in user-session-refresh-code-oidc-token order", async () => {
+    const { account } = await accounts.register({
+      email: "credential-lock-order@example.com",
+      password: "credential-lock-order-password"
+    });
+    await seedRevocableCredentials({ prisma, sessions, userId: account.id });
+    const beforeOwner = await prisma.user.findUnique({
+      where: { id: account.id },
+      select: { updatedAt: true }
+    });
+    const observed = observeTransactionWrites(prisma);
+    const orderedAccounts = createAccountService({ prisma: observed.prisma, config });
+
+    await orderedAccounts.revokeAllCredentials(account.id, "lock_order_regression");
+
+    assert.deepEqual(observed.writes, [
+      "user.updateMany",
+      "session.deleteMany",
+      "refreshToken.updateMany",
+      "authorizationCode.updateMany",
+      "oidcSession.updateMany",
+      "passwordResetToken.updateMany",
+      "emailVerificationToken.updateMany"
+    ]);
+    const afterOwner = await prisma.user.findUnique({
+      where: { id: account.id },
+      select: { updatedAt: true }
+    });
+    assert.equal(
+      afterOwner.updatedAt.getTime(),
+      beforeOwner.updatedAt.getTime(),
+      "the write lock changed the account update timestamp"
+    );
+  });
+
+  it("does not overwrite an administrative disable from a stale reset snapshot", async () => {
+    sentMail.length = 0;
+    const { account } = await accounts.register({
+      email: "reset-disable-race@example.com",
+      password: "original-race-password"
+    });
+    await accounts.requestPasswordReset({ email: account.email });
+    const resetMail = sentMail.find((entry) => entry.kind === "reset");
+    assert.ok(resetMail?.token);
+
+    const before = await prisma.user.findUnique({ where: { id: account.id } });
+    const paused = pauseOnceAfterRead(prisma, { model: "user", method: "findUnique" });
+    const racingAccounts = createAccountService({ prisma: paused.prisma, config });
+    const reset = racingAccounts.resetPassword({
+      token: resetMail.token,
+      password: "replacement-race-password"
+    });
+
+    await paused.reached;
+    await prisma.user.update({
+      where: { id: account.id },
+      data: { status: "DISABLED", disabledAt: new Date(), disabledReason: "concurrent_admin_action" }
+    });
+    paused.resume();
+
+    const result = await reset;
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "disabled");
+    const after = await prisma.user.findUnique({ where: { id: account.id } });
+    assert.equal(after.status, "DISABLED", "the reset undid the administrative disable");
+    assert.equal(after.passwordHash, before.passwordHash, "the reset changed the password after disable");
+    const resetRecord = await prisma.passwordResetToken.findUnique({
+      where: { tokenHash: hashToken(resetMail.token) }
+    });
+    assert.equal(resetRecord.usedAt, null, "the rejected reset consumed its one-time link");
+  });
+
+  it("allows only one concurrent password change to consume the old password", async () => {
+    const { account } = await accounts.register({
+      email: "change-password-race@example.com",
+      password: "shared-old-password"
+    });
+    const synchronizedPrisma = synchronizeReads(prisma, {
+      model: "user",
+      method: "findUnique",
+      participants: 2
+    });
+    const racingAccounts = createAccountService({ prisma: synchronizedPrisma, config });
+
+    const results = await Promise.all([
+      racingAccounts.changePassword({
+        userId: account.id,
+        currentPassword: "shared-old-password",
+        newPassword: "first-concurrent-password"
+      }),
+      racingAccounts.changePassword({
+        userId: account.id,
+        currentPassword: "shared-old-password",
+        newPassword: "second-concurrent-password"
+      })
+    ]);
+
+    assert.equal(results.filter((result) => result.ok).length, 1, "both stale password changes succeeded");
+    const rejected = results.find((result) => !result.ok);
+    assert.equal(rejected?.reason, "bad_password");
+    assert.equal(
+      (await accounts.authenticate({ identifier: account.email, password: "shared-old-password" })).ok,
+      false,
+      "the consumed old password still worked"
+    );
+    const winningPasswords = await Promise.all(
+      ["first-concurrent-password", "second-concurrent-password"].map((password) =>
+        accounts.authenticate({ identifier: account.email, password })
+      )
+    );
+    assert.equal(
+      winningPasswords.filter((result) => result.ok).length,
+      1,
+      "the stored password did not match exactly one successful request"
+    );
+  });
+
+  it("rolls back DISABLED status when credential revocation fails", async () => {
+    const { account } = await accounts.register({
+      email: "disable-transaction@example.com",
+      password: "disable-transaction-password"
+    });
+    const credentials = await seedRevocableCredentials({ prisma, sessions, userId: account.id });
+    const fault = failOnceInTransaction(prisma, { model: "session", method: "deleteMany" });
+    const failingAccounts = createAccountService({ prisma: fault.prisma, config });
+
+    await assert.rejects(
+      failingAccounts.setStatus({ userId: account.id, status: "DISABLED", reason: "transaction_regression" }),
+      /injected transaction failure/
+    );
+    assert.equal(fault.didFail(), true);
+    const after = await prisma.user.findUnique({ where: { id: account.id } });
+    assert.equal(after.status, "ACTIVE", "the status committed without credential revocation");
+    assert.equal(after.disabledAt, null);
+    assert.equal(after.disabledReason, null);
+    assert.ok(await sessions.find(credentials.sid), "the browser session was partially revoked");
+    assert.equal(
+      (await prisma.refreshToken.findUnique({ where: { id: credentials.refreshTokenId } })).revokedAt,
+      null,
+      "the refresh token was partially revoked"
+    );
+  });
+
   it("stores a session cookie only as a hash", async () => {
     const account = await accounts.findByEmail("first@example.com");
     const { sid, session } = await sessions.create({ userId: account.id });
@@ -222,9 +733,71 @@ describe("local accounts and external identity", () => {
     assert.ok(await sessions.find(second.sid));
   });
 
+  it("rolls back logout when either the Session or OIDC write fails", async () => {
+    const { account } = await accounts.register({
+      email: "logout-transaction@example.com",
+      password: "logout-transaction-password"
+    });
+
+    for (const model of ["session", "oidcSession"]) {
+      const credentials = await seedRevocableCredentials({ prisma, sessions, userId: account.id });
+      const fault = failOnceInTransaction(prisma, { model, method: model === "session" ? "deleteMany" : "updateMany" });
+      const failingSessions = createSessionService({ prisma: fault.prisma, config });
+
+      await assert.rejects(
+        failingSessions.logout({ sid: credentials.sid, reason: "transaction_regression" }),
+        /injected transaction failure/
+      );
+      assert.equal(fault.didFail(), true);
+      assert.ok(await sessions.find(credentials.sid), `${model} failure deleted the browser session`);
+      assert.equal(
+        (await prisma.oidcSession.findUnique({ where: { id: credentials.oidcSessionId } })).revokedAt,
+        null,
+        `${model} failure partially revoked the OIDC session`
+      );
+    }
+  });
+
+  it("rolls back remote session revocation when either Session or OIDC write fails", async () => {
+    const { account } = await accounts.register({
+      email: "remote-revoke-transaction@example.com",
+      password: "remote-revoke-transaction-password"
+    });
+
+    for (const model of ["session", "oidcSession"]) {
+      const credentials = await seedRevocableCredentials({ prisma, sessions, userId: account.id });
+      const fault = failOnceInTransaction(prisma, { model, method: model === "session" ? "deleteMany" : "updateMany" });
+      const failingSessions = createSessionService({ prisma: fault.prisma, config });
+
+      await assert.rejects(
+        failingSessions.revoke({
+          sessionId: credentials.sessionId,
+          userId: account.id,
+          reason: "transaction_regression"
+        }),
+        /injected transaction failure/
+      );
+      assert.equal(fault.didFail(), true);
+      assert.ok(
+        await prisma.session.findUnique({ where: { id: credentials.sessionId } }),
+        `${model} failure deleted the browser session`
+      );
+      assert.equal(
+        (await prisma.oidcSession.findUnique({ where: { id: credentials.oidcSessionId } })).revokedAt,
+        null,
+        `${model} failure partially revoked the OIDC session`
+      );
+    }
+  });
+
   it("creates a local account from a valid handoff ticket", async () => {
     const ticket = signTicket(
-      ticketPayload({ email: "upstream@example.com", name: "Upstream User", attributes: { knight_uid: 4242 } })
+      ticketPayload({
+        email: "upstream@example.com",
+        username: "upstream-user",
+        name: "Upstream User",
+        attributes: { knight_uid: 4242 }
+      })
     );
     const result = await external.completeCallback({
       provider: "upstream",
@@ -236,6 +809,7 @@ describe("local accounts and external identity", () => {
     assert.equal(result.account.hasPassword, false);
     // Attributes are what a custom scope releases as a claim.
     assert.equal(result.account.attributes.knight_uid, 4242);
+    assert.equal(result.account.attributes.external_preferred_username, "upstream-user");
   });
 
   it("rejects a replayed handoff ticket", async () => {
@@ -293,6 +867,16 @@ describe("local accounts and external identity", () => {
       external.completeCallback({ provider: "upstream", ticket: signTicket(payload), state: payload.state }),
       /has expired/
     );
+  });
+
+  it("requires a numeric issued-at time on a handoff ticket", async () => {
+    for (const iat of [undefined, "not-a-time"]) {
+      const payload = ticketPayload({ sub: `upstream-user-iat-${String(iat)}`, iat });
+      await assert.rejects(
+        external.completeCallback({ provider: "upstream", ticket: signTicket(payload), state: payload.state }),
+        /no valid issued-at time/
+      );
+    }
   });
 
   it("rejects a ticket addressed to a different issuer", async () => {

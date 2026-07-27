@@ -20,7 +20,7 @@ const { createProviderService } = require("./services/providerService");
 const { createSessionService } = require("./services/sessionService");
 
 const { cookieMiddleware } = require("./middleware/cookies");
-const { createCsrfMiddleware } = require("./middleware/csrf");
+const { createCsrfMiddleware, isStatelessProtocolEndpoint } = require("./middleware/csrf");
 const { createRateLimitMiddleware } = require("./middleware/rateLimit");
 const { createSessionMiddleware, requireAdmin, requireAuth } = require("./middleware/session");
 
@@ -44,11 +44,12 @@ const { createOAuthRoutes } = require("./routes/oauthRoutes");
 //
 //   1. helmet          — headers, before anything can respond
 //   2. body parsers    — the protocol endpoints are form-encoded
-//   3. cookies         — the session middleware reads them
-//   4. session         — attaches req.currentUser, which CSRF rendering uses
-//   5. csrf            — must see req.body, so it follows the parsers
-//   6. routes
-//   7. error handler   — last, and it decides JSON or HTML by path
+//   3. public routes   — machine responses never enter browser state middleware
+//   4. cookies         — the session middleware reads them
+//   5. session         — attaches req.currentUser, which CSRF rendering uses
+//   6. csrf            — must see req.body, so it follows the parsers
+//   7. stateful routes — authorization, account, and administration
+//   8. error handler   — last, and it decides JSON or HTML by path
 //
 // Putting CSRF before the body parser is a classic way to make it silently pass
 // every request, so the order above is not incidental.
@@ -223,10 +224,6 @@ function createApp(options = {}) {
   });
   app.use("/static", express.static(path.join(__dirname, "public"), { index: false, maxAge: "1h" }));
 
-  app.use(cookieMiddleware);
-  app.use(createSessionMiddleware({ sessions, accounts, provider }));
-  app.use(createCsrfMiddleware({ secureCookies: String(config.publicBaseUrl).startsWith("https:") }));
-
   // --- CORS, for the endpoints a browser-based client reads -----------------
   //
   // A single-page application fetches discovery, JWKS, and the token endpoint
@@ -253,6 +250,24 @@ function createApp(options = {}) {
     return next();
   });
 
+  // Public machine endpoints must stay independent of browser state. Mounting
+  // them before the cookie, session, and CSRF middleware means a health probe
+  // or client fetching metadata never receives a session/CSRF cookie, even if
+  // the request happens to carry a browser cookie of its own.
+  app.get("/healthz", oauthController.health);
+  app.get("/.well-known/openid-configuration", oauthController.openidConfiguration);
+  app.get("/.well-known/oauth-authorization-server", oauthController.authorizationServerMetadata);
+  app.get("/oauth2/jwks", oauthController.jwks);
+  app.get("/.well-known/jwks.json", oauthController.jwks);
+
+  app.use(cookieMiddleware);
+  const sessionMiddleware = createSessionMiddleware({ sessions, accounts, provider });
+  app.use((req, res, next) => {
+    if (isStatelessProtocolEndpoint(req.path)) return next();
+    return sessionMiddleware(req, res, next);
+  });
+  app.use(createCsrfMiddleware({ secureCookies: String(config.publicBaseUrl).startsWith("https:") }));
+
   // --- Rate limiting --------------------------------------------------------
   //
   // After CSRF, so a request that fails there is never counted — it cost
@@ -266,7 +281,6 @@ function createApp(options = {}) {
   app.use(createRateLimitMiddleware({ config, logger }));
 
   // --- Routes ---------------------------------------------------------------
-  app.get("/healthz", oauthController.health);
   app.use(createOAuthRoutes({ controller: oauthController }));
   app.use(createAccountRoutes({ controller: accountController, external: externalController, requireAuth }));
   app.use(createAdminRoutes({ controller: adminController, requireAdmin }));

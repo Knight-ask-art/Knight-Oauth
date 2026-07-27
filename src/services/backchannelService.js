@@ -46,11 +46,20 @@ function createBackchannelService({
    * act on. The parameter is named after the claim, not after the column, so
    * that a caller reaching for `.sessionId` reads as the mistake it is.
    */
-  async function enqueue({ clientId, sid, userId, subject, reason = "logout" }) {
-    const client = await clients.findByClientId(clientId);
+  async function enqueue({ clientId, sid, userId, subject, reason = "logout" }, database = prisma) {
+    // Read the client through the same transaction client that will persist the
+    // outbox row. Otherwise a concurrent endpoint update can be observed from a
+    // different snapshot, leaving the committed revocation with a missing or
+    // stale delivery intent.
+    const client = clients.toClient(
+      await database.oAuthClient.findUnique({ where: { clientId: String(clientId) } })
+    );
     if (!client?.backchannelLogoutUri) return false;
 
-    await prisma.backchannelLogout.create({
+    // Revocation callers pass their transaction client here so the state
+    // transition and its durable delivery intent commit together. Standalone
+    // callers keep the repository client default.
+    await database.backchannelLogout.create({
       data: {
         id: randomId(),
         clientId: client.clientId,

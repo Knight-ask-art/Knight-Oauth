@@ -33,6 +33,8 @@ const { invalidRequest, loginRequired } = require("../lib/errors");
 
 const TICKET_ALG = "HS256";
 const MAX_TICKET_LENGTH = 4096;
+const MAX_EXTERNAL_USERNAME_LENGTH = 64;
+const EXTERNAL_USERNAME_ATTRIBUTE = "external_preferred_username";
 
 function base64UrlDecode(part) {
   return Buffer.from(String(part), "base64url").toString("utf8");
@@ -133,18 +135,32 @@ function createHandoffAdapter(provider, { issuer }) {
       const subject = String(payload.sub || "").trim();
       if (!subject) throw invalidRequest("The sign-in ticket does not identify a user");
 
+      if (payload.username !== undefined && payload.username !== null && typeof payload.username !== "string") {
+        throw invalidRequest("The sign-in ticket username is not valid");
+      }
+      const username = String(payload.username || "").trim() || null;
+      if (
+        username &&
+        (username.length > MAX_EXTERNAL_USERNAME_LENGTH || /[\u0000-\u001f\u007f]/.test(username))
+      ) {
+        throw invalidRequest("The sign-in ticket username is not valid");
+      }
+
       const seconds = Math.floor(now.getTime() / 1000);
       if (!Number.isFinite(payload.exp) || payload.exp <= seconds) {
         throw invalidRequest("The sign-in ticket has expired");
       }
+      if (!Number.isFinite(payload.iat)) {
+        throw invalidRequest("The sign-in ticket has no valid issued-at time");
+      }
       // A ticket dated in the future is either a clock problem or a forgery
       // attempt; both are worth refusing. The 60s allowance is for ordinary skew.
-      if (Number.isFinite(payload.iat) && payload.iat > seconds + 60) {
+      if (payload.iat > seconds + 60) {
         throw invalidRequest("The sign-in ticket is not valid yet");
       }
       // A long-lived ticket defeats the point of a short-lived handoff, so the
       // configured TTL is a ceiling the upstream cannot exceed.
-      if (Number.isFinite(payload.iat) && payload.exp - payload.iat > provider.ticketTtlSeconds) {
+      if (payload.exp - payload.iat > provider.ticketTtlSeconds) {
         throw invalidRequest("The sign-in ticket is valid for too long");
       }
 
@@ -159,6 +175,7 @@ function createHandoffAdapter(provider, { issuer }) {
         subject,
         jti,
         expiresAt: new Date(payload.exp * 1000),
+        username,
         email: String(payload.email || "").trim().toLowerCase() || null,
         emailVerified: payload.email_verified === true,
         name: String(payload.name || "").trim() || null,
@@ -261,13 +278,18 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
         data: {
           profileJson: encodeJson({
             email: claims.email,
+            username: claims.username,
             name: claims.name,
             picture: claims.picture
           })
         }
       });
-      if (Object.keys(claims.attributes || {}).length) {
-        await accounts.setAttributes({ userId: account.id, attributes: claims.attributes });
+      const attributes = {
+        ...(claims.attributes || {}),
+        [EXTERNAL_USERNAME_ATTRIBUTE]: claims.username || null
+      };
+      if (Object.keys(claims.attributes || {}).length || claims.username || account.attributes?.[EXTERNAL_USERNAME_ATTRIBUTE]) {
+        await accounts.setAttributes({ userId: account.id, attributes });
       }
       return { account: await accounts.findById(account.id), created: false };
     }
@@ -316,6 +338,10 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
     const timestamp = now();
     const email = claims.email || `${adapter.name}-${claims.subject}@external.invalid`;
     const userId = randomId();
+    const attributes = {
+      ...(claims.attributes || {}),
+      ...(claims.username ? { [EXTERNAL_USERNAME_ATTRIBUTE]: claims.username } : {})
+    };
 
     const record = await prisma.user.create({
       data: {
@@ -329,7 +355,7 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
         name: claims.name,
         picture: claims.picture,
         status: accounts.STATUS.ACTIVE,
-        attributesJson: Object.keys(claims.attributes || {}).length ? encodeJson(claims.attributes) : null,
+        attributesJson: Object.keys(attributes).length ? encodeJson(attributes) : null,
         externalIdentities: {
           create: {
             id: randomId(),
@@ -337,6 +363,7 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
             subject: claims.subject,
             profileJson: encodeJson({
               email: claims.email,
+              username: claims.username,
               name: claims.name,
               picture: claims.picture
             })

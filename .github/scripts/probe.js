@@ -183,6 +183,73 @@ async function main() {
     );
   }
 
+  // These endpoints are easy to miss in an edge rule because they are not part
+  // of the interactive browser flow. Probe them without credentials: the exact
+  // OAuth error may vary with deployment policy, but the transport boundary may
+  // not. A Cloudflare challenge, proxy redirect, cacheable error, or CSRF cookie
+  // would break a conforming machine client before authentication is attempted.
+  const machineEndpoints = [
+    {
+      name: "introspection",
+      pathname: "/oauth2/introspect",
+      options: {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: ""
+      }
+    },
+    {
+      name: "revocation",
+      pathname: "/oauth2/revoke",
+      options: {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: ""
+      }
+    },
+    {
+      name: "dynamic registration",
+      pathname: "/oauth2/register",
+      options: {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}"
+      }
+    },
+    {
+      name: "registration management",
+      pathname: "/oauth2/register/probe-client",
+      options: { method: "GET" }
+    }
+  ];
+
+  for (const probe of machineEndpoints) {
+    const { response, json } = await get(probe.pathname, probe.options);
+    const prefix = `${probe.name} unauthenticated response`;
+    check(
+      `${prefix} is a 4xx`,
+      response.status >= 400 && response.status < 500,
+      `status ${response.status}`
+    );
+    check(
+      `${prefix} is JSON`,
+      (response.headers.get("content-type") || "").includes("application/json") &&
+        typeof json?.error === "string",
+      `content-type ${response.headers.get("content-type") || "missing"}`
+    );
+    check(
+      `${prefix} sends no-store`,
+      (response.headers.get("cache-control") || "").includes("no-store"),
+      `cache-control ${response.headers.get("cache-control") || "missing"}`
+    );
+    check(
+      `${prefix} sets no browser cookie`,
+      !response.headers.has("set-cookie"),
+      "a Set-Cookie header was present"
+    );
+    check(`${prefix} is not redirected`, response.status < 300 || response.status >= 400);
+  }
+
   // --- Caching -------------------------------------------------------------
   // RFC 6749 section 5.1. A cached token response is a token served to whoever
   // asks next through a shared proxy.

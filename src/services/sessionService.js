@@ -138,10 +138,10 @@ function createSessionService({ prisma, config, auditLog, now = () => new Date()
    * Signs a user out.
    *
    * Per-client OIDC sessions are revoked with a reason so back-channel logout
-   * has something to send. Refresh tokens are deliberately NOT revoked: OIDC
-   * Core section 11 defines `offline_access` as access that outlives the browser
-   * session, so killing it here would break every client holding one. Ending
-   * every grant is a separate, explicit action.
+   * has something to send. Refresh-token rows are not rewritten here. The
+   * revoked OIDC session makes them inactive at exchange and introspection,
+   * while retaining their family history for replay detection. Ending every
+   * grant is a separate, explicit action.
    */
   async function logout({ res, sid, reason = "user_logout" } = {}) {
     const raw = String(sid || "").trim();
@@ -150,14 +150,26 @@ function createSessionService({ prisma, config, auditLog, now = () => new Date()
       return { loggedOut: false, sessionId: null };
     }
     const sidHash = hashToken(raw);
-    const record = await prisma.session.findUnique({ where: { sidHash } });
+    const timestamp = now();
+    const record = await prisma.$transaction(async (transaction) => {
+      const current = await transaction.session.findUnique({ where: { sidHash } });
+      if (!current) return null;
+
+      // Session is the shared first lock for browser logout, remote revoke, and
+      // account-wide credential revocation. OIDC follows in the same
+      // transaction, so either failure rolls both state changes back.
+      const removed = await transaction.session.deleteMany({
+        where: { id: current.id, sidHash }
+      });
+      if (!removed.count) return null;
+      await transaction.oidcSession.updateMany({
+        where: { sessionId: current.id, revokedAt: null },
+        data: { revokedAt: timestamp, revocationReason: reason }
+      });
+      return current;
+    });
 
     if (record) {
-      await prisma.oidcSession.updateMany({
-        where: { sessionId: record.id, revokedAt: null },
-        data: { revokedAt: now(), revocationReason: reason }
-      });
-      await prisma.session.deleteMany({ where: { id: record.id } });
       await auditLog?.record({
         action: "session.logout",
         actorUserId: record.userId,
@@ -221,15 +233,26 @@ function createSessionService({ prisma, config, auditLog, now = () => new Date()
 
   /** Ends one session by id — for signing out a device from another device. */
   async function revoke({ sessionId, userId, reason = "user_revoked" } = {}) {
-    const record = await prisma.session.findFirst({
-      where: { id: String(sessionId || ""), userId: String(userId || "") }
+    const id = String(sessionId || "");
+    const ownerId = String(userId || "");
+    const timestamp = now();
+    const record = await prisma.$transaction(async (transaction) => {
+      const current = await transaction.session.findFirst({
+        where: { id, userId: ownerId }
+      });
+      if (!current) return null;
+
+      const removed = await transaction.session.deleteMany({
+        where: { id: current.id, userId: ownerId }
+      });
+      if (!removed.count) return null;
+      await transaction.oidcSession.updateMany({
+        where: { sessionId: current.id, revokedAt: null },
+        data: { revokedAt: timestamp, revocationReason: reason }
+      });
+      return current;
     });
     if (!record) return { revoked: false };
-    await prisma.oidcSession.updateMany({
-      where: { sessionId: record.id, revokedAt: null },
-      data: { revokedAt: now(), revocationReason: reason }
-    });
-    await prisma.session.deleteMany({ where: { id: record.id } });
     return { revoked: true, sessionId: record.id };
   }
 
