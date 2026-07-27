@@ -375,6 +375,11 @@ the following without printing credential values:
 - refresh-token rotation, with the replaced refresh token refused on replay
 - refresh-token revocation followed by inactive introspection of that refresh
   token
+- for the Knight Portal client, `credits_admin=true` only when the access token
+  has `credits.admin` and the current account still has administrator authority;
+  an ordinary user, an admin token without that scope, and the next fresh
+  introspection after an admin downgrade must report false without reviving the
+  value through refresh rotation
 - consent denial returning `access_denied` and no authorization code
 
 Never pass a client secret on the command line and never retain access tokens,

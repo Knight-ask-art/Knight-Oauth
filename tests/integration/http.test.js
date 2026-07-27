@@ -98,7 +98,12 @@ describe("the HTTP surface", () => {
         // /oauth2/authorize/continue rather than at /oauth2/authorize: an
         // anonymous request is sent to the login page before the scope is ever
         // checked, so the refusal happens on the way back.
-        { name: "ledger.admin", description: "Administer the ledger", adminOnly: true }
+        {
+          name: "ledger.admin",
+          description: "Administer the ledger",
+          adminOnly: true,
+          introspectionClaim: "ledger_admin"
+        }
       ])
     });
 
@@ -546,6 +551,7 @@ describe("the HTTP surface", () => {
       .send({ token: tokens.body.access_token })
       .expect(200);
     assert.equal(introspection.body.active, true);
+    assert.equal(introspection.body.ledger_admin, false);
 
     await request(app)
       .post("/oauth2/revoke")

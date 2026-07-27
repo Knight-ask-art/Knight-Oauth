@@ -118,12 +118,39 @@ const ACCOUNT_CLAIMS = new Set([
   "phone_number_verified"
 ]);
 
+// RFC 7662 defines these fields as issuer-controlled introspection metadata.
+// A deployment-specific live-authority boolean must never overwrite one of
+// them, even if a custom scope is misconfigured.
+const INTROSPECTION_RESPONSE_FIELDS = new Set([
+  ...RESERVED_CLAIMS,
+  "active",
+  "username",
+  "token_type",
+  "__proto__",
+  "prototype",
+  "constructor"
+]);
+
+// Keep private introspection field names deliberately boring. They are emitted
+// as JSON object keys and consumed as security decisions, so whitespace,
+// control characters, and look-alike punctuation have no useful role here.
+const INTROSPECTION_CLAIM_NAME = /^[A-Za-z_][A-Za-z0-9_.-]{0,127}$/;
+
 const SCOPE_TOKEN = /^[\x21\x23-\x5b\x5d-\x7e]+$/; // RFC 6749 appendix A.4
 const MAX_SCOPE_LENGTH = 1024;
 
 function validateScopeToken(scope) {
   if (!SCOPE_TOKEN.test(scope)) {
     throw invalidScope(`Scope token contains an illegal character: ${scope}`);
+  }
+}
+
+function assertIntrospectionClaimName(claim) {
+  if (!INTROSPECTION_CLAIM_NAME.test(claim)) {
+    throw new Error(`Invalid introspection claim name "${claim}"`);
+  }
+  if (INTROSPECTION_RESPONSE_FIELDS.has(claim)) {
+    throw new Error(`Introspection claim "${claim}" collides with a standard response field`);
   }
 }
 
@@ -137,6 +164,7 @@ function validateScopeToken(scope) {
  */
 function createScopeRegistry({ customScopes = [] } = {}) {
   const scopes = new Map();
+  const introspectionClaims = new Set();
 
   for (const [name, definition] of Object.entries(STANDARD_SCOPES)) {
     scopes.set(name, { name, standard: true, claimsFrom: null, ...definition });
@@ -158,12 +186,24 @@ function createScopeRegistry({ customScopes = [] } = {}) {
     if (entry.claimsFrom && typeof entry.claimsFrom !== "function") {
       throw new Error(`Custom scope "${name}" claimsFrom must be a function`);
     }
+    const introspectionClaim = String(entry.introspectionClaim || "").trim() || null;
+    if (introspectionClaim) {
+      assertIntrospectionClaimName(introspectionClaim);
+      if (typeof entry.allowFor !== "function") {
+        throw new Error(`Custom scope "${name}" requires allowFor when introspectionClaim is configured`);
+      }
+      if (introspectionClaims.has(introspectionClaim)) {
+        throw new Error(`Duplicate introspection claim "${introspectionClaim}"`);
+      }
+      introspectionClaims.add(introspectionClaim);
+    }
     scopes.set(name, {
       name,
       standard: false,
       description: String(entry.description || name),
       claims,
       claimsFrom: entry.claimsFrom || null,
+      introspectionClaim,
       /** Restrict a scope to accounts satisfying a predicate, e.g. admin-only. */
       allowFor: typeof entry.allowFor === "function" ? entry.allowFor : null
     });
@@ -295,6 +335,39 @@ function createScopeRegistry({ customScopes = [] } = {}) {
     return result;
   }
 
+  /**
+   * Computes deployment-defined live-authority booleans for access-token
+   * introspection. A value is true only when the token was granted the owning
+   * scope and the account still satisfies that scope's current allowFor rule.
+   * Values never come from account attributes or from JWT claims.
+   *
+   * A restricted scope without such a boolean remains fail-closed: if its
+   * allowFor rule stops passing, the token cannot be reported active because a
+   * relying party would otherwise see the stale scope with no live correction.
+   */
+  function introspectionAuthorityFor({ user, scopes: granted }) {
+    const held = new Set(granted || []);
+    const claims = {};
+    let canRemainActive = true;
+    for (const definition of scopes.values()) {
+      const claim = definition.introspectionClaim;
+      const wasGranted = held.has(definition.name);
+      let allowed = wasGranted;
+      if (wasGranted && definition.allowFor) {
+        try {
+          allowed = Boolean(definition.allowFor(user));
+        } catch {
+          allowed = false;
+        }
+      }
+      if (wasGranted && definition.allowFor && !allowed && !claim) {
+        canRemainActive = false;
+      }
+      if (claim) claims[claim] = Boolean(allowed);
+    }
+    return { canRemainActive, claims };
+  }
+
   /** Scopes shown on the consent screen; `openid` carries no user-visible grant. */
   function describeForConsent(granted) {
     return sort(granted || [])
@@ -314,6 +387,7 @@ function createScopeRegistry({ customScopes = [] } = {}) {
     describeForConsent,
     get,
     has,
+    introspectionAuthorityFor,
     parse,
     sort,
     supported
@@ -322,7 +396,9 @@ function createScopeRegistry({ customScopes = [] } = {}) {
 
 module.exports = {
   ACCOUNT_CLAIMS,
+  INTROSPECTION_RESPONSE_FIELDS,
   RESERVED_CLAIMS,
   STANDARD_SCOPES,
+  assertIntrospectionClaimName,
   createScopeRegistry
 };
