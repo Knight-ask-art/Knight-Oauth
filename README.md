@@ -424,12 +424,14 @@ database-native backup and rollback work, and a larger resource budget.
   price of closing that.
 - **Never change `OAUTH_ISSUER` on a live deployment.** Clients compare `iss`
   byte for byte; changing it invalidates every token already issued.
-- **Access tokens are self-contained JWTs and cannot be withdrawn early.**
-  Revoking one, or a refresh-token replay that revokes its whole family, ends the
-  grant — but an access token already issued stays verifiable until it expires,
-  so introspection keeps reporting `active: true` for it. What bounds that window
-  is `OAUTH_ACCESS_TOKEN_TTL` (one hour by default); shorten it if your threat
-  model needs revocation to bite sooner, at the cost of more refresh traffic.
+- **Central revocation is immediate at Knight's online endpoints.** Revoking an
+  access token revokes its OIDC session and the refresh tokens attached to that
+  session. UserInfo and introspection re-check the live client, account, grant,
+  scopes, role, and session, so they reject the token immediately. The access
+  token is still a self-contained JWT: a resource server that validates only the
+  signature offline cannot observe central revocation before the token expires.
+  Such a resource server must use introspection for immediate revocation, or
+  accept the window bounded by `OAUTH_ACCESS_TOKEN_TTL` (one hour by default).
 
 ---
 
@@ -760,11 +762,12 @@ PostgreSQL 是面向扩展和运维韧性的替代方案，不是轻量默认方
   等导出也必须遵守相同规则。
 - **不要修改已上线部署的 `OAUTH_ISSUER`。** 客户端会逐字节比对 `iss`，改了会让
   所有已签发的令牌失效。
-- **访问令牌是自包含 JWT，无法提前撤销。** 撤销令牌、或刷新令牌被重放导致整个
-  family 被吊销，都会终止这次授权；但已经签发出去的访问令牌在过期前仍然可以验签
-  通过，内省也会继续返回 `active: true`。真正限制这个窗口的是
-  `OAUTH_ACCESS_TOKEN_TTL`（默认 1 小时）——如果你的威胁模型要求撤销立刻生效，就
-  把它调短，代价是刷新请求变多。
+- **Knight 的在线端点会立即执行中央撤销。** 撤销访问令牌会同时撤销它所属的
+  OIDC 会话及关联刷新令牌。UserInfo 和内省会实时复核客户端、账户、Grant、
+  scope、角色和会话，因此会立即拒绝已撤销令牌。访问令牌仍是自包含 JWT：如果
+  资源服务器只做离线签名校验，它在令牌过期前无法感知中央撤销。需要撤销立即生效的
+  资源服务器必须使用内省，否则就要接受由 `OAUTH_ACCESS_TOKEN_TTL`（默认 1 小时）
+  限制的离线验签窗口。
 
 ## Docker
 
