@@ -5,6 +5,7 @@ node_modules/
 .env
 .env.*
 !.env.example
+!deploy/server/.env.production.example
 
 # SQLite lives on disk next to the code. `data/` is the default location and
 # `prisma/sqlite/data/` is where the Prisma CLI resolves a relative `file:` URL

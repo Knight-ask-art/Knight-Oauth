@@ -1,0 +1,29 @@
+# Production overlay for the lightweight SQLite deployment.
+#
+# Keep this file free of credentials. Put the required values in the operator
+# owned `.env` next to the compose files on the server.
+
+services:
+  knight-oauth:
+    image: knight-oauth:6278c25
+    container_name: knight-oauth
+    environment:
+      PUBLIC_BASE_URL: https://oauth.knightx.asia
+      OAUTH_ISSUER: https://oauth.knightx.asia
+      NODE_ENV: production
+      OAUTH_ALLOW_INSECURE_HTTP: "false"
+      OAUTH_ALLOW_GENERATED_KEYS: "false"
+      TRUST_PROXY: "1"
+      OAUTH_DYNAMIC_REGISTRATION_ENABLED: "false"
+      OAUTH_CLIENT_REQUIRE_APPROVAL: "true"
+      OAUTH_REGISTRATION_ENABLED: ${OAUTH_REGISTRATION_ENABLED:?set OAUTH_REGISTRATION_ENABLED in the operator env file}
+      OAUTH_FIRST_USER_IS_ADMIN: ${OAUTH_FIRST_USER_IS_ADMIN:?set OAUTH_FIRST_USER_IS_ADMIN in the operator env file}
+      OAUTH_SIGNING_KEYS_JSON: ${OAUTH_SIGNING_KEYS_JSON:?set OAUTH_SIGNING_KEYS_JSON in the operator env file}
+      OAUTH_CUSTOM_SCOPES: ${OAUTH_CUSTOM_SCOPES:?set OAUTH_CUSTOM_SCOPES in the operator env file}
+    networks:
+      - default
+      - stack_proxy
+
+networks:
+  stack_proxy:
+    external: true

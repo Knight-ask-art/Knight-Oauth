@@ -1,0 +1,9 @@
+# Temporary operator-only hold. It obtains/validates the origin certificate
+# without exposing the fresh database or registration flow to public traffic.
+
+oauth.knightx.asia {
+  log {
+    output discard
+  }
+  respond "operator hold" 403
+}

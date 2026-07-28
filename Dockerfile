@@ -8,6 +8,13 @@ FROM node:22-bookworm-slim AS build
 
 WORKDIR /app
 
+# Prisma selects its native query engine from the system OpenSSL ABI. The slim
+# Node image does not include OpenSSL, so install the runtime library explicitly
+# in both stages instead of silently falling back to the obsolete 1.1 target.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssl \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY package.json package-lock.json ./
 # The full dependency set: `prisma generate` needs the CLI, which is a normal
 # dependency here rather than a dev one so the same command works in a clone.
@@ -36,6 +43,10 @@ FROM node:22-bookworm-slim AS runtime
 
 ENV NODE_ENV=production
 WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssl \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/prisma ./prisma

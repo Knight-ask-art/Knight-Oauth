@@ -1,0 +1,17 @@
+# Final Caddy site for the standalone Knight OAuth container.
+# Apply only after the operator-only bootstrap hold is complete.
+
+oauth.knightx.asia {
+  log {
+    # OAuth query strings contain state, code, and other security values.
+    output discard
+  }
+
+  @discovery path /.well-known/openid-configuration /.well-known/oauth-authorization-server /.well-known/jwks.json /oauth2/jwks
+  header @discovery Cache-Control "public, max-age=300"
+
+  @no_store path /healthz /oauth2/* /login* /register* /account* /admin*
+  header @no_store Cache-Control "no-store"
+
+  reverse_proxy knight-oauth:3010
+}
