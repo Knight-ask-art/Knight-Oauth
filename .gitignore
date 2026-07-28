@@ -23,3 +23,7 @@ npm-debug.log*
 *.log
 coverage/
 dist/
+
+# Local review and security-scan working material must stay outside the public
+# repository. Preserve anything durable under the KnightWeb workspace output.
+tmp/

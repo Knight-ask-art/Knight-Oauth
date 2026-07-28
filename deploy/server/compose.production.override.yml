@@ -1,11 +1,11 @@
 # Production overlay for the lightweight SQLite deployment.
 #
-# Keep this file free of credentials. Put the required values in the operator
-# owned `.env` next to the compose files on the server.
+# Keep this file free of credentials. Use it together with the repository root
+# compose.yml and an operator-owned deploy/server/.env.production file.
 
 services:
   knight-oauth:
-    image: knight-oauth:6278c25
+    image: ${OAUTH_IMAGE:?set OAUTH_IMAGE to the tested immutable release tag}
     container_name: knight-oauth
     environment:
       PUBLIC_BASE_URL: https://oauth.knightx.asia
@@ -13,7 +13,7 @@ services:
       NODE_ENV: production
       OAUTH_ALLOW_INSECURE_HTTP: "false"
       OAUTH_ALLOW_GENERATED_KEYS: "false"
-      TRUST_PROXY: "1"
+      TRUST_PROXY: ${OAUTH_TRUSTED_PROXY:?set OAUTH_TRUSTED_PROXY to the dedicated Caddy address}
       OAUTH_DYNAMIC_REGISTRATION_ENABLED: "false"
       OAUTH_CLIENT_REQUIRE_APPROVAL: "true"
       OAUTH_REGISTRATION_ENABLED: ${OAUTH_REGISTRATION_ENABLED:?set OAUTH_REGISTRATION_ENABLED in the operator env file}
@@ -21,9 +21,11 @@ services:
       OAUTH_SIGNING_KEYS_JSON: ${OAUTH_SIGNING_KEYS_JSON:?set OAUTH_SIGNING_KEYS_JSON in the operator env file}
       OAUTH_CUSTOM_SCOPES: ${OAUTH_CUSTOM_SCOPES:?set OAUTH_CUSTOM_SCOPES in the operator env file}
     networks:
-      - default
-      - stack_proxy
+      default:
+      oauth_proxy:
+        ipv4_address: ${OAUTH_CONTAINER_IP:?set OAUTH_CONTAINER_IP inside the dedicated proxy subnet}
 
 networks:
-  stack_proxy:
+  oauth_proxy:
     external: true
+    name: ${OAUTH_PROXY_NETWORK_NAME:?set OAUTH_PROXY_NETWORK_NAME to the dedicated Caddy-OAuth network}

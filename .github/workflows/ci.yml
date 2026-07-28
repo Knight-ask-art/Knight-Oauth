@@ -342,6 +342,31 @@ jobs:
         with:
           node-version: 22
 
+      - name: validate the production compose overlay
+        env:
+          OAUTH_IMAGE: knight-oauth:ci-validation
+          OAUTH_SIGNING_KEYS_JSON: "[]"
+          OAUTH_CUSTOM_SCOPES: "[]"
+          OAUTH_REGISTRATION_ENABLED: "false"
+          OAUTH_FIRST_USER_IS_ADMIN: "false"
+          OAUTH_TRUSTED_PROXY: 172.31.255.2
+          OAUTH_CONTAINER_IP: 172.31.255.3
+          OAUTH_PROXY_NETWORK_NAME: knight_oauth_proxy
+        run: |
+          production_compose() {
+            docker compose \
+              --env-file deploy/server/.env.production.example \
+              -f compose.yml \
+              -f deploy/server/compose.production.override.yml \
+              "$@"
+          }
+
+          production_compose config --quiet
+          test "$(production_compose config --images)" = "knight-oauth:ci-validation"
+          test "$(production_compose config --networks | wc -l)" -eq 2
+          production_compose config --networks | grep -Fxq default
+          production_compose config --networks | grep -Fxq oauth_proxy
+
       # The README's claim is that this needs no configuration at all, so no .env
       # is written and no build argument is passed.
       - name: docker compose up --build

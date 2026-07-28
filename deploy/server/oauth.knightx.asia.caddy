@@ -1,5 +1,7 @@
 # Final Caddy site for the standalone Knight OAuth container.
-# Apply only after the operator-only bootstrap hold is complete.
+# Apply only after the operator-only bootstrap hold is complete. The Caddy
+# container must reach knight-oauth over the dedicated knight_oauth_proxy
+# network at the exact address configured as OAUTH_TRUSTED_PROXY.
 
 oauth.knightx.asia {
   log {

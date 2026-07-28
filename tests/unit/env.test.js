@@ -218,13 +218,15 @@ test("a custom scope introspection claim cannot collide or be ambiguous", () => 
   );
 });
 
-test("TRUST_PROXY resolves to a hop count rather than to blanket trust", () => {
+test("TRUST_PROXY avoids blanket trust and preserves explicit proxy identities", () => {
   // `req.ip` is what the rate limiter counts against and what the audit log
   // records a sign-in as coming from. Express reads the left-most
   // X-Forwarded-For entry as the client and `true` tells it to trust every hop,
   // including the entries the client wrote itself — and nginx's usual recipe
   // appends rather than replaces, so "the proxy is mine" does not close it.
-  // A hop count does: Express counts back from the socket instead.
+  // A hop count blocks client-prepended entries only when every route reaches
+  // the same proxy chain. Production deployments with alternate container
+  // paths must use an address/CIDR plus network isolation instead.
   assert.equal(loadEnv({}).trustProxy, false, "no proxy is the default");
   assert.equal(loadEnv({ TRUST_PROXY: "false" }).trustProxy, false);
   assert.equal(loadEnv({ TRUST_PROXY: "off" }).trustProxy, false);
@@ -235,8 +237,9 @@ test("TRUST_PROXY resolves to a hop count rather than to blanket trust", () => {
   assert.equal(loadEnv({ TRUST_PROXY: "yes" }).trustProxy, 1);
 
   assert.equal(loadEnv({ TRUST_PROXY: "2" }).trustProxy, 2);
-  // Passed through for Express to interpret: it accepts addresses, CIDR ranges,
-  // and the presets `loopback`, `linklocal`, `uniquelocal`.
+  // Passed through for Express to interpret: explicit addresses and narrow
+  // CIDRs bind trust to a peer identity instead of to its position in a route.
+  assert.equal(loadEnv({ TRUST_PROXY: "172.31.255.2" }).trustProxy, "172.31.255.2");
   assert.equal(loadEnv({ TRUST_PROXY: "10.0.0.0/8, 192.168.0.0/16" }).trustProxy, "10.0.0.0/8, 192.168.0.0/16");
   assert.equal(loadEnv({ TRUST_PROXY: "uniquelocal" }).trustProxy, "uniquelocal");
 
