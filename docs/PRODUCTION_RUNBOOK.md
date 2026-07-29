@@ -63,6 +63,12 @@ readiness, protocol, backup, and rollback evidence.
   Caddy-to-OAuth Docker network, and an exact `TRUST_PROXY` address for Caddy.
   Do not attach OAuth to a shared application proxy network or trust by hop
   count: a direct peer would occupy the trusted position.
+- The production overlay ignores the development Compose file's optional root
+  `.env`. Set `OAUTH_STATIC_CLIENTS` and
+  `OAUTH_EXTERNAL_IDENTITY_PROVIDERS` only in the operator-owned production
+  environment, and leave both as `[]` unless a release explicitly approves an
+  entry. Remove and revoke stale persisted clients, providers, grants, codes,
+  and tokens as part of any trust-root retirement.
 - Inject signing keys and credentials from an operator-controlled, root-readable
   secret source. Never put them in Git, commands, terminal output, receipts, or
   chat. Do not use `docker compose config`, an unscoped `docker inspect`, `env`,

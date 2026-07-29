@@ -361,11 +361,44 @@ jobs:
               "$@"
           }
 
+          # The development service accepts a repository-root .env for local
+          # zero-config startup. A production render must never inherit values
+          # from that file, because clients and providers are authentication
+          # trust roots. These are inert markers, not usable credentials.
+          test ! -e .env
+          cat > .env <<'ENV'
+          OAUTH_STATIC_CLIENTS=root-env-static-client-marker
+          OAUTH_EXTERNAL_IDENTITY_PROVIDERS=root-env-provider-marker
+          ENV
+          trap 'rm -f .env' EXIT
+
           production_compose config --quiet
           test "$(production_compose config --images)" = "knight-oauth:ci-validation"
           test "$(production_compose config --networks | wc -l)" -eq 2
           production_compose config --networks | grep -Fxq default
           production_compose config --networks | grep -Fxq oauth_proxy
+          production_compose config --format json | node -e '
+            let input = "";
+            process.stdin.setEncoding("utf8");
+            process.stdin.on("data", (chunk) => { input += chunk; });
+            process.stdin.on("end", () => {
+              const service = JSON.parse(input).services["knight-oauth"];
+              const environment = service.environment || {};
+              if ("env_file" in service && JSON.stringify(service.env_file) !== "[]") {
+                throw new Error("production service still inherits an env_file");
+              }
+              if (environment.OAUTH_STATIC_CLIENTS !== "[]") {
+                throw new Error("production static-client allowlist is not explicit and empty by default");
+              }
+              if (environment.OAUTH_EXTERNAL_IDENTITY_PROVIDERS !== "[]") {
+                throw new Error("production provider allowlist is not explicit and empty by default");
+              }
+              const rendered = JSON.stringify(environment);
+              if (rendered.includes("root-env-static-client-marker") || rendered.includes("root-env-provider-marker")) {
+                throw new Error("a repository-root .env marker reached the production service");
+              }
+            });
+          '
 
       # The README's claim is that this needs no configuration at all, so no .env
       # is written and no build argument is passed.

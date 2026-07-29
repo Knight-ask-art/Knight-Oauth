@@ -7,6 +7,10 @@ services:
   knight-oauth:
     image: ${OAUTH_IMAGE:?set OAUTH_IMAGE to the tested immutable release tag}
     container_name: knight-oauth
+    # The development compose file supports an optional repository-root .env.
+    # Production must not inherit it: clients and identity providers establish
+    # OAuth trust roots and must come only from the operator-owned environment.
+    env_file: !override []
     environment:
       PUBLIC_BASE_URL: https://oauth.knightx.asia
       OAUTH_ISSUER: https://oauth.knightx.asia
@@ -18,6 +22,8 @@ services:
       OAUTH_CLIENT_REQUIRE_APPROVAL: "true"
       OAUTH_REGISTRATION_ENABLED: ${OAUTH_REGISTRATION_ENABLED:?set OAUTH_REGISTRATION_ENABLED in the operator env file}
       OAUTH_FIRST_USER_IS_ADMIN: ${OAUTH_FIRST_USER_IS_ADMIN:?set OAUTH_FIRST_USER_IS_ADMIN in the operator env file}
+      OAUTH_STATIC_CLIENTS: ${OAUTH_STATIC_CLIENTS:-[]}
+      OAUTH_EXTERNAL_IDENTITY_PROVIDERS: ${OAUTH_EXTERNAL_IDENTITY_PROVIDERS:-[]}
       OAUTH_SIGNING_KEYS_JSON: ${OAUTH_SIGNING_KEYS_JSON:?set OAUTH_SIGNING_KEYS_JSON in the operator env file}
       OAUTH_CUSTOM_SCOPES: ${OAUTH_CUSTOM_SCOPES:?set OAUTH_CUSTOM_SCOPES in the operator env file}
     networks:

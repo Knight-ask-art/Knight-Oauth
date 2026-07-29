@@ -24,6 +24,20 @@ test("the production overlay binds an immutable image and an explicit proxy iden
   assert.doesNotMatch(compose, /^\s{4}image:\s*knight-oauth:[0-9a-f]+$/m);
 });
 
+test("the production overlay replaces development environment files with explicit trust-root allowlists", () => {
+  const compose = read("deploy/server/compose.production.override.yml");
+  const environment = read("deploy/server/.env.production.example");
+
+  assert.match(compose, /^\s{4}env_file:\s*!override\s*\[\]\s*$/m);
+  assert.match(compose, /^\s{6}OAUTH_STATIC_CLIENTS:\s*\$\{OAUTH_STATIC_CLIENTS:-\[\]\}$/m);
+  assert.match(
+    compose,
+    /^\s{6}OAUTH_EXTERNAL_IDENTITY_PROVIDERS:\s*\$\{OAUTH_EXTERNAL_IDENTITY_PROVIDERS:-\[\]\}$/m
+  );
+  assert.match(environment, /^OAUTH_STATIC_CLIENTS=\[\]$/m);
+  assert.match(environment, /^OAUTH_EXTERNAL_IDENTITY_PROVIDERS=\[\]$/m);
+});
+
 test("the production environment template starts with bootstrap authority disabled", () => {
   const environment = read("deploy/server/.env.production.example");
 
