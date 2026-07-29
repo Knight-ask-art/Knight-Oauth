@@ -1,0 +1,37 @@
+# Production overlay for the lightweight SQLite deployment.
+#
+# Keep this file free of credentials. Use it together with the repository root
+# compose.yml and an operator-owned deploy/server/.env.production file.
+
+services:
+  knight-oauth:
+    image: ${OAUTH_IMAGE:?set OAUTH_IMAGE to the tested immutable release tag}
+    container_name: knight-oauth
+    # The development compose file supports an optional repository-root .env.
+    # Production must not inherit it: clients and identity providers establish
+    # OAuth trust roots and must come only from the operator-owned environment.
+    env_file: !override []
+    environment:
+      PUBLIC_BASE_URL: https://oauth.knightx.asia
+      OAUTH_ISSUER: https://oauth.knightx.asia
+      NODE_ENV: production
+      OAUTH_ALLOW_INSECURE_HTTP: "false"
+      OAUTH_ALLOW_GENERATED_KEYS: "false"
+      TRUST_PROXY: ${OAUTH_TRUSTED_PROXY:?set OAUTH_TRUSTED_PROXY to the dedicated Caddy address}
+      OAUTH_DYNAMIC_REGISTRATION_ENABLED: "false"
+      OAUTH_CLIENT_REQUIRE_APPROVAL: "true"
+      OAUTH_REGISTRATION_ENABLED: ${OAUTH_REGISTRATION_ENABLED:?set OAUTH_REGISTRATION_ENABLED in the operator env file}
+      OAUTH_FIRST_USER_IS_ADMIN: ${OAUTH_FIRST_USER_IS_ADMIN:?set OAUTH_FIRST_USER_IS_ADMIN in the operator env file}
+      OAUTH_STATIC_CLIENTS: ${OAUTH_STATIC_CLIENTS:-[]}
+      OAUTH_EXTERNAL_IDENTITY_PROVIDERS: ${OAUTH_EXTERNAL_IDENTITY_PROVIDERS:-[]}
+      OAUTH_SIGNING_KEYS_JSON: ${OAUTH_SIGNING_KEYS_JSON:?set OAUTH_SIGNING_KEYS_JSON in the operator env file}
+      OAUTH_CUSTOM_SCOPES: ${OAUTH_CUSTOM_SCOPES:?set OAUTH_CUSTOM_SCOPES in the operator env file}
+    networks:
+      default:
+      oauth_proxy:
+        ipv4_address: ${OAUTH_CONTAINER_IP:?set OAUTH_CONTAINER_IP inside the dedicated proxy subnet}
+
+networks:
+  oauth_proxy:
+    external: true
+    name: ${OAUTH_PROXY_NETWORK_NAME:?set OAUTH_PROXY_NETWORK_NAME to the dedicated Caddy-OAuth network}

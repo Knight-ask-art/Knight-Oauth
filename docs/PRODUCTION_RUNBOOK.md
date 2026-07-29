@@ -56,10 +56,19 @@ readiness, protocol, backup, and rollback evidence.
 - Run one Knight OAuth application instance. The shipped SQLite deployment is
   the lowest-resource supported topology: one Node process, one named volume,
   no Redis, queue, worker, or database sidecar.
-- Bind Node to `127.0.0.1:3010`; expose only the TLS reverse proxy.
+- Bind the host publication to `127.0.0.1:3010`; expose only the TLS reverse
+  proxy publicly.
 - Keep the issuer exactly `https://oauth.knightx.asia`.
-- Use `NODE_ENV=production`, `OAUTH_ALLOW_INSECURE_HTTP=false`, and an exact
-  `TRUST_PROXY` hop count matching the deployed proxy chain.
+- Use `NODE_ENV=production`, `OAUTH_ALLOW_INSECURE_HTTP=false`, a dedicated
+  Caddy-to-OAuth Docker network, and an exact `TRUST_PROXY` address for Caddy.
+  Do not attach OAuth to a shared application proxy network or trust by hop
+  count: a direct peer would occupy the trusted position.
+- The production overlay ignores the development Compose file's optional root
+  `.env`. Set `OAUTH_STATIC_CLIENTS` and
+  `OAUTH_EXTERNAL_IDENTITY_PROVIDERS` only in the operator-owned production
+  environment, and leave both as `[]` unless a release explicitly approves an
+  entry. Remove and revoke stale persisted clients, providers, grants, codes,
+  and tokens as part of any trust-root retirement.
 - Inject signing keys and credentials from an operator-controlled, root-readable
   secret source. Never put them in Git, commands, terminal output, receipts, or
   chat. Do not use `docker compose config`, an unscoped `docker inspect`, `env`,
@@ -94,8 +103,18 @@ Start from a clean checkout. These commands emit only a commit identifier and
 test results; they do not read runtime credentials.
 
 ```bash
+PRODUCTION_ENV=deploy/server/.env.production
+test -r "$PRODUCTION_ENV"
+
 git status --short
 RELEASE_ID="$(git rev-parse --verify HEAD)"
+export OAUTH_IMAGE="knight-oauth:${RELEASE_ID}"
+COMPOSE=(
+  docker compose
+  --env-file "$PRODUCTION_ENV"
+  -f compose.yml
+  -f deploy/server/compose.production.override.yml
+)
 npm ci
 npm run db:schema:check
 npm test
@@ -113,7 +132,7 @@ Before changing the running container, capture the immutable image ID actually
 used by that container. Do not derive rollback from a mutable local tag:
 
 ```bash
-RUNNING_CONTAINER_ID="$(docker compose ps -q knight-oauth)"
+RUNNING_CONTAINER_ID="$("${COMPOSE[@]}" ps -q knight-oauth)"
 if [ -n "$RUNNING_CONTAINER_ID" ]; then
   ROLLBACK_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$RUNNING_CONTAINER_ID")"
   test -n "$ROLLBACK_IMAGE_ID"
@@ -127,6 +146,82 @@ fi
 Keep these variables in the same protected operator shell through deployment.
 Do not stop the current application yet: TLS, proxy, and Cloudflare checks in
 the next two sections must run while the known-good release is still available.
+
+### Provision the dedicated proxy network
+
+Read only the non-secret network fields from the production environment file;
+do not source the whole file because JSON values such as custom scopes are not
+shell syntax:
+
+```bash
+read_network_value() {
+  sed -n "s/^$1=//p" "$PRODUCTION_ENV" | tail -n 1
+}
+
+OAUTH_PROXY_NETWORK_NAME="$(read_network_value OAUTH_PROXY_NETWORK_NAME)"
+OAUTH_PROXY_SUBNET="$(read_network_value OAUTH_PROXY_SUBNET)"
+OAUTH_TRUSTED_PROXY="$(read_network_value OAUTH_TRUSTED_PROXY)"
+OAUTH_CONTAINER_IP="$(read_network_value OAUTH_CONTAINER_IP)"
+
+test -n "$OAUTH_PROXY_NETWORK_NAME"
+test -n "$OAUTH_PROXY_SUBNET"
+test -n "$OAUTH_TRUSTED_PROXY"
+test -n "$OAUTH_CONTAINER_IP"
+test "$OAUTH_TRUSTED_PROXY" != "$OAUTH_CONTAINER_IP"
+```
+
+Confirm the requested subnet does not overlap a host route or existing Docker
+network. Create it as an internal network if it does not already exist:
+
+```bash
+if ! docker network inspect "$OAUTH_PROXY_NETWORK_NAME" >/dev/null 2>&1; then
+  docker network create \
+    --driver bridge \
+    --internal \
+    --subnet "$OAUTH_PROXY_SUBNET" \
+    "$OAUTH_PROXY_NETWORK_NAME" >/dev/null
+fi
+
+test "$(docker network inspect \
+  --format '{{(index .IPAM.Config 0).Subnet}}' \
+  "$OAUTH_PROXY_NETWORK_NAME")" = "$OAUTH_PROXY_SUBNET"
+test "$(docker network inspect \
+  --format '{{.Internal}}' \
+  "$OAUTH_PROXY_NETWORK_NAME")" = true
+```
+
+Declare this external network in the Compose stack that owns Caddy, reserve
+`OAUTH_TRUSTED_PROXY` for Caddy there, and recreate Caddy. A one-off
+`docker network connect` is not a durable deployment because the attachment is
+lost when Caddy is recreated. Before continuing, verify the narrowly formatted
+network address without printing environment or container configuration:
+
+```bash
+: "${CADDY_CONTAINER:?set CADDY_CONTAINER to the Caddy container name}"
+CADDY_PROXY_IP="$(docker inspect \
+  --format "{{with index .NetworkSettings.Networks \"$OAUTH_PROXY_NETWORK_NAME\"}}{{.IPAddress}}{{end}}" \
+  "$CADDY_CONTAINER")"
+test "$CADDY_PROXY_IP" = "$OAUTH_TRUSTED_PROXY"
+
+unexpected_members="$(docker network inspect \
+  --format '{{range .Containers}}{{println .Name}}{{end}}' \
+  "$OAUTH_PROXY_NETWORK_NAME" | \
+  grep -Fvx -e "$CADDY_CONTAINER" -e knight-oauth || true)"
+test -z "$unexpected_members"
+
+if docker network inspect \
+  --format '{{range .Containers}}{{println .Name}}{{end}}' \
+  "$OAUTH_PROXY_NETWORK_NAME" | grep -Fxq knight-oauth; then
+  CURRENT_OAUTH_PROXY_IP="$(docker inspect \
+    --format "{{with index .NetworkSettings.Networks \"$OAUTH_PROXY_NETWORK_NAME\"}}{{.IPAddress}}{{end}}" \
+    knight-oauth)"
+  test "$CURRENT_OAUTH_PROXY_IP" = "$OAUTH_CONTAINER_IP"
+fi
+```
+
+The production overlay keeps OAuth on its project-private default network for
+outbound SMTP and back-channel traffic, and joins the internal proxy network
+only for Caddy ingress. Do not attach unrelated services to either network.
 
 ## 2. Validate origin TLS and SNI
 
@@ -178,6 +273,11 @@ certificate or hostname verification.
 
 Set Cloudflare SSL/TLS mode to **Full (strict)**. Do not use Flexible mode and do
 not disable origin certificate validation to hide a `525`.
+
+The Caddy site must forward to `knight-oauth:3010` over the dedicated
+`OAUTH_PROXY_NETWORK_NAME` network. The host publication on `127.0.0.1:3010`
+is for bounded operator probes only; Caddy must not use it, and OAuth must not
+rejoin the shared `stack_proxy` network.
 
 Configure the origin proxy to log the URL path without its query string, and
 configure Cloudflare Logpush, WAF event export, or equivalent edge logs to omit
@@ -239,36 +339,54 @@ isolated location. Do not inspect or attach snapshot contents to evidence. The
 TLS and Cloudflare preflight has already completed, so this stop begins the
 bounded application deployment window rather than an open-ended preflight.
 
-Tag the tested SQLite image for the repository-native `compose.yml` file and
-recreate only the OAuth application:
+The exported `OAUTH_IMAGE` already names the exact image built and tested in
+section 1. Recreate only the OAuth application through the production Compose
+file set; do not retag the candidate to a mutable `local` tag:
 
 ```bash
 if [ -n "${ROLLBACK_IMAGE_ID:-}" ]; then
   docker image tag "$ROLLBACK_IMAGE_ID" knight-oauth:rollback
 fi
-docker image tag "knight-oauth:${RELEASE_ID}" knight-oauth:local
-docker compose up --detach --no-build --force-recreate knight-oauth
+test "$OAUTH_IMAGE" = "knight-oauth:${RELEASE_ID}"
+"${COMPOSE[@]}" up --detach --no-build --force-recreate knight-oauth
 ```
 
 Do not start a second application replica during handover. The SQLite entrypoint
 applies pending migrations before Node starts. A migration failure blocks the
 rollout; never force the server to start against an unverified schema.
 
-On a fresh database, keep the edge operator-only while bootstrapping. If local
-registration is used to create the administrator, only the intended operator
-may reach the real HTTPS registration flow while
-`OAUTH_FIRST_USER_IS_ADMIN=true`. Verify that the intended account can reach the
-admin surface, then set `OAUTH_FIRST_USER_IS_ADMIN=false`. For a Knight
-handoff-only deployment, also set `OAUTH_REGISTRATION_ENABLED=false`. Recreate
-the single application container after these changes and repeat readiness; do
-not open general public traffic merely because the first login succeeded.
+After the container starts, prove that the dedicated proxy network contains
+exactly Caddy and OAuth. This check prints only container names on failure:
+
+```bash
+unexpected_members="$(docker network inspect \
+  --format '{{range .Containers}}{{println .Name}}{{end}}' \
+  "$OAUTH_PROXY_NETWORK_NAME" | \
+  grep -Fvx -e "$CADDY_CONTAINER" -e knight-oauth || true)"
+test -z "$unexpected_members"
+test "$(docker network inspect \
+  --format '{{range .Containers}}{{println .Name}}{{end}}' \
+  "$OAUTH_PROXY_NETWORK_NAME" | wc -l)" -eq 2
+```
+
+On a fresh database, keep the edge operator-only while bootstrapping. The
+production template starts with registration and first-user promotion both
+disabled. Only after the fixed 403 Caddy hold has proved TLS and a separate
+edge rule restricts the final proxy route to the intended operator may the
+operator temporarily set both `OAUTH_REGISTRATION_ENABLED=true` and
+`OAUTH_FIRST_USER_IS_ADMIN=true` in the protected production environment file
+and recreate OAuth. Only the intended operator may then reach the real HTTPS
+registration flow. Verify that the intended account can reach the admin
+surface, set both values back to `false`, recreate the single application
+container, and repeat readiness. Do not open general public traffic merely
+because the first login succeeded.
 
 Before any public opening, verify that the database contains exactly one
 administrator. This check prints only the count and a fixed failure marker; it
 does not print account identity or configuration:
 
 ```bash
-docker compose exec -T knight-oauth node <<'NODE'
+"${COMPOSE[@]}" exec -T knight-oauth node <<'NODE'
 const { PrismaClient } = require("@prisma/client");
 const prisma = new PrismaClient();
 
@@ -403,7 +521,7 @@ Stop the candidate first, regardless of whether this is an upgrade or a first
 deployment:
 
 ```bash
-docker compose stop knight-oauth
+"${COMPOSE[@]}" stop knight-oauth
 ```
 
 If the candidate applied a migration that is not backward compatible with the
@@ -417,8 +535,9 @@ immutable image. A first deployment has no previous image and remains stopped:
 
 ```bash
 if [ -n "${ROLLBACK_IMAGE_ID:-}" ]; then
-  docker image tag "$ROLLBACK_IMAGE_ID" knight-oauth:local
-  docker compose up --detach --no-build --force-recreate knight-oauth
+  docker image tag "$ROLLBACK_IMAGE_ID" knight-oauth:rollback
+  export OAUTH_IMAGE=knight-oauth:rollback
+  "${COMPOSE[@]}" up --detach --no-build --force-recreate knight-oauth
 else
   printf 'rollback_state=stopped first_deployment=true\n'
 fi

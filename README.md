@@ -284,7 +284,7 @@ list; these are the ones that matter most.
 | `OAUTH_FIRST_USER_IS_ADMIN` | `true` | So a fresh install has an administrator without seeding |
 | `OAUTH_CLIENT_REQUIRE_APPROVAL` | `true` | UI-submitted clients wait for an administrator |
 | `OAUTH_DYNAMIC_REGISTRATION_ENABLED` | `false` | An open registration endpoint should be a decision |
-| `TRUST_PROXY` | `false` | Only enable behind a proxy you control |
+| `TRUST_PROXY` | `false` | Trust an explicit proxy address/CIDR when alternate peers can reach the listener; hop counts assume every route has the same proxy chain |
 
 The server refuses to start rather than run in a state that looks secure and is
 not: a plaintext issuer in production, dynamic registration in production with
@@ -423,9 +423,13 @@ database-native backup and rollback work, and a larger resource budget.
   `OAUTH_ALLOW_GENERATED_KEYS=false`. Database-generated keys converge safely
   during concurrent first boot, but they keep private key material in the
   application database and cannot be rotated independently of it.
-- **`TRUST_PROXY=true` only behind a proxy you control.** It makes the app trust
-  `X-Forwarded-*`, and a directly exposed process would let a caller spoof its
-  own address past the rate limiter and into the audit log.
+- **Bind proxy trust to an identity, not only a route position.**
+  `TRUST_PROXY=true` is retained as one-hop compatibility for simple
+  deployments, but it is safe only when every socket path reaches the same
+  controlled proxy. If another container or listener can call the app directly,
+  isolate the proxy network and set `TRUST_PROXY` to the proxy's exact address
+  or a narrowly owned CIDR. Otherwise that peer can supply `X-Forwarded-*`,
+  evade address-based limits, and forge audit attribution.
 - **Do not log URL query strings at the edge or origin proxy.** Authorization
   requests and external-login callbacks carry short-lived security values in
   the query. Record the path and safe correlation metadata only, and configure
@@ -783,9 +787,11 @@ PostgreSQL 是面向扩展和运维韧性的替代方案，不是轻量默认方
   `OAUTH_SIGNING_KEYS_JSON` 注入，并保持 `OAUTH_ALLOW_GENERATED_KEYS=false`。
   数据库自动生成模式在并发首启时会安全收敛到同一行，但私钥会留在应用数据库里，
   也无法独立于数据库轮换。
-- **只有在你自己掌控的反向代理后面才开 `TRUST_PROXY=true`。** 它会让应用信任
-  `X-Forwarded-*`；直接暴露的进程开了它，调用方就能伪造自己的来源 IP，绕过限流
-  并污染审计日志。
+- **代理信任必须绑定到明确身份，而不只是链路位置。** 为简单部署保留的
+  `TRUST_PROXY=true` 表示一个代理跳，但只有所有 socket 路径都经过同一受控代理时
+  才安全。如果其他容器或监听路径可以直连应用，应隔离代理网络，并把
+  `TRUST_PROXY` 设置为代理的精确地址或严格受控的 CIDR；否则直连对端可以提供
+  `X-Forwarded-*`，绕过按地址限流并伪造审计来源。
 - **边缘层和源站反向代理不得记录 URL 查询字符串。** 授权请求和外部登录回调会在
   query 中携带短时效安全值。日志只能记录路径和安全关联元数据，Cloudflare Logpush
   等导出也必须遵守相同规则。

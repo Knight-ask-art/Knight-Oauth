@@ -54,16 +54,19 @@ function list(value) {
  * sending its own X-Forwarded-For gets that value back out as `req.ip`, rotates
  * it per request, and never meets a limit.
  *
- * A hop count does close it. Express counts back from the socket, so with `1`
- * the address is the one the nearest proxy observed and anything the client
- * prepended is out of reach.
+ * A hop count closes the client-prepended-header case only when every route to
+ * the listener has the same trusted proxy chain. If another container can call
+ * the listener directly, that peer occupies the trusted nearest-hop position
+ * and chooses the address Express returns. Address or CIDR trust plus network
+ * isolation is required for that topology.
  *
  * `TRUST_PROXY=true` therefore now means one hop rather than all of them. That
  * is a change in meaning, and it is the safe direction: a single reverse proxy
  * is what almost every deployment has, it is what `true` was reached for, and a
- * deployment behind two says `2`. Anything that is not a boolean or an integer
- * is handed to Express as-is, which accepts a comma-separated list of addresses,
- * CIDR ranges, and the presets `loopback`, `linklocal`, and `uniquelocal`.
+ * deployment behind two says `2`. This compatibility behavior does not prove
+ * proxy identity. Anything that is not a boolean or an integer is handed to
+ * Express as-is, which accepts a comma-separated list of addresses, CIDR ranges,
+ * and the presets `loopback`, `linklocal`, and `uniquelocal`.
  */
 function parseTrustProxy(value) {
   const raw = String(value ?? "").trim();

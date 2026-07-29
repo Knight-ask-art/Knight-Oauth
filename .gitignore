@@ -5,6 +5,7 @@ node_modules/
 .env
 .env.*
 !.env.example
+!deploy/server/.env.production.example
 
 # SQLite lives on disk next to the code. `data/` is the default location and
 # `prisma/sqlite/data/` is where the Prisma CLI resolves a relative `file:` URL
@@ -22,3 +23,7 @@ npm-debug.log*
 *.log
 coverage/
 dist/
+
+# Local review and security-scan working material must stay outside the public
+# repository. Preserve anything durable under the KnightWeb workspace output.
+tmp/
