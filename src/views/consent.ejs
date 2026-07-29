@@ -1,98 +1,130 @@
-<%- include("partials/head", { title, branding, hideNav: true }) %>
+<%- include("partials/head", {
+  title,
+  branding,
+  hideNav: true,
+  bodyClass: "consent-page",
+  referrerPolicy: "no-referrer",
+  pageLanguage: "zh-CN"
+}) %>
 <%
-// The consent screen.
-//
-// This is the only page in the product a third party's users are guaranteed to
-// see, and it is where a user makes a security decision, so it says three things
-// plainly: who is asking, what they get, and where the result goes.
-//
-// `redirectOrigin` is shown because it is the answer to "who am I actually
-// giving this to". It is the registered, validated redirect URI's origin — never
-// raw input — so what is displayed is what will be used.
-//
-// Every scope is a checkbox the user can clear. The server intersects what comes
-// back with what was requested, so unticking one narrows the grant rather than
-// failing the request. `openid` is not listed: it is not a permission, it only
-// means "issue an ID token", and it rides along whenever it was asked for.
+const accountLabel = account.name || account.username || account.email;
+const accountInitial = String(accountLabel || "K").trim().slice(0, 1).toUpperCase() || "K";
+const clientInitial = String(client.name || "K").trim().slice(0, 1).toUpperCase() || "K";
 %>
-<div class="card card--narrow">
-  <div class="consent-client">
-    <% if (client.logoUri) { %>
-      <img class="consent-logo" src="<%= client.logoUri %>" alt="" width="44" height="44" />
-    <% } %>
-    <div>
-      <h1><%= client.name %></h1>
-      <p class="muted small">wants access to your account</p>
+
+<article class="consent-shell" aria-labelledby="consent-title">
+  <header class="consent-hero">
+    <div class="consent-client-logo" aria-hidden="true">
+      <span class="consent-client-logo__fallback"><%= clientInitial %></span>
+      <% if (client.logoUri) { %>
+        <img data-consent-client-logo src="<%= client.logoUri %>" alt="" width="72" height="72" referrerpolicy="no-referrer" decoding="async" />
+      <% } %>
     </div>
-  </div>
+    <p class="consent-kicker">Knight authorization</p>
+    <h1 id="consent-title"><%= client.name %></h1>
+    <p class="consent-summary">请求访问你的 Knight 账户</p>
+  </header>
 
   <% if (previouslyGranted) { %>
-    <div class="alert alert--ok">
-      You have authorized this application before. It is asking for something new, or asking again.
+    <div class="consent-notice consent-notice--known" role="status">
+      你之前已授权过此应用。请重新确认本次请求的权限。
     </div>
   <% } %>
 
-  <% if (!client.isFirstParty) { %>
-    <p class="small muted">
-      This application was registered by a third party. <%= branding.serviceName %> does not vouch for it.
-    </p>
-  <% } %>
+  <section class="consent-account" aria-labelledby="consent-account-title">
+    <div class="consent-account__avatar" aria-hidden="true"><%= accountInitial %></div>
+    <div class="consent-account__identity">
+      <h2 id="consent-account-title"><%= accountLabel %></h2>
+      <p><%= account.email %></p>
+    </div>
+    <span class="consent-account__state">当前账户</span>
+  </section>
 
-  <h2>It will be able to</h2>
-  <% if (permissions.length) { %>
-    <ul class="permissions">
-      <% permissions.forEach((permission) => { %>
-        <li>
-          <span class="tick" aria-hidden="true">✓</span>
-          <label class="check">
-            <input type="checkbox" name="scope" value="<%= permission.name %>" form="consent-form" checked />
-            <span>
-              <%= permission.description %>
-              <span class="scope-name"><%= permission.name %></span>
-            </span>
-          </label>
-        </li>
-      <% }) %>
-    </ul>
-  <% } else { %>
-    <p class="muted">
-      Confirm who you are. It is not asking for access to anything in your account.
-    </p>
-  <% } %>
+  <section class="consent-section" aria-labelledby="application-information-title">
+    <div class="consent-section__heading">
+      <h2 id="application-information-title">应用信息</h2>
+      <% if (client.isFirstParty) { %>
+        <span class="consent-trust consent-trust--first-party">Knight 服务</span>
+      <% } else { %>
+        <span class="consent-trust">第三方应用</span>
+      <% } %>
+    </div>
 
-  <p class="small muted consent-target">
-    Signed in as <strong><%= account.email %></strong>. You will be returned to
-    <code><%= redirectOrigin %></code>.
-  </p>
+    <dl class="consent-facts">
+      <div>
+        <dt>返回到</dt>
+        <dd><code><%= redirectOrigin %></code></dd>
+      </div>
+      <% if (client.clientUri) { %>
+        <div>
+          <dt>应用主页</dt>
+          <dd><a href="<%= client.clientUri %>" rel="noopener noreferrer nofollow" target="_blank"><%= client.clientUri %></a></dd>
+        </div>
+      <% } %>
+      <% if (client.description) { %>
+        <div>
+          <dt>用途</dt>
+          <dd><%= client.description %></dd>
+        </div>
+      <% } %>
+    </dl>
 
-  <%
-  // Both buttons submit the same form. Refusing is a POST like approving is,
-  // because a GET that decides an authorization can be triggered cross-site.
-  %>
-  <form id="consent-form" method="post" action="/oauth2/consent" class="form-actions">
+    <% if (!client.isFirstParty) { %>
+      <div class="consent-notice consent-notice--warning" role="note">
+        这是由第三方注册的应用。Knight OAuth 只校验已登记的回调地址，不为其内容或服务背书。
+      </div>
+    <% } %>
+  </section>
+
+  <section class="consent-section consent-permissions" aria-labelledby="permissions-title">
+    <div class="consent-section__heading">
+      <div>
+        <h2 id="permissions-title">将获取以下权限</h2>
+        <p>你可以取消不需要的可选权限。</p>
+      </div>
+    </div>
+
+    <% if (permissions.length) { %>
+      <ul class="permissions">
+        <% permissions.forEach((permission) => { %>
+          <li>
+            <label class="check permission-choice">
+              <input type="checkbox" name="scope" value="<%= permission.name %>" form="consent-form" checked />
+              <span class="permission-choice__text">
+                <strong><%= permission.description %></strong>
+                <span class="scope-name"><%= permission.name %></span>
+              </span>
+            </label>
+          </li>
+        <% }) %>
+      </ul>
+    <% } else { %>
+      <p class="consent-empty">只确认你的身份，不请求访问账户中的其他数据。</p>
+    <% } %>
+  </section>
+
+  <form id="consent-form" method="post" action="/oauth2/consent" class="consent-actions">
     <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
     <input type="hidden" name="request" value="<%= requestToken %>" />
-    <%
-    // Unticked checkboxes are simply absent from a form submission, so without
-    // this marker "the user cleared every box" and "this form had no boxes"
-    // arrive identically — and the server would read the first as "approve
-    // everything requested". The marker says the choice was made here.
-    %>
     <input type="hidden" name="scope_selection" value="1" />
-    <button type="submit" name="decision" value="allow">Allow access</button>
-    <button type="submit" name="decision" value="deny" class="button--secondary">Cancel</button>
+    <button type="submit" name="decision" value="allow">允许访问</button>
+    <button type="submit" name="decision" value="deny" class="button--secondary">拒绝</button>
   </form>
 
-  <% if (client.policyUri || client.tosUri) { %>
-    <p class="small muted">
-      <% if (client.policyUri) { %>
-        <a href="<%= client.policyUri %>" rel="noopener noreferrer nofollow" target="_blank">Privacy policy</a>
-      <% } %>
-      <% if (client.policyUri && client.tosUri) { %>·<% } %>
-      <% if (client.tosUri) { %>
-        <a href="<%= client.tosUri %>" rel="noopener noreferrer nofollow" target="_blank">Terms of service</a>
-      <% } %>
-    </p>
-  <% } %>
-</div>
+  <footer class="consent-legal">
+    <p>继续即表示你同意将所选信息提供给 <strong><%= client.name %></strong>。</p>
+    <% if (client.policyUri || client.tosUri) { %>
+      <nav aria-label="Application legal links">
+        <% if (client.policyUri) { %>
+          <a href="<%= client.policyUri %>" rel="noopener noreferrer nofollow" target="_blank">隐私政策</a>
+        <% } %>
+        <% if (client.tosUri) { %>
+          <a href="<%= client.tosUri %>" rel="noopener noreferrer nofollow" target="_blank">服务条款</a>
+        <% } %>
+      </nav>
+    <% } %>
+  </footer>
+</article>
+
+<script src="/static/js/consent.js?v=20260729-consent1" defer></script>
 <%- include("partials/foot", { branding }) %>

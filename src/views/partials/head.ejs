@@ -25,17 +25,21 @@ const pageTitle = (typeof title === "string" && title) || serviceName;
 const user = typeof currentUser !== "undefined" ? currentUser : null;
 const csrf = typeof csrfToken === "string" ? csrfToken : "";
 const bare = typeof hideNav !== "undefined" && hideNav;
+const bodyClassName = typeof bodyClass === "string" ? bodyClass : "";
+const pageReferrerPolicy = typeof referrerPolicy === "string" ? referrerPolicy : "same-origin";
+const documentLanguage = typeof pageLanguage === "string" ? pageLanguage : "en";
+const staticAssetVersion = "20260729-consent1";
 %><!DOCTYPE html>
-<html lang="en">
+<html lang="<%= documentLanguage %>">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="referrer" content="same-origin" />
+    <meta name="referrer" content="<%= pageReferrerPolicy %>" />
     <title><%= pageTitle %> · <%= serviceName %></title>
-    <link rel="stylesheet" href="/static/css/app.css" />
+    <link rel="stylesheet" href="/static/css/app.css?v=<%= staticAssetVersion %>" />
     <link rel="stylesheet" href="/static/css/brand.css" />
   </head>
-  <body>
+  <body class="<%= bodyClassName %>">
     <header class="site-header">
       <a class="brand" href="/">
         <% if (brand.logoUrl) { %><img class="brand-logo" src="<%= brand.logoUrl %>" alt="" width="28" height="28" /><% } %>

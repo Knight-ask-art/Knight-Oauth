@@ -135,6 +135,11 @@ describe("the HTTP surface", () => {
     const web = await clients.create(
       {
         name: "Third Party Web App",
+        description: "View profile details and manage the connected credit experience.",
+        logoUri: "https://rp.example/logo.png",
+        clientUri: "https://rp.example/",
+        policyUri: "https://rp.example/privacy",
+        tosUri: "https://rp.example/terms",
         clientType: "confidential",
         redirectUris: ["https://rp.example/callback"],
         postLogoutRedirectUris: ["https://rp.example/signed-out"],
@@ -480,6 +485,18 @@ describe("the HTTP surface", () => {
     const consent = await user.get(redirected.headers.location).expect(200);
     assertPrivateBrowserResponse(consent, "/oauth2/consent");
     assert.match(consent.text, /Third Party Web App/);
+    assert.match(consent.text, /class="consent-shell"/);
+    assert.match(consent.text, /class="consent-account"/);
+    assert.match(consent.text, /class="consent-actions"/);
+    assert.match(consent.text, /<html lang="zh-CN">/);
+    assert.match(consent.text, /View profile details and manage the connected credit experience/);
+    assert.match(consent.text, /user@example\.com/);
+    assert.match(consent.text, /referrerpolicy="no-referrer"/);
+    assert.match(consent.text, /src="\/static\/js\/consent\.js\?v=20260729-consent1"/);
+    assert.match(consent.text, /name="scope_selection" value="1"/);
+    assert.match(consent.text, /name="decision" value="allow"/);
+    assert.match(consent.text, /name="decision" value="deny"/);
+    assert.doesNotMatch(consent.text, /theme-toggle|switch-theme|toggle-theme/i);
     // The origin the result is going to, which is the answer to "who am I
     // actually giving this to".
     assert.match(consent.text, /https:\/\/rp\.example/);
@@ -568,6 +585,41 @@ describe("the HTTP surface", () => {
       .auth(confidential.clientId, confidentialSecret)
       .send({ token: "never-existed" })
       .expect(200);
+  });
+
+  it("escapes untrusted client copy on the consent decision page", async () => {
+    const hostile = await clients.create(
+      {
+        name: '<img src=x onerror="alert(1)">',
+        description: '</p><script>alert("consent")</script>',
+        clientType: "public",
+        redirectUris: ["https://hostile.example/callback"],
+        scopes: ["openid", "profile"],
+        grantTypes: ["authorization_code"],
+        tokenEndpointAuthMethod: "none",
+        requireConsent: true
+      },
+      { status: "APPROVED" }
+    );
+    const agent = await signIn("user@example.com");
+    const { challenge } = pkce();
+    const query = new URLSearchParams({
+      client_id: hostile.client.clientId,
+      redirect_uri: hostile.client.redirectUris[0],
+      response_type: "code",
+      scope: "openid profile",
+      state: crypto.randomBytes(16).toString("base64url"),
+      nonce: crypto.randomBytes(16).toString("base64url"),
+      code_challenge: challenge,
+      code_challenge_method: "S256"
+    });
+
+    const redirected = await agent.get(`/oauth2/authorize?${query}`).expect(302);
+    const consent = await agent.get(redirected.headers.location).expect(200);
+
+    assert.match(consent.text, /&lt;img src=x onerror=&#34;alert\(1\)&#34;&gt;/);
+    assert.match(consent.text, /&lt;\/p&gt;&lt;script&gt;alert\(&#34;consent&#34;\)&lt;\/script&gt;/);
+    assert.doesNotMatch(consent.text, /<img src=x|<script>alert\("consent"\)<\/script>/);
   });
 
   it("challenges a UserInfo request that carries no token", async () => {
