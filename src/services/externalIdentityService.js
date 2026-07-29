@@ -35,6 +35,7 @@ const TICKET_ALG = "HS256";
 const MAX_TICKET_LENGTH = 4096;
 const MAX_EXTERNAL_USERNAME_LENGTH = 64;
 const EXTERNAL_USERNAME_ATTRIBUTE = "external_preferred_username";
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function base64UrlDecode(part) {
   return Buffer.from(String(part), "base64url").toString("utf8");
@@ -96,6 +97,7 @@ function verifyTicketSignature(ticket, secret) {
  */
 function createHandoffAdapter(provider, { issuer }) {
   const secret = provider.sharedSecret;
+  const subjectFormat = provider.subjectFormat || "opaque";
   if (!secret) {
     throw new Error(`External identity provider "${provider.name}" requires a sharedSecret`);
   }
@@ -105,6 +107,8 @@ function createHandoffAdapter(provider, { issuer }) {
     kind: "handoff",
     displayName: provider.displayName || provider.name,
     autoCreateUsers: provider.autoCreateUsers !== false,
+    subjectMode: provider.subjectMode || "local",
+    subjectFormat,
 
     buildStartUrl({ state, returnTo }) {
       const url = new URL(provider.startUrl);
@@ -132,8 +136,15 @@ function createHandoffAdapter(provider, { issuer }) {
         throw invalidRequest("The sign-in ticket is not addressed to this issuer");
       }
 
-      const subject = String(payload.sub || "").trim();
+      const rawSubject = payload.sub;
+      const subject = String(rawSubject || "").trim();
       if (!subject) throw invalidRequest("The sign-in ticket does not identify a user");
+      if (
+        subjectFormat === "uuid" &&
+        (typeof rawSubject !== "string" || rawSubject !== subject || !UUID_PATTERN.test(subject))
+      ) {
+        throw invalidRequest("The sign-in ticket subject must be a UUID");
+      }
 
       if (payload.username !== undefined && payload.username !== null && typeof payload.username !== "string") {
         throw invalidRequest("The sign-in ticket username is not valid");
@@ -245,6 +256,67 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
     }
   }
 
+  function subjectConflict() {
+    return loginRequired("This upstream identity conflicts with an existing account");
+  }
+
+  /**
+   * Earlier handoff deployments created a random issuer-local account ID. When
+   * a trusted upstream is configured as the canonical subject source, move an
+   * existing linked account to that verified subject before any new session is
+   * issued. The schema's user foreign keys cascade on update; stale browser and
+   * token state is invalidated explicitly so an old subject fails closed.
+   */
+  async function migrateLinkedAccountSubject(adapter, claims, account) {
+    if (adapter.subjectMode !== "upstream" || account.id === claims.subject) {
+      return { account, migrated: false };
+    }
+
+    try {
+      await prisma.$transaction(async (database) => {
+        const identity = await database.externalIdentity.findUnique({
+          where: { provider_subject: { provider: adapter.name, subject: claims.subject } }
+        });
+        if (!identity) throw loginRequired("That account is no longer available");
+        if (identity.userId === claims.subject) return;
+
+        const conflictingAccount = await database.user.findUnique({
+          where: { id: claims.subject },
+          select: { id: true }
+        });
+        if (conflictingAccount && conflictingAccount.id !== identity.userId) throw subjectConflict();
+
+        const timestamp = now();
+        await database.authorizationCode.updateMany({
+          where: { userId: identity.userId, usedAt: null },
+          data: { usedAt: timestamp }
+        });
+        await database.refreshToken.updateMany({
+          where: { userId: identity.userId, revokedAt: null },
+          data: { revokedAt: timestamp }
+        });
+        await database.oidcSession.updateMany({
+          where: { userId: identity.userId, revokedAt: null },
+          data: { revokedAt: timestamp, revocationReason: "subject_migrated" }
+        });
+        await database.session.deleteMany({ where: { userId: identity.userId } });
+
+        const moved = await database.user.updateMany({
+          where: { id: identity.userId },
+          data: { id: claims.subject }
+        });
+        if (moved.count !== 1) throw loginRequired("That account is no longer available");
+      });
+    } catch (error) {
+      if (error?.code === "P2002") throw subjectConflict();
+      throw error;
+    }
+
+    const migrated = await accounts.findById(claims.subject);
+    if (!migrated) throw loginRequired("That account is no longer available");
+    return { account: migrated, migrated: true };
+  }
+
   /**
    * Resolves upstream claims to a local account.
    *
@@ -260,7 +332,7 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
     });
 
     if (existing) {
-      const account = await accounts.findById(existing.userId);
+      let account = await accounts.findById(existing.userId);
       if (!account) {
         // The identity outlived its account. Cascade delete should prevent this;
         // if it happens, refuse rather than silently creating a new account for
@@ -270,6 +342,9 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
       if (account.status === accounts.STATUS.DISABLED) {
         throw loginRequired("That account has been disabled");
       }
+
+      const subjectMigration = await migrateLinkedAccountSubject(adapter, claims, account);
+      account = subjectMigration.account;
 
       // Refresh the non-authoritative profile hints and attributes on each login
       // so a change upstream propagates.
@@ -291,7 +366,7 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
       if (Object.keys(claims.attributes || {}).length || claims.username || account.attributes?.[EXTERNAL_USERNAME_ATTRIBUTE]) {
         await accounts.setAttributes({ userId: account.id, attributes });
       }
-      return { account: await accounts.findById(account.id), created: false };
+      return { account: await accounts.findById(account.id), created: false, migrated: subjectMigration.migrated };
     }
 
     if (!adapter.autoCreateUsers) {
@@ -323,7 +398,7 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
       ipAddress,
       userAgent
     });
-    return { account, created: true };
+    return { account, created: true, migrated: false };
   }
 
   /**
@@ -337,16 +412,22 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
   async function createLinkedAccount(adapter, claims) {
     const timestamp = now();
     const email = claims.email || `${adapter.name}-${claims.subject}@external.invalid`;
-    const userId = randomId();
+    const userId = adapter.subjectMode === "upstream" ? claims.subject : randomId();
+    if (adapter.subjectMode === "upstream") {
+      const conflictingAccount = await accounts.findById(userId);
+      if (conflictingAccount) throw subjectConflict();
+    }
     const attributes = {
       ...(claims.attributes || {}),
       ...(claims.username ? { [EXTERNAL_USERNAME_ATTRIBUTE]: claims.username } : {})
     };
 
-    const record = await prisma.user.create({
-      data: {
-        id: userId,
-        email: email.toLowerCase(),
+    let record;
+    try {
+      record = await prisma.user.create({
+        data: {
+          id: userId,
+          email: email.toLowerCase(),
         // Trusting the upstream's `email_verified` is a deployment-level
         // decision: the shared secret means the assertion is authentic, and the
         // operator configured this provider precisely because they trust it.
@@ -356,21 +437,25 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
         picture: claims.picture,
         status: accounts.STATUS.ACTIVE,
         attributesJson: Object.keys(attributes).length ? encodeJson(attributes) : null,
-        externalIdentities: {
-          create: {
-            id: randomId(),
-            provider: adapter.name,
-            subject: claims.subject,
-            profileJson: encodeJson({
-              email: claims.email,
-              username: claims.username,
-              name: claims.name,
-              picture: claims.picture
-            })
+          externalIdentities: {
+            create: {
+              id: randomId(),
+              provider: adapter.name,
+              subject: claims.subject,
+              profileJson: encodeJson({
+                email: claims.email,
+                username: claims.username,
+                name: claims.name,
+                picture: claims.picture
+              })
+            }
           }
         }
-      }
-    });
+      });
+    } catch (error) {
+      if (error?.code === "P2002" && adapter.subjectMode === "upstream") throw subjectConflict();
+      throw error;
+    }
     return accounts.toAccount(record);
   }
 
@@ -381,17 +466,17 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
     const adapter = require_(provider);
     const claims = await adapter.verify({ ticket, state, now: now() });
     await consumeTicket({ provider: adapter.name, jti: claims.jti, expiresAt: claims.expiresAt });
-    const { account, created } = await resolveAccount(adapter, claims, { ipAddress, userAgent });
+    const { account, created, migrated } = await resolveAccount(adapter, claims, { ipAddress, userAgent });
     await auditLog?.record({
       action: "account.external.login",
       actorUserId: account.id,
       targetType: "user",
       targetId: account.id,
-      metadata: { provider: adapter.name, created },
+      metadata: { provider: adapter.name, created, migrated },
       ipAddress,
       userAgent
     });
-    return { account, created, provider: adapter.name };
+    return { account, created, migrated, provider: adapter.name };
   }
 
   /**

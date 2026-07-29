@@ -13,6 +13,7 @@ const { createAccountService } = require("../../src/services/accountService");
 const { createAuditService } = require("../../src/services/auditService");
 const { createBackchannelService } = require("../../src/services/backchannelService");
 const { createClientService } = require("../../src/services/clientService");
+const { createExternalIdentityService } = require("../../src/services/externalIdentityService");
 const { createKeyService } = require("../../src/services/keyService");
 const { createProviderService } = require("../../src/services/providerService");
 const { createSessionService } = require("../../src/services/sessionService");
@@ -41,12 +42,22 @@ function basicAuth(clientId, clientSecret) {
   return { authorization: `Basic ${encoded}` };
 }
 
+const HANDOFF_SHARED_SECRET = "handoff-test-secret-at-least-32-characters-long";
+
+function signHandoffTicket(payload) {
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = crypto.createHmac("sha256", HANDOFF_SHARED_SECRET).update(`${header}.${body}`).digest("base64url");
+  return `${header}.${body}.${signature}`;
+}
+
 describe("OAuth 2.0 and OpenID Connect provider", () => {
   let db;
   let prisma;
   let config;
   let scopeRegistry;
   let accounts;
+  let external;
   let sessions;
   let clients;
   let keys;
@@ -71,6 +82,15 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
       OAUTH_CLIENT_REQUIRE_APPROVAL: "false",
       OAUTH_DYNAMIC_REGISTRATION_ENABLED: "true",
       OAUTH_REGISTRATION_ACCESS_TOKEN: "registration-token-at-least-32-characters",
+      OAUTH_EXTERNAL_IDENTITY_PROVIDERS: JSON.stringify([
+        {
+          name: "knight",
+          kind: "handoff",
+          startUrl: "https://knight.test/oauth2/handoff/start",
+          sharedSecret: HANDOFF_SHARED_SECRET,
+          subjectMode: "upstream"
+        }
+      ]),
       // A deployment-specific scope, to prove the extension path works through
       // configuration alone rather than through anything in the core.
       OAUTH_CUSTOM_SCOPES: JSON.stringify([
@@ -96,6 +116,7 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     const auditLog = createAuditService({ prisma, logger: { error() {} } });
     scopeRegistry = createScopeRegistry({ customScopes: config.customScopes });
     accounts = createAccountService({ prisma, config, auditLog });
+    external = createExternalIdentityService({ prisma, config, accounts, auditLog });
     sessions = createSessionService({ prisma, config, auditLog });
     clients = createClientService({ prisma, config, scopeRegistry, auditLog });
     keys = createKeyService({ prisma, config: config.signing });
@@ -2371,6 +2392,56 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     assert.equal(claims.email_verified, false);
     assert.equal(claims.name, "Ada Lovelace");
     assert.equal(claims.preferred_username, "owner");
+  });
+
+  it("keeps a verified handoff UUID in every OAuth subject output", async () => {
+    const subject = crypto.randomUUID();
+    const seconds = Math.floor(Date.now() / 1000);
+    const ticketClaims = {
+      iss: "knight",
+      aud: config.issuer,
+      sub: subject,
+      iat: seconds,
+      exp: seconds + 60,
+      jti: crypto.randomUUID(),
+      state: "handoff-subject-contract",
+      email: `handoff-${subject}@example.test`,
+      email_verified: true,
+      name: "Handoff Subject"
+    };
+    const handoff = await external.completeCallback({
+      provider: "knight",
+      ticket: signHandoffTicket(ticketClaims),
+      state: ticketClaims.state
+    });
+    assert.equal(handoff.account.id, subject);
+
+    const browserSession = (await sessions.login({ userId: handoff.account.id })).session;
+    const flow = await authorize(
+      { scope: "openid profile email" },
+      { authorizationAccount: handoff.account, browserSession }
+    );
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+    const userinfo = await provider.userinfo({ accessToken: tokens.access_token });
+    const introspection = await provider.introspect({ headers, body: { token: tokens.access_token } });
+
+    for (const emittedSubject of [
+      decodeJwt(tokens.id_token).payload.sub,
+      decodeJwt(tokens.access_token).payload.sub,
+      userinfo.sub,
+      introspection.sub
+    ]) {
+      assert.equal(emittedSubject, subject);
+    }
   });
 
   it("returns a handoff username without using it as the local account key", async () => {

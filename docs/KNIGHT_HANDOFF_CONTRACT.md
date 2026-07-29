@@ -17,6 +17,31 @@ receipts.
 | Knight OAuth | OAuth browser session, `state`, safe post-login path, callback validation, replay ledger, local account link, OAuth authorization and tokens | Knight credentials or `knight-app` sessions |
 | `knight-app` | Existing Knight login, upstream user lookup, ticket signing, exact callback/client allowlists | OAuth session, OAuth grants, authorization codes, access tokens, or refresh tokens |
 
+## Canonical subject and handoff-only policy
+
+For the Knight deployment, one user is identified everywhere by the same UUID:
+
+```
+knight-app User.id == handoff ticket sub == OAuth sub == Credit Core subject
+```
+
+The Knight provider must use `subjectMode: "upstream"` and
+`subjectFormat: "uuid"`. OAuth requires the canonical lower-case UUID form and
+rejects a malformed subject before it can create or migrate an account. New
+handoff accounts use the verified ticket subject as their OAuth account ID. A
+pre-existing linked OAuth account with a random ID is migrated transactionally
+on its next valid handoff:
+unspent codes are consumed, refresh and OIDC sessions are revoked, browser
+sessions are deleted, then the account ID moves. If another account already owns
+that UUID, OAuth rejects the handoff without changing either account.
+
+Knight's candidate configuration is handoff-only: set
+`OAUTH_REGISTRATION_ENABLED=false` and `OAUTH_LOCAL_LOGIN_ENABLED=false` with
+the Knight external provider configured. The issuer refuses to boot if this
+combination leaves registration enabled or provides no external identity route.
+Changing this policy does not itself revoke existing local browser sessions;
+candidate rollout preflight must revoke them before enabling the new policy.
+
 ## Browser flow
 
 1. OAuth begins the handoff at `GET /login/external/:provider`.
@@ -64,7 +89,7 @@ by an untrusted header.
 | --- | --- |
 | `iss` | Exact configured provider name |
 | `aud` | Exact OAuth issuer string, or an array containing that exact string |
-| `sub` | Stable, opaque Knight user identifier; never an email address |
+| `sub` | Stable UUID Knight user identifier; never an email address; becomes the OAuth and Credit Core subject unchanged |
 | `iat` | JWT NumericDate for ticket issuance |
 | `exp` | JWT NumericDate for ticket expiry |
 | `jti` | Unique, high-entropy ticket identifier |

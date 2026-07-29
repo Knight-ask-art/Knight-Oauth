@@ -170,6 +170,46 @@ describe("the HTTP surface", () => {
     await db?.close();
   });
 
+  it("renders only the configured provider in handoff-only mode", async () => {
+    const isolated = await withDatabase();
+    try {
+      const handoffOnly = loadEnv({
+        PUBLIC_BASE_URL: "http://127.0.0.1:3010",
+        DATABASE_PROVIDER: isolated.provider,
+        DATABASE_URL: isolated.url,
+        OAUTH_ALLOW_GENERATED_KEYS: "true",
+        OAUTH_REGISTRATION_ENABLED: "false",
+        OAUTH_LOCAL_LOGIN_ENABLED: "false",
+        OAUTH_EXTERNAL_IDENTITY_PROVIDERS: JSON.stringify([
+          {
+            name: "knight",
+            kind: "handoff",
+            displayName: "Knight",
+            startUrl: "https://knight.test/oauth2/handoff/start",
+            sharedSecret: "handoff-only-test-secret-at-least-32-characters",
+            subjectMode: "upstream"
+          }
+        ])
+      });
+      const handoffApp = createApp({
+        env: handoffOnly,
+        prisma: isolated.prisma,
+        logger: { error() {}, warn() {}, info() {} },
+        auditLog: createAuditService({ prisma: isolated.prisma, logger: { error() {} } })
+      });
+
+      const page = await request(handoffApp).get("/login").expect(200);
+      assert.match(page.text, /Continue with Knight/);
+      assert.doesNotMatch(page.text, /name="password"/);
+      assert.doesNotMatch(page.text, /Forgot your password/);
+      await request(handoffApp).get("/register").expect(403);
+      await request(handoffApp).get("/forgot-password").expect(404);
+      await request(handoffApp).get("/reset-password").expect(404);
+    } finally {
+      await isolated.close();
+    }
+  });
+
   /** Signs in through the real form and returns the agent holding the cookies. */
   async function signIn(email) {
     const agent = request.agent(app);

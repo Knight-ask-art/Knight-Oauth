@@ -100,6 +100,7 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
   const minPasswordLength = config?.accounts?.minPasswordLength ?? 12;
   const requireEmailVerification = Boolean(config?.accounts?.requireEmailVerification);
   const registrationEnabled = config?.accounts?.registrationEnabled !== false;
+  const localLoginEnabled = config?.accounts?.localLoginEnabled !== false;
   const firstUserIsAdmin = config?.accounts?.firstUserIsAdmin !== false;
 
   // Prisma compiles `contains` to LIKE, and the two supported databases do not
@@ -167,7 +168,7 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
    * credential — is worse.
    */
   async function register({ email, password, username, name, ipAddress, userAgent } = {}) {
-    if (!registrationEnabled) {
+    if (!registrationEnabled || !localLoginEnabled) {
       throw appError("Registration is closed on this server", 403);
     }
     const normalizedEmail = assertValidEmail(email);
@@ -281,6 +282,17 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
    * latency alone reveals which addresses are registered.
    */
   async function authenticate({ identifier, password, ipAddress, userAgent } = {}) {
+    if (!localLoginEnabled) {
+      await auditLog?.record({
+        action: "account.login.refused",
+        targetType: "user",
+        metadata: { reason: "local_login_disabled" },
+        ipAddress,
+        userAgent
+      });
+      return { ok: false, reason: "local_login_disabled", account: null };
+    }
+
     const record = await findRecordByIdentifier(identifier);
 
     if (!record || !record.passwordHash) {
@@ -455,6 +467,8 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
    * registered; only a real account gets mail.
    */
   async function requestPasswordReset({ email, ttlSeconds = 60 * 60, ipAddress, userAgent } = {}) {
+    if (!localLoginEnabled) return { sent: false };
+
     const normalized = normalizeEmail(email);
     const record = normalized ? await prisma.user.findUnique({ where: { email: normalized } }) : null;
 
@@ -504,6 +518,8 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
    * requester's own session and force a fresh login.
    */
   async function resetPassword({ token, password, ipAddress, userAgent } = {}) {
+    if (!localLoginEnabled) return { ok: false, reason: "local_login_disabled", account: null };
+
     const raw = String(token || "").trim();
     if (!raw) return { ok: false, reason: "missing_token", account: null };
 
@@ -587,6 +603,8 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
 
   /** Changes a password for a signed-in user, which requires the current one. */
   async function changePassword({ userId, currentPassword, newPassword, ipAddress, userAgent } = {}) {
+    if (!localLoginEnabled) return { ok: false, reason: "local_login_disabled" };
+
     const record = await prisma.user.findUnique({ where: { id: String(userId || "") } });
     if (!record) return { ok: false, reason: "unknown_account" };
 
@@ -870,6 +888,9 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
     verifyEmail,
     get registrationEnabled() {
       return registrationEnabled;
+    },
+    get localLoginEnabled() {
+      return localLoginEnabled;
     },
     get requireEmailVerification() {
       return requireEmailVerification;

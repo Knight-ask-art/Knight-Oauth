@@ -151,6 +151,7 @@ const NOTICES = {
   </form>
 </section>
 
+<% if (localLoginEnabled) { %>
 <section class="card">
   <h2>Password</h2>
   <% if (!account.hasPassword) { %>
@@ -175,4 +176,5 @@ const NOTICES = {
     <div class="form-actions"><button type="submit">Change password</button></div>
   </form>
 </section>
+<% } %>
 <%- include("partials/foot", { branding }) %>
