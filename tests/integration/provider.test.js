@@ -61,6 +61,7 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
   let sessions;
   let clients;
   let keys;
+  let backchannel;
   let provider;
   let backchannelPosts;
 
@@ -116,13 +117,12 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     const auditLog = createAuditService({ prisma, logger: { error() {} } });
     scopeRegistry = createScopeRegistry({ customScopes: config.customScopes });
     accounts = createAccountService({ prisma, config, auditLog });
-    external = createExternalIdentityService({ prisma, config, accounts, auditLog });
     sessions = createSessionService({ prisma, config, auditLog });
     clients = createClientService({ prisma, config, scopeRegistry, auditLog });
     keys = createKeyService({ prisma, config: config.signing });
 
     backchannelPosts = [];
-    const backchannel = createBackchannelService({
+    backchannel = createBackchannelService({
       prisma,
       config,
       clients,
@@ -133,6 +133,7 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
         return { status: 200 };
       }
     });
+    external = createExternalIdentityService({ prisma, config, accounts, auditLog, backchannel });
 
     provider = createProviderService({
       prisma,
@@ -2442,6 +2443,89 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     ]) {
       assert.equal(emittedSubject, subject);
     }
+  });
+
+  it("queues an old-subject back-channel logout and a redacted audit trail during migration", async () => {
+    const legacyId = crypto.randomUUID();
+    const subject = crypto.randomUUID();
+    const clientId = `subject-migration-${crypto.randomUUID()}`;
+    await prisma.oAuthClient.create({
+      data: {
+        id: crypto.randomUUID(),
+        clientId,
+        name: "Subject migration relying party",
+        redirectUris: "https://subject-migration.test/callback",
+        backchannelLogoutUri: "https://subject-migration.test/backchannel-logout",
+        allowedScopes: "openid",
+        status: "APPROVED"
+      }
+    });
+    await prisma.user.create({
+      data: {
+        id: legacyId,
+        email: `legacy-${legacyId}@example.test`,
+        passwordHash: null,
+        status: accounts.STATUS.ACTIVE,
+        externalIdentities: {
+          create: { id: crypto.randomUUID(), provider: "knight", subject }
+        }
+      }
+    });
+    const browserSession = (await sessions.login({ userId: legacyId })).session;
+    const oidcSession = await prisma.oidcSession.create({
+      data: {
+        id: crypto.randomUUID(),
+        sessionId: browserSession.id,
+        clientId,
+        userId: legacyId,
+        authTime: browserSession.authTime,
+        lastSeenAt: new Date()
+      }
+    });
+
+    const seconds = Math.floor(Date.now() / 1000);
+    const ticketClaims = {
+      iss: "knight",
+      aud: config.issuer,
+      sub: subject,
+      iat: seconds,
+      exp: seconds + 60,
+      jti: crypto.randomUUID(),
+      state: "subject-migration-state"
+    };
+    const result = await external.completeCallback({
+      provider: "knight",
+      ticket: signHandoffTicket(ticketClaims),
+      state: ticketClaims.state
+    });
+
+    assert.equal(result.migrated, true);
+    assert.equal(await accounts.findById(legacyId), null);
+    assert.equal(result.account.id, subject);
+    const queued = await prisma.backchannelLogout.findFirst({ where: { sessionId: oidcSession.id } });
+    assert.equal(queued.clientId, clientId);
+    assert.equal(queued.userId, subject);
+    assert.equal(queued.subject, legacyId);
+    assert.equal(queued.reason, "subject_migrated");
+
+    const migrationAudit = await prisma.auditLog.findFirst({
+      where: { action: "account.external.subject_migrated", targetId: subject },
+      orderBy: { createdAt: "desc" }
+    });
+    const auditMetadata = JSON.parse(migrationAudit.metadataJson);
+    assert.equal(auditMetadata.provider, "knight");
+    assert.match(auditMetadata.previousSubjectFingerprint, /^[A-Za-z0-9_-]{43}$/);
+    assert.match(auditMetadata.canonicalSubjectFingerprint, /^[A-Za-z0-9_-]{43}$/);
+    assert.notEqual(auditMetadata.previousSubjectFingerprint, legacyId);
+    assert.doesNotMatch(migrationAudit.metadataJson, new RegExp(legacyId));
+
+    const postsBefore = backchannelPosts.length;
+    await backchannel.deliver(queued);
+    assert.equal(backchannelPosts.length, postsBefore + 1);
+    const logoutToken = new URLSearchParams(backchannelPosts.at(-1).body).get("logout_token");
+    const logoutClaims = decodeJwt(logoutToken).payload;
+    assert.equal(logoutClaims.sub, legacyId);
+    assert.equal(logoutClaims.sid, oidcSession.id);
   });
 
   it("returns a handoff username without using it as the local account key", async () => {

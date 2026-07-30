@@ -32,8 +32,13 @@ handoff accounts use the verified ticket subject as their OAuth account ID. A
 pre-existing linked OAuth account with a random ID is migrated transactionally
 on its next valid handoff:
 unspent codes are consumed, refresh and OIDC sessions are revoked, browser
-sessions are deleted, then the account ID moves. If another account already owns
-that UUID, OAuth rejects the handoff without changing either account.
+sessions are deleted, durable per-client back-channel logout records are
+queued, then the account ID moves. The same atomic rule applies when a legacy
+account first links the Knight provider, so it cannot retain a temporary random
+OAuth subject. A successful move records `account.external.subject_migrated`
+with HMAC fingerprints rather than the prior raw subject. If another account
+already owns that UUID, OAuth rejects the handoff without changing either
+account.
 
 Knight's candidate configuration is handoff-only: set
 `OAUTH_REGISTRATION_ENABLED=false` and `OAUTH_LOCAL_LOGIN_ENABLED=false` with

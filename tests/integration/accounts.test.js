@@ -1010,6 +1010,88 @@ describe("local accounts and external identity", () => {
     assert.ok((await prisma.oidcSession.findUnique({ where: { id: credentials.oidcSessionId } })).revokedAt);
   });
 
+  it("migrates an account in the same transaction that creates its canonical provider link", async () => {
+    const legacyID = crypto.randomUUID();
+    const subject = crypto.randomUUID();
+    await prisma.user.create({
+      data: {
+        id: legacyID,
+        email: "legacy-link-migration@example.com",
+        passwordHash: null,
+        status: accounts.STATUS.ACTIVE
+      }
+    });
+    const credentials = await seedRevocableCredentials({ prisma, sessions, userId: legacyID });
+    const payload = ticketPayload({ sub: subject });
+    const result = await external.link({
+      provider: "upstream",
+      ticket: signTicket(payload),
+      state: payload.state,
+      userId: legacyID
+    });
+
+    assert.deepEqual(result, { linked: true, alreadyLinked: false, migrated: true });
+    assert.equal(await accounts.findById(legacyID), null);
+    assert.ok(await accounts.findById(subject));
+    assert.equal(
+      (await prisma.externalIdentity.findUnique({ where: { provider_subject: { provider: "upstream", subject } } })).userId,
+      subject
+    );
+    assert.equal(await prisma.session.findUnique({ where: { id: credentials.sessionId } }), null);
+    assert.ok((await prisma.refreshToken.findUnique({ where: { id: credentials.refreshTokenId } })).revokedAt);
+    assert.ok((await prisma.oidcSession.findUnique({ where: { id: credentials.oidcSessionId } })).revokedAt);
+  });
+
+  it("rolls a subject migration back when the durable logout queue cannot be written", async () => {
+    const legacyID = crypto.randomUUID();
+    const subject = crypto.randomUUID();
+    await prisma.user.create({
+      data: {
+        id: legacyID,
+        email: "legacy-migration-outbox-failure@example.com",
+        passwordHash: null,
+        status: accounts.STATUS.ACTIVE,
+        externalIdentities: {
+          create: {
+            id: crypto.randomUUID(),
+            provider: "upstream",
+            subject
+          }
+        }
+      }
+    });
+    const credentials = await seedRevocableCredentials({ prisma, sessions, userId: legacyID });
+    const failingExternal = createExternalIdentityService({
+      prisma,
+      config,
+      accounts,
+      backchannel: {
+        async enqueue() {
+          throw new Error("injected backchannel outbox failure");
+        }
+      }
+    });
+    const payload = ticketPayload({ sub: subject });
+
+    await assert.rejects(
+      failingExternal.completeCallback({
+        provider: "upstream",
+        ticket: signTicket(payload),
+        state: payload.state
+      }),
+      /injected backchannel outbox failure/
+    );
+    assert.ok(await accounts.findById(legacyID));
+    assert.equal(await accounts.findById(subject), null);
+    assert.equal(
+      (await prisma.externalIdentity.findUnique({ where: { provider_subject: { provider: "upstream", subject } } })).userId,
+      legacyID
+    );
+    assert.ok(await prisma.session.findUnique({ where: { id: credentials.sessionId } }));
+    assert.equal((await prisma.refreshToken.findUnique({ where: { id: credentials.refreshTokenId } })).revokedAt, null);
+    assert.equal((await prisma.oidcSession.findUnique({ where: { id: credentials.oidcSessionId } })).revokedAt, null);
+  });
+
   it("fails closed when a legacy linked account conflicts with another account's canonical subject", async () => {
     const legacyID = crypto.randomUUID();
     const subject = crypto.randomUUID();
