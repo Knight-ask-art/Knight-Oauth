@@ -260,7 +260,8 @@ describe("local accounts and external identity", () => {
           kind: "handoff",
           displayName: "Upstream Site",
           startUrl: "https://upstream.test/oauth2/handoff/start",
-          sharedSecret: SHARED_SECRET
+          sharedSecret: SHARED_SECRET,
+          subjectMode: "upstream"
         }
       ])
     });
@@ -348,6 +349,35 @@ describe("local accounts and external identity", () => {
     });
     assert.equal(byUsername.ok, true);
     assert.equal(byUsername.account.id, byEmail.account.id);
+  });
+
+  it("blocks every local-password entry point in handoff-only mode", async () => {
+    const handoffOnly = createAccountService({
+      prisma,
+      config: {
+        ...config,
+        accounts: { ...config.accounts, localLoginEnabled: false }
+      },
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+
+    assert.deepEqual(
+      await handoffOnly.authenticate({ identifier: "first@example.com", password: "correct-horse-battery-staple" }),
+      { ok: false, reason: "local_login_disabled", account: null }
+    );
+    assert.deepEqual(await handoffOnly.requestPasswordReset({ email: "first@example.com" }), { sent: false });
+    assert.deepEqual(
+      await handoffOnly.resetPassword({ token: "still-not-usable", password: "replacement-password" }),
+      { ok: false, reason: "local_login_disabled", account: null }
+    );
+    assert.deepEqual(
+      await handoffOnly.changePassword({
+        userId: (await accounts.findByEmail("first@example.com")).id,
+        currentPassword: "correct-horse-battery-staple",
+        newPassword: "replacement-password"
+      }),
+      { ok: false, reason: "local_login_disabled" }
+    );
   });
 
   it("refuses a wrong password and an unknown account identically", async () => {
@@ -790,26 +820,56 @@ describe("local accounts and external identity", () => {
     }
   });
 
-  it("creates a local account from a valid handoff ticket", async () => {
-    const ticket = signTicket(
-      ticketPayload({
+  it("uses a verified upstream subject for a new handoff account", async () => {
+    const payload = ticketPayload({
+        sub: crypto.randomUUID(),
         email: "upstream@example.com",
         username: "upstream-user",
         name: "Upstream User",
         attributes: { knight_uid: 4242 }
-      })
-    );
+      });
+    const ticket = signTicket(payload);
     const result = await external.completeCallback({
       provider: "upstream",
       ticket,
       state: "handoff-state-value"
     });
     assert.equal(result.created, true);
+    assert.equal(result.migrated, false);
+    assert.equal(result.account.id, payload.sub);
     assert.equal(result.account.email, "upstream@example.com");
     assert.equal(result.account.hasPassword, false);
     // Attributes are what a custom scope releases as a claim.
     assert.equal(result.account.attributes.knight_uid, 4242);
     assert.equal(result.account.attributes.external_preferred_username, "upstream-user");
+  });
+
+  it("rejects a malformed subject when a handoff provider requires UUID subjects", async () => {
+    const strictConfig = loadEnv({
+      OAUTH_EXTERNAL_IDENTITY_PROVIDERS: JSON.stringify([
+        {
+          name: "uuid-upstream",
+          kind: "handoff",
+          displayName: "UUID Upstream",
+          startUrl: "https://upstream.test/oauth2/handoff/start",
+          sharedSecret: SHARED_SECRET,
+          subjectMode: "upstream",
+          subjectFormat: "uuid"
+        }
+      ])
+    });
+    const strictExternal = createExternalIdentityService({ prisma, config: strictConfig, accounts });
+    for (const sub of ["not-a-uuid", crypto.randomUUID().toUpperCase(), ` ${crypto.randomUUID()}`]) {
+      const payload = ticketPayload({ iss: "uuid-upstream", sub });
+      await assert.rejects(
+        strictExternal.completeCallback({
+          provider: "uuid-upstream",
+          ticket: signTicket(payload),
+          state: payload.state
+        }),
+        /subject must be a UUID/
+      );
+    }
   });
 
   it("rejects a replayed handoff ticket", async () => {
@@ -909,6 +969,160 @@ describe("local accounts and external identity", () => {
     });
     assert.equal(second.created, false);
     assert.equal(second.account.id, first.account.id);
+  });
+
+  it("migrates a legacy random linked user ID to its verified upstream subject", async () => {
+    const legacyID = crypto.randomUUID();
+    const subject = crypto.randomUUID();
+    await prisma.user.create({
+      data: {
+        id: legacyID,
+        email: "legacy-linked-subject@example.com",
+        passwordHash: null,
+        status: accounts.STATUS.ACTIVE,
+        externalIdentities: {
+          create: {
+            id: crypto.randomUUID(),
+            provider: "upstream",
+            subject
+          }
+        }
+      }
+    });
+    const credentials = await seedRevocableCredentials({ prisma, sessions, userId: legacyID });
+    const payload = ticketPayload({ subject, sub: subject });
+    const result = await external.completeCallback({
+      provider: "upstream",
+      ticket: signTicket(payload),
+      state: payload.state
+    });
+
+    assert.equal(result.created, false);
+    assert.equal(result.migrated, true);
+    assert.equal(result.account.id, subject);
+    assert.equal(await accounts.findById(legacyID), null);
+    assert.equal(
+      (await prisma.externalIdentity.findUnique({ where: { provider_subject: { provider: "upstream", subject } } })).userId,
+      subject
+    );
+    assert.equal(await prisma.session.findUnique({ where: { id: credentials.sessionId } }), null);
+    assert.ok((await prisma.refreshToken.findUnique({ where: { id: credentials.refreshTokenId } })).revokedAt);
+    assert.ok((await prisma.oidcSession.findUnique({ where: { id: credentials.oidcSessionId } })).revokedAt);
+  });
+
+  it("migrates an account in the same transaction that creates its canonical provider link", async () => {
+    const legacyID = crypto.randomUUID();
+    const subject = crypto.randomUUID();
+    await prisma.user.create({
+      data: {
+        id: legacyID,
+        email: "legacy-link-migration@example.com",
+        passwordHash: null,
+        status: accounts.STATUS.ACTIVE
+      }
+    });
+    const credentials = await seedRevocableCredentials({ prisma, sessions, userId: legacyID });
+    const payload = ticketPayload({ sub: subject });
+    const result = await external.link({
+      provider: "upstream",
+      ticket: signTicket(payload),
+      state: payload.state,
+      userId: legacyID
+    });
+
+    assert.deepEqual(result, { linked: true, alreadyLinked: false, migrated: true });
+    assert.equal(await accounts.findById(legacyID), null);
+    assert.ok(await accounts.findById(subject));
+    assert.equal(
+      (await prisma.externalIdentity.findUnique({ where: { provider_subject: { provider: "upstream", subject } } })).userId,
+      subject
+    );
+    assert.equal(await prisma.session.findUnique({ where: { id: credentials.sessionId } }), null);
+    assert.ok((await prisma.refreshToken.findUnique({ where: { id: credentials.refreshTokenId } })).revokedAt);
+    assert.ok((await prisma.oidcSession.findUnique({ where: { id: credentials.oidcSessionId } })).revokedAt);
+  });
+
+  it("rolls a subject migration back when the durable logout queue cannot be written", async () => {
+    const legacyID = crypto.randomUUID();
+    const subject = crypto.randomUUID();
+    await prisma.user.create({
+      data: {
+        id: legacyID,
+        email: "legacy-migration-outbox-failure@example.com",
+        passwordHash: null,
+        status: accounts.STATUS.ACTIVE,
+        externalIdentities: {
+          create: {
+            id: crypto.randomUUID(),
+            provider: "upstream",
+            subject
+          }
+        }
+      }
+    });
+    const credentials = await seedRevocableCredentials({ prisma, sessions, userId: legacyID });
+    const failingExternal = createExternalIdentityService({
+      prisma,
+      config,
+      accounts,
+      backchannel: {
+        async enqueue() {
+          throw new Error("injected backchannel outbox failure");
+        }
+      }
+    });
+    const payload = ticketPayload({ sub: subject });
+
+    await assert.rejects(
+      failingExternal.completeCallback({
+        provider: "upstream",
+        ticket: signTicket(payload),
+        state: payload.state
+      }),
+      /injected backchannel outbox failure/
+    );
+    assert.ok(await accounts.findById(legacyID));
+    assert.equal(await accounts.findById(subject), null);
+    assert.equal(
+      (await prisma.externalIdentity.findUnique({ where: { provider_subject: { provider: "upstream", subject } } })).userId,
+      legacyID
+    );
+    assert.ok(await prisma.session.findUnique({ where: { id: credentials.sessionId } }));
+    assert.equal((await prisma.refreshToken.findUnique({ where: { id: credentials.refreshTokenId } })).revokedAt, null);
+    assert.equal((await prisma.oidcSession.findUnique({ where: { id: credentials.oidcSessionId } })).revokedAt, null);
+  });
+
+  it("fails closed when a legacy linked account conflicts with another account's canonical subject", async () => {
+    const legacyID = crypto.randomUUID();
+    const subject = crypto.randomUUID();
+    await prisma.user.create({
+      data: { id: subject, email: "canonical-subject-owner@example.com", passwordHash: null, status: accounts.STATUS.ACTIVE }
+    });
+    await prisma.user.create({
+      data: {
+        id: legacyID,
+        email: "legacy-subject-conflict@example.com",
+        passwordHash: null,
+        status: accounts.STATUS.ACTIVE,
+        externalIdentities: {
+          create: {
+            id: crypto.randomUUID(),
+            provider: "upstream",
+            subject
+          }
+        }
+      }
+    });
+    const payload = ticketPayload({ subject, sub: subject });
+    await assert.rejects(
+      external.completeCallback({ provider: "upstream", ticket: signTicket(payload), state: payload.state }),
+      /conflicts with an existing account/
+    );
+    assert.equal(
+      (await prisma.externalIdentity.findUnique({ where: { provider_subject: { provider: "upstream", subject } } })).userId,
+      legacyID
+    );
+    assert.equal(await prisma.consumedTicket.count({ where: { provider: "upstream", jti: payload.jti } }), 1);
   });
 
   it("refuses to unlink the only way into an account", async () => {

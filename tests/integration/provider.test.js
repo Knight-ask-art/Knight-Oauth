@@ -13,6 +13,7 @@ const { createAccountService } = require("../../src/services/accountService");
 const { createAuditService } = require("../../src/services/auditService");
 const { createBackchannelService } = require("../../src/services/backchannelService");
 const { createClientService } = require("../../src/services/clientService");
+const { createExternalIdentityService } = require("../../src/services/externalIdentityService");
 const { createKeyService } = require("../../src/services/keyService");
 const { createProviderService } = require("../../src/services/providerService");
 const { createSessionService } = require("../../src/services/sessionService");
@@ -41,15 +42,26 @@ function basicAuth(clientId, clientSecret) {
   return { authorization: `Basic ${encoded}` };
 }
 
+const HANDOFF_SHARED_SECRET = "handoff-test-secret-at-least-32-characters-long";
+
+function signHandoffTicket(payload) {
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = crypto.createHmac("sha256", HANDOFF_SHARED_SECRET).update(`${header}.${body}`).digest("base64url");
+  return `${header}.${body}.${signature}`;
+}
+
 describe("OAuth 2.0 and OpenID Connect provider", () => {
   let db;
   let prisma;
   let config;
   let scopeRegistry;
   let accounts;
+  let external;
   let sessions;
   let clients;
   let keys;
+  let backchannel;
   let provider;
   let backchannelPosts;
 
@@ -71,6 +83,15 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
       OAUTH_CLIENT_REQUIRE_APPROVAL: "false",
       OAUTH_DYNAMIC_REGISTRATION_ENABLED: "true",
       OAUTH_REGISTRATION_ACCESS_TOKEN: "registration-token-at-least-32-characters",
+      OAUTH_EXTERNAL_IDENTITY_PROVIDERS: JSON.stringify([
+        {
+          name: "knight",
+          kind: "handoff",
+          startUrl: "https://knight.test/oauth2/handoff/start",
+          sharedSecret: HANDOFF_SHARED_SECRET,
+          subjectMode: "upstream"
+        }
+      ]),
       // A deployment-specific scope, to prove the extension path works through
       // configuration alone rather than through anything in the core.
       OAUTH_CUSTOM_SCOPES: JSON.stringify([
@@ -101,7 +122,7 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     keys = createKeyService({ prisma, config: config.signing });
 
     backchannelPosts = [];
-    const backchannel = createBackchannelService({
+    backchannel = createBackchannelService({
       prisma,
       config,
       clients,
@@ -112,6 +133,7 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
         return { status: 200 };
       }
     });
+    external = createExternalIdentityService({ prisma, config, accounts, auditLog, backchannel });
 
     provider = createProviderService({
       prisma,
@@ -2371,6 +2393,139 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     assert.equal(claims.email_verified, false);
     assert.equal(claims.name, "Ada Lovelace");
     assert.equal(claims.preferred_username, "owner");
+  });
+
+  it("keeps a verified handoff UUID in every OAuth subject output", async () => {
+    const subject = crypto.randomUUID();
+    const seconds = Math.floor(Date.now() / 1000);
+    const ticketClaims = {
+      iss: "knight",
+      aud: config.issuer,
+      sub: subject,
+      iat: seconds,
+      exp: seconds + 60,
+      jti: crypto.randomUUID(),
+      state: "handoff-subject-contract",
+      email: `handoff-${subject}@example.test`,
+      email_verified: true,
+      name: "Handoff Subject"
+    };
+    const handoff = await external.completeCallback({
+      provider: "knight",
+      ticket: signHandoffTicket(ticketClaims),
+      state: ticketClaims.state
+    });
+    assert.equal(handoff.account.id, subject);
+
+    const browserSession = (await sessions.login({ userId: handoff.account.id })).session;
+    const flow = await authorize(
+      { scope: "openid profile email" },
+      { authorizationAccount: handoff.account, browserSession }
+    );
+    const headers = basicAuth(confidential.clientId, confidentialSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+    const userinfo = await provider.userinfo({ accessToken: tokens.access_token });
+    const introspection = await provider.introspect({ headers, body: { token: tokens.access_token } });
+
+    for (const emittedSubject of [
+      decodeJwt(tokens.id_token).payload.sub,
+      decodeJwt(tokens.access_token).payload.sub,
+      userinfo.sub,
+      introspection.sub
+    ]) {
+      assert.equal(emittedSubject, subject);
+    }
+  });
+
+  it("queues an old-subject back-channel logout and a redacted audit trail during migration", async () => {
+    const legacyId = crypto.randomUUID();
+    const subject = crypto.randomUUID();
+    const clientId = `subject-migration-${crypto.randomUUID()}`;
+    await prisma.oAuthClient.create({
+      data: {
+        id: crypto.randomUUID(),
+        clientId,
+        name: "Subject migration relying party",
+        redirectUris: "https://subject-migration.test/callback",
+        backchannelLogoutUri: "https://subject-migration.test/backchannel-logout",
+        allowedScopes: "openid",
+        status: "APPROVED"
+      }
+    });
+    await prisma.user.create({
+      data: {
+        id: legacyId,
+        email: `legacy-${legacyId}@example.test`,
+        passwordHash: null,
+        status: accounts.STATUS.ACTIVE,
+        externalIdentities: {
+          create: { id: crypto.randomUUID(), provider: "knight", subject }
+        }
+      }
+    });
+    const browserSession = (await sessions.login({ userId: legacyId })).session;
+    const oidcSession = await prisma.oidcSession.create({
+      data: {
+        id: crypto.randomUUID(),
+        sessionId: browserSession.id,
+        clientId,
+        userId: legacyId,
+        authTime: browserSession.authTime,
+        lastSeenAt: new Date()
+      }
+    });
+
+    const seconds = Math.floor(Date.now() / 1000);
+    const ticketClaims = {
+      iss: "knight",
+      aud: config.issuer,
+      sub: subject,
+      iat: seconds,
+      exp: seconds + 60,
+      jti: crypto.randomUUID(),
+      state: "subject-migration-state"
+    };
+    const result = await external.completeCallback({
+      provider: "knight",
+      ticket: signHandoffTicket(ticketClaims),
+      state: ticketClaims.state
+    });
+
+    assert.equal(result.migrated, true);
+    assert.equal(await accounts.findById(legacyId), null);
+    assert.equal(result.account.id, subject);
+    const queued = await prisma.backchannelLogout.findFirst({ where: { sessionId: oidcSession.id } });
+    assert.equal(queued.clientId, clientId);
+    assert.equal(queued.userId, subject);
+    assert.equal(queued.subject, legacyId);
+    assert.equal(queued.reason, "subject_migrated");
+
+    const migrationAudit = await prisma.auditLog.findFirst({
+      where: { action: "account.external.subject_migrated", targetId: subject },
+      orderBy: { createdAt: "desc" }
+    });
+    const auditMetadata = JSON.parse(migrationAudit.metadataJson);
+    assert.equal(auditMetadata.provider, "knight");
+    assert.match(auditMetadata.previousSubjectFingerprint, /^[A-Za-z0-9_-]{43}$/);
+    assert.match(auditMetadata.canonicalSubjectFingerprint, /^[A-Za-z0-9_-]{43}$/);
+    assert.notEqual(auditMetadata.previousSubjectFingerprint, legacyId);
+    assert.doesNotMatch(migrationAudit.metadataJson, new RegExp(legacyId));
+
+    const postsBefore = backchannelPosts.length;
+    await backchannel.deliver(queued);
+    assert.equal(backchannelPosts.length, postsBefore + 1);
+    const logoutToken = new URLSearchParams(backchannelPosts.at(-1).body).get("logout_token");
+    const logoutClaims = decodeJwt(logoutToken).payload;
+    assert.equal(logoutClaims.sub, legacyId);
+    assert.equal(logoutClaims.sid, oidcSession.id);
   });
 
   it("returns a handoff username without using it as the local account key", async () => {

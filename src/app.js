@@ -98,7 +98,7 @@ function createApp(options = {}) {
   const external =
     options.external ||
     (config.externalProviders.length
-      ? createExternalIdentityService({ prisma, config, accounts, auditLog })
+      ? createExternalIdentityService({ prisma, config, accounts, auditLog, backchannel })
       : null);
 
   // --- Controllers ----------------------------------------------------------

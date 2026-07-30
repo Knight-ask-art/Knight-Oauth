@@ -28,6 +28,10 @@ function safeNext(value, fallback = "/account") {
 function createAccountController({ config, accounts, sessions, provider, clients, external, logger = console }) {
   const branding = config.branding;
 
+  // Older embedders can omit this newer flag and retain the historical local
+  // sign-in behavior. Only an explicit false creates a handoff-only issuer.
+  const localLoginEnabled = () => accounts.localLoginEnabled !== false;
+
   function view(res, template, locals = {}) {
     return res.render(template, { branding, ...locals });
   }
@@ -36,12 +40,14 @@ function createAccountController({ config, accounts, sessions, provider, clients
 
   function registerPage(req, res) {
     if (req.currentUser) return res.redirect("/account");
-    if (!accounts.registrationEnabled) {
+    if (!accounts.registrationEnabled || !localLoginEnabled()) {
       return res.status(403).render("error", {
         branding,
         title: "Registration closed",
         heading: "This server is not accepting new accounts",
-        message: "Ask the operator of this server for an account.",
+        message: localLoginEnabled()
+          ? "Ask the operator of this server for an account."
+          : "Sign in through the configured identity provider.",
         status: 403
       });
     }
@@ -127,6 +133,7 @@ function createAccountController({ config, accounts, sessions, provider, clients
       next: target,
       reauthenticate,
       registrationEnabled: accounts.registrationEnabled,
+      localLoginEnabled: localLoginEnabled(),
       providers: external?.list?.() || [],
       minPasswordLength: accounts.minPasswordLength
     });
@@ -144,6 +151,20 @@ function createAccountController({ config, accounts, sessions, provider, clients
       });
 
       if (!result.ok) {
+        if (result.reason === "local_login_disabled") {
+          return res.status(403).render("login", {
+            branding,
+            title: "Sign in",
+            identifier: "",
+            error: "Sign in through the configured identity provider.",
+            next: target,
+            reauthenticate: false,
+            registrationEnabled: false,
+            localLoginEnabled: false,
+            providers: external?.list?.() || [],
+            minPasswordLength: accounts.minPasswordLength
+          });
+        }
         if (result.reason === "unverified") {
           return view(res, "check-email", {
             title: "Confirm your email",
@@ -167,6 +188,7 @@ function createAccountController({ config, accounts, sessions, provider, clients
           next: target,
           reauthenticate: false,
           registrationEnabled: accounts.registrationEnabled,
+          localLoginEnabled: localLoginEnabled(),
           providers: external?.list?.() || [],
           minPasswordLength: accounts.minPasswordLength
         });
@@ -191,10 +213,28 @@ function createAccountController({ config, accounts, sessions, provider, clients
   // --- Password recovery ---------------------------------------------------
 
   function forgotPasswordPage(req, res) {
+    if (!localLoginEnabled()) {
+      return res.status(404).render("error", {
+        branding,
+        title: "Not found",
+        heading: "This sign-in method is unavailable",
+        message: "Sign in through the configured identity provider.",
+        status: 404
+      });
+    }
     return view(res, "forgot-password", { title: "Reset your password", error: null, sent: false });
   }
 
   async function submitForgotPassword(req, res, next) {
+    if (!localLoginEnabled()) {
+      return res.status(404).render("error", {
+        branding,
+        title: "Not found",
+        heading: "This sign-in method is unavailable",
+        message: "Sign in through the configured identity provider.",
+        status: 404
+      });
+    }
     try {
       await accounts.requestPasswordReset({
         email: req.body.email,
@@ -210,6 +250,15 @@ function createAccountController({ config, accounts, sessions, provider, clients
   }
 
   function resetPasswordPage(req, res) {
+    if (!localLoginEnabled()) {
+      return res.status(404).render("error", {
+        branding,
+        title: "Not found",
+        heading: "This sign-in method is unavailable",
+        message: "Sign in through the configured identity provider.",
+        status: 404
+      });
+    }
     return view(res, "reset-password", {
       title: "Choose a new password",
       token: String(req.query.token || ""),
@@ -219,6 +268,15 @@ function createAccountController({ config, accounts, sessions, provider, clients
   }
 
   async function submitResetPassword(req, res, next) {
+    if (!localLoginEnabled()) {
+      return res.status(404).render("error", {
+        branding,
+        title: "Not found",
+        heading: "This sign-in method is unavailable",
+        message: "Sign in through the configured identity provider.",
+        status: 404
+      });
+    }
     const token = String(req.body.token || "");
     try {
       const result = await accounts.resetPassword({
@@ -351,6 +409,7 @@ function createAccountController({ config, accounts, sessions, provider, clients
         current: session.id === req.session?.id
       })),
       minPasswordLength: accounts.minPasswordLength,
+      localLoginEnabled: localLoginEnabled(),
       error,
       notice
     };

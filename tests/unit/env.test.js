@@ -346,10 +346,49 @@ test("an external identity provider must be verifiable", () => {
   assert.equal(env.externalProviders.length, 1);
   assert.equal(env.externalProviders[0].displayName, "upstream");
   assert.equal(env.externalProviders[0].ticketTtlSeconds, 60);
+  assert.equal(env.externalProviders[0].subjectMode, "local");
+  assert.equal(env.externalProviders[0].subjectFormat, "opaque");
+  assert.equal(loadEnv(provider({ ...valid, subjectMode: "upstream" })).externalProviders[0].subjectMode, "upstream");
+  assert.throws(() => loadEnv(provider({ ...valid, subjectMode: "email" })), /subjectMode must be local or upstream/);
+  assert.equal(loadEnv(provider({ ...valid, subjectFormat: "uuid" })).externalProviders[0].subjectFormat, "uuid");
+  assert.throws(() => loadEnv(provider({ ...valid, subjectFormat: "numeric" })), /subjectFormat must be opaque or uuid/);
   assert.throws(
     () => loadEnv({ OAUTH_EXTERNAL_IDENTITY_PROVIDERS: JSON.stringify([valid, valid]) }),
     /duplicate name/
   );
+});
+
+test("a handoff-only deployment cannot leave a local password path behind", () => {
+  const provider = {
+    name: "upstream",
+    kind: "handoff",
+    startUrl: "https://www.example.com/handoff/start",
+    sharedSecret: SECRET,
+    subjectMode: "upstream",
+    subjectFormat: "uuid"
+  };
+
+  assert.throws(
+    () => loadEnv({ OAUTH_LOCAL_LOGIN_ENABLED: "false" }),
+    /OAUTH_REGISTRATION_ENABLED=false/
+  );
+  assert.throws(
+    () =>
+      loadEnv({
+        OAUTH_LOCAL_LOGIN_ENABLED: "false",
+        OAUTH_REGISTRATION_ENABLED: "false"
+      }),
+    /requires at least one OAUTH_EXTERNAL_IDENTITY_PROVIDERS/
+  );
+
+  const env = loadEnv({
+    OAUTH_LOCAL_LOGIN_ENABLED: "false",
+    OAUTH_REGISTRATION_ENABLED: "false",
+    OAUTH_EXTERNAL_IDENTITY_PROVIDERS: JSON.stringify([provider])
+  });
+  assert.equal(env.accounts.localLoginEnabled, false);
+  assert.equal(env.externalProviders[0].subjectMode, "upstream");
+  assert.equal(env.externalProviders[0].subjectFormat, "uuid");
 });
 
 test("nothing in a loaded config carries a Knight-specific default", () => {

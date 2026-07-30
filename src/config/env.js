@@ -219,6 +219,26 @@ function parseExternalProviders(value, { allowInsecureHttp }) {
       // A brand-new upstream subject may create a local account. Off by default:
       // auto-provisioning from an unauthenticated upstream would be an open door.
       autoCreateUsers: bool(entry?.autoCreateUsers, true),
+      // Most standalone deployments keep an issuer-local random subject. A
+      // trusted upstream directory can opt in to preserving its verified
+      // subject so every downstream service addresses the same principal.
+      subjectMode: (() => {
+        const value = text(entry?.subjectMode) || "local";
+        if (value !== "local" && value !== "upstream") {
+          throw new Error(`External identity provider "${name}" subjectMode must be local or upstream`);
+        }
+        return value;
+      })(),
+      // An upstream subject is normally opaque. Deployments whose canonical
+      // principal is a UUID can opt into rejecting malformed values before an
+      // account is created or migrated.
+      subjectFormat: (() => {
+        const value = text(entry?.subjectFormat) || "opaque";
+        if (value !== "opaque" && value !== "uuid") {
+          throw new Error(`External identity provider "${name}" subjectFormat must be opaque or uuid`);
+        }
+        return value;
+      })(),
       ticketTtlSeconds: integer(entry?.ticketTtlSeconds, 60, `External provider ${name} ticketTtlSeconds`, {
         min: 15,
         max: 600
@@ -383,6 +403,11 @@ function loadEnv(source = process.env) {
       // Open registration is the default for a self-hosted install; an operator
       // running a closed directory turns it off.
       registrationEnabled: bool(source.OAUTH_REGISTRATION_ENABLED, true),
+      // A deployment that delegates every authentication decision to a trusted
+      // upstream can disable every local-password entry point. This is separate
+      // from registration: turning registration off alone leaves existing local
+      // passwords usable.
+      localLoginEnabled: bool(source.OAUTH_LOCAL_LOGIN_ENABLED, true),
       // Requiring a verified address before login needs working mail. Defaulting
       // it on would make a fresh install appear broken, so it is opt-in and the
       // README says to enable it in production.
@@ -512,6 +537,19 @@ function loadEnv(source = process.env) {
 
   if (env.mail.enabled && (!env.mail.host || !env.mail.from)) {
     throw new Error("SMTP_ENABLED=true requires SMTP_HOST and SMTP_FROM");
+  }
+
+  if (!env.accounts.localLoginEnabled) {
+    if (env.accounts.registrationEnabled) {
+      throw new Error(
+        "OAUTH_LOCAL_LOGIN_ENABLED=false requires OAUTH_REGISTRATION_ENABLED=false, because a handoff-only issuer must not create local password accounts"
+      );
+    }
+    if (!env.externalProviders.length) {
+      throw new Error(
+        "OAUTH_LOCAL_LOGIN_ENABLED=false requires at least one OAUTH_EXTERNAL_IDENTITY_PROVIDERS entry, otherwise no user can authenticate"
+      );
+    }
   }
 
   const scopeNames = env.customScopes.map((scope) => scope.name);
