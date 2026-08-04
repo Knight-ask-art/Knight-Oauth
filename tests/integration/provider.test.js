@@ -86,6 +86,16 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
           introspectionClaim: "credits_admin"
         },
         {
+          name: "research.read",
+          description: "Read your research access status and agreements",
+          claims: []
+        },
+        {
+          name: "research.write",
+          description: "Manage your own research access application and agreements",
+          claims: []
+        },
+        {
           name: "legacy.admin",
           description: "Legacy administration without a live authority claim",
           adminOnly: true
@@ -512,6 +522,104 @@ describe("OAuth 2.0 and OpenID Connect provider", () => {
     });
     const decision = await provider.resolveAuthorization({ request, account, session });
     assert.equal(decision.action, "issue");
+  });
+
+  it("widens a first-party research grant after ordinary-user admin fallback without releasing claims", async () => {
+    const portal = await clients.create(
+      {
+        name: "Knight Credit Portal",
+        clientType: "confidential",
+        redirectUris: ["https://credit.example/auth/callback"],
+        scopes: ["openid", "research.read", "research.write", "credits.admin"],
+        grantTypes: ["authorization_code"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+        isFirstParty: true,
+        requireConsent: false
+      },
+      { status: "APPROVED" }
+    );
+    const registered = await accounts.register({
+      email: `research-member-${crypto.randomUUID()}@example.test`,
+      password: "research-member-password"
+    });
+    assert.equal(registered.account.role, "USER");
+    const browserSession = (await sessions.create({ userId: registered.account.id })).session;
+
+    // Model an existing production grant created before the research scopes were
+    // introduced. A trusted first-party client should merge the new ordinary-user
+    // scopes on the next authorization rather than requiring a database rewrite.
+    await provider.upsertGrant({
+      userId: registered.account.id,
+      clientId: portal.client.clientId,
+      scopes: ["openid"]
+    });
+
+    const privilegedAttempt = await provider.parseAuthorizationRequest({
+      client_id: portal.client.clientId,
+      redirect_uri: portal.client.redirectUris[0],
+      response_type: "code",
+      scope: "openid research.read research.write credits.admin",
+      code_challenge: pkce().challenge,
+      code_challenge_method: "S256"
+    });
+    await assert.rejects(
+      provider.resolveAuthorization({
+        request: privilegedAttempt,
+        account: registered.account,
+        session: browserSession
+      }),
+      (error) => {
+        assert.equal(error.code, "invalid_scope");
+        return true;
+      }
+    );
+    const unchanged = await prisma.grant.findUnique({
+      where: {
+        userId_clientId: { userId: registered.account.id, clientId: portal.client.clientId }
+      }
+    });
+    assert.equal(unchanged.scopes, "openid", "a rejected admin request partially widened the grant");
+
+    const flow = await authorize(
+      { scope: "openid research.read research.write" },
+      {
+        client: portal.client,
+        authorizationAccount: registered.account,
+        browserSession
+      }
+    );
+    assert.equal(flow.decision.action, "issue", "the first-party fallback unexpectedly required consent");
+    const headers = basicAuth(portal.client.clientId, portal.clientSecret);
+    const tokens = await provider.token({
+      headers,
+      body: {
+        grant_type: "authorization_code",
+        code: flow.code,
+        redirect_uri: flow.redirectUri,
+        code_verifier: flow.verifier
+      }
+    });
+
+    assert.equal(tokens.scope, "openid research.read research.write");
+    assert.equal(decodeJwt(tokens.access_token).payload.scope, tokens.scope);
+    assert.deepEqual(await provider.userinfo({ accessToken: tokens.access_token }), {
+      sub: registered.account.id
+    });
+    const introspected = await provider.introspect({
+      headers,
+      body: { token: tokens.access_token }
+    });
+    assert.equal(introspected.active, true);
+    assert.equal(introspected.scope, tokens.scope, "introspection disagreed with the token response");
+    assert.equal(introspected.credits_admin, false);
+    assert.equal(introspected.knight_uid, undefined, "research scopes released an unrelated identity claim");
+
+    const widened = await prisma.grant.findUnique({
+      where: {
+        userId_clientId: { userId: registered.account.id, clientId: portal.client.clientId }
+      }
+    });
+    assert.equal(widened.scopes, tokens.scope);
   });
 
   // --- The authorization code flow ----------------------------------------

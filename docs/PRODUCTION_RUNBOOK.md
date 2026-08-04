@@ -383,6 +383,11 @@ the following without printing credential values:
   an ordinary user, an admin token without that scope, and the next fresh
   introspection after an admin downgrade must report false without reviving the
   value through refresh rotation
+- for the Knight Portal research workflow, an ordinary user receives
+  `research.read research.write` after the client retries without the rejected
+  `credits.admin` scope; the token response and fresh introspection must report
+  the same scope set, UserInfo must release no additional claim for either
+  research scope, and `credits_admin` must remain false
 - consent denial returning `access_denied` and no authorization code
 
 Never pass a client secret on the command line and never retain access tokens,
@@ -395,6 +400,40 @@ and roll back the candidate.
 For a fresh database, remove the temporary public-traffic hold only after every
 gate above passes. Immediately repeat public readiness and both sanitized probes
 after opening the route. Any different result moves directly to rollback.
+
+### Knight Portal research-scope rollout
+
+Research self-service is a browser authorization contract, not an administrator
+role. Configure both scopes without `adminOnly`, `introspectionClaim`, or identity
+claims, alongside the existing Knight scopes:
+
+```text
+{"name":"research.read","description":"Read your research access status and agreements","claims":[]}
+{"name":"research.write","description":"Manage your own research access application and agreements","claims":[]}
+```
+
+Apply the following as one release transaction: add both entries to
+`OAUTH_CUSTOM_SCOPES`, add both names to the approved `knight-credit-portal`
+client's allowed scopes, then restart the issuer with the complete custom-scope
+array. Do not replace the array with only the two new entries. Keep
+`credits.admin` configured with `adminOnly=true` and
+`introspectionClaim=credits_admin`; research review across users remains gated
+by that scope and a fresh `credits_admin=true` response.
+
+Do not edit existing grant rows. For an approved first-party client with
+`requireConsent=false`, the next successful authorization atomically merges the
+two research scopes into the user's active grant. An ordinary user's initial
+request may be rejected because it also asks for `credits.admin`; the relying
+party must retry with the same ordinary scopes minus only `credits.admin`.
+
+Existing access tokens and relying-party sessions do not gain scopes
+retroactively. After the issuer and client configuration are live, expire only
+the Knight Portal application's login sessions (or require its users to log out
+and back in) so it performs a new authorization. Retain the OAuth grants so the
+first-party widening path can merge them. Revoke the specific Portal grant only
+if immediate invalidation of its already-issued tokens is required; doing so
+also revokes that client's OIDC sessions and refresh credentials for the user,
+so it is not the default rollout step.
 
 ## 7. Roll back SQLite on any failed gate
 
