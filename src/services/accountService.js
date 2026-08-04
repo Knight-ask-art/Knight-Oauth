@@ -806,6 +806,34 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
     return toAccount(record);
   }
 
+  /**
+   * Applies a role asserted by a configured external authority. This is kept
+   * separate from the operator-facing setRole path so audit records cannot be
+   * mistaken for a local administrator action. Callers must already have
+   * verified the provider's signed assertion and must pass only a boolean-derived
+   * role.
+   */
+  async function syncExternalAuthority({ userId, role, provider, ipAddress, userAgent } = {}) {
+    if (!Object.values(ROLE).includes(role)) throw invalidRequest("Unknown role");
+    const id = String(userId || "");
+    const current = await prisma.user.findUnique({ where: { id } });
+    if (!current) throw invalidRequest("Unknown account");
+    if (current.role === role) return toAccount(current);
+
+    const record = await prisma.user.update({ where: { id }, data: { role } });
+    await auditLog?.record({
+      action: "account.external.authority.synced",
+      actorUserId: record.id,
+      targetUserId: record.id,
+      targetType: "user",
+      targetId: record.id,
+      metadata: { provider: String(provider || ""), role },
+      ipAddress,
+      userAgent
+    });
+    return toAccount(record);
+  }
+
   async function list({ take = 50, skip = 0, query = "" } = {}) {
     const search = String(query || "").trim();
     // The email term stays lowercased even with the flag above. Addresses are
@@ -864,6 +892,7 @@ function createAccountService({ prisma, config, mailer, auditLog, now = () => ne
     revokeAllCredentials,
     setAttributes,
     setRole,
+    syncExternalAuthority,
     setStatus,
     toAccount,
     updateProfile,

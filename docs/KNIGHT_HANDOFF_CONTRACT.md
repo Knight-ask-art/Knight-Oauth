@@ -79,12 +79,18 @@ by an untrusted header.
 | `email_verified` | Boolean `true` only when Knight has actually verified `email` |
 | `name` | Current display name |
 | `picture` | Current avatar URL |
-| `attributes` | JSON object containing explicitly approved deployment attributes |
+| `attributes` | JSON object containing explicitly approved deployment attributes. For the configured Knight provider, `knight_uid` is the canonical UID and `knight_admin` is a signed boolean capability derived by `knight-app` from `user.role === "ADMIN"`. |
 
 Do not place passwords, session identifiers, access tokens, refresh tokens,
-authorization codes, secrets, roles, or unrestricted database records in a
-ticket. The `sub` claim is the account-linking authority. Matching email never
-causes an automatic account merge.
+authorization codes, secrets, raw roles, or unrestricted database records in a
+ticket. `knight_admin` is the only approved authority capability in the Knight
+deployment; it is not a browser-controlled role field. OAuth must ignore it
+unless the provider is explicitly configured with
+`syncAdminFromAttribute: "knight_admin"`. A boolean `true` promotes the linked
+OAuth account to `ADMIN`, a boolean `false` synchronizes it to `USER`, and a
+missing or non-boolean value leaves the existing role unchanged. The `sub`
+claim is the account-linking authority. Matching email never causes an
+automatic account merge.
 
 ## Time and replay rules
 

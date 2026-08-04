@@ -259,9 +259,12 @@ registration is used to create the administrator, only the intended operator
 may reach the real HTTPS registration flow while
 `OAUTH_FIRST_USER_IS_ADMIN=true`. Verify that the intended account can reach the
 admin surface, then set `OAUTH_FIRST_USER_IS_ADMIN=false`. For a Knight
-handoff-only deployment, also set `OAUTH_REGISTRATION_ENABLED=false`. Recreate
-the single application container after these changes and repeat readiness; do
-not open general public traffic merely because the first login succeeded.
+handoff-only deployment, set both `OAUTH_REGISTRATION_ENABLED=false` and
+`OAUTH_LOCAL_LOGIN_ENABLED=false`. The issuer then redirects browser login to
+the main site's handoff start instead of rendering its own password form; the
+OAuth consent page remains on the issuer. Recreate the single application
+container after these changes and repeat readiness; do not open general public
+traffic merely because the first login succeeded.
 
 Before any public opening, verify that the database contains exactly one
 administrator. This check prints only the count and a fixed failure marker; it

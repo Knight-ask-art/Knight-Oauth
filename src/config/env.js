@@ -169,7 +169,9 @@ function parseCustomScopes(value) {
  *       "kind": "handoff",
  *       "displayName": "Knight",
  *       "startUrl": "https://www.example.com/oauth2/handoff/start",
- *       "sharedSecret": "..."
+ *       "sharedSecret": "...",
+ *       "useSubjectAsUserId": true,
+ *       "syncAdminFromAttribute": "knight_admin"
  *     }
  *   ]
  */
@@ -204,6 +206,12 @@ function parseExternalProviders(value, { allowInsecureHttp }) {
     if (sharedSecret.length < 32) {
       throw new Error(`External identity provider "${name}" sharedSecret must be at least 32 characters`);
     }
+    const syncAdminFromAttribute = text(entry?.syncAdminFromAttribute) || null;
+    if (syncAdminFromAttribute && !/^[a-z][a-z0-9_.-]{0,63}$/.test(syncAdminFromAttribute)) {
+      throw new Error(
+        `External provider ${name} syncAdminFromAttribute must be a lowercase attribute name`
+      );
+    }
     return {
       name,
       kind,
@@ -213,6 +221,13 @@ function parseExternalProviders(value, { allowInsecureHttp }) {
         allowHttp: allowInsecureHttp
       }),
       sharedSecret,
+      // When enabled, the upstream subject is the canonical local account id.
+      // This is useful only for a provider whose subject namespace is explicitly
+      // trusted; it is never inferred from a request or from an email address.
+      useSubjectAsUserId: bool(entry?.useSubjectAsUserId, false),
+      // Role synchronization is opt-in and scoped to this provider. A missing or
+      // non-boolean value is deliberately handled as "no change" by the adapter.
+      syncAdminFromAttribute,
       // A brand-new upstream subject may create a local account. Off by default:
       // auto-provisioning from an unauthenticated upstream would be an open door.
       autoCreateUsers: bool(entry?.autoCreateUsers, true),
@@ -380,6 +395,13 @@ function loadEnv(source = process.env) {
       // Open registration is the default for a self-hosted install; an operator
       // running a closed directory turns it off.
       registrationEnabled: bool(source.OAUTH_REGISTRATION_ENABLED, true),
+      // A closed-directory deployment may still need the authorization and
+      // consent pages while delegating every user authentication to an
+      // upstream account provider. This is deliberately separate from
+      // registrationEnabled: turning off sign-up must not turn off OAuth
+      // authorization, and it must not leave a second password directory
+      // reachable by accident.
+      localLoginEnabled: bool(source.OAUTH_LOCAL_LOGIN_ENABLED, true),
       // Requiring a verified address before login needs working mail. Defaulting
       // it on would make a fresh install appear broken, so it is opt-in and the
       // README says to enable it in production.
@@ -557,6 +579,12 @@ function loadEnv(source = process.env) {
   const providerNames = env.externalProviders.map((provider) => provider.name);
   if (new Set(providerNames).size !== providerNames.length) {
     throw new Error("OAUTH_EXTERNAL_IDENTITY_PROVIDERS contains a duplicate name");
+  }
+
+  if (isProduction && !env.accounts.localLoginEnabled && env.externalProviders.length === 0) {
+    throw new Error(
+      "OAUTH_LOCAL_LOGIN_ENABLED=false in production requires at least one OAUTH_EXTERNAL_IDENTITY_PROVIDERS handoff provider"
+    );
   }
 
   return env;

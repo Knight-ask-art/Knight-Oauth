@@ -281,6 +281,7 @@ list; these are the ones that matter most.
 | `OAUTH_REQUIRE_PKCE` | `true` | Governs confidential clients; public clients always require it |
 | `OAUTH_ROTATE_REFRESH_TOKENS` | `true` | Reusing a rotated token revokes the whole family |
 | `OAUTH_REGISTRATION_ENABLED` | `true` | Local account sign-up |
+| `OAUTH_LOCAL_LOGIN_ENABLED` | `true` | Local password login; set `false` for a handoff-only issuer |
 | `OAUTH_FIRST_USER_IS_ADMIN` | `true` | So a fresh install has an administrator without seeding |
 | `OAUTH_CLIENT_REQUIRE_APPROVAL` | `true` | UI-submitted clients wait for an administrator |
 | `OAUTH_DYNAMIC_REGISTRATION_ENABLED` | `false` | An open registration endpoint should be a decision |
@@ -377,8 +378,13 @@ however it likes, and returns a short-lived ticket signed with `sharedSecret`.
 The secret is mandatory and must be at least 32 characters: an unsigned ticket
 would mean trusting whatever identity an anonymous caller claimed.
 
-Local accounts and external providers coexist — configuring one does not turn
-off the other.
+Local accounts and external providers coexist by default — configuring one does
+not turn off the other. A handoff-only deployment can set
+`OAUTH_LOCAL_LOGIN_ENABLED=false` while keeping the OAuth authorization and
+consent pages enabled. In that mode `/login` and unauthenticated authorization
+requests start the configured external provider, and production refuses to boot
+unless one is configured. This is separate from
+`OAUTH_REGISTRATION_ENABLED`, which only controls new account sign-up.
 
 For the exact independent integration contract used by `knight-app`, including
 the redirect parameters, signed-ticket claims, failure rules, and acceptance

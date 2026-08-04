@@ -35,6 +35,7 @@ const TICKET_ALG = "HS256";
 const MAX_TICKET_LENGTH = 4096;
 const MAX_EXTERNAL_USERNAME_LENGTH = 64;
 const EXTERNAL_USERNAME_ATTRIBUTE = "external_preferred_username";
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function base64UrlDecode(part) {
   return Buffer.from(String(part), "base64url").toString("utf8");
@@ -105,6 +106,8 @@ function createHandoffAdapter(provider, { issuer }) {
     kind: "handoff",
     displayName: provider.displayName || provider.name,
     autoCreateUsers: provider.autoCreateUsers !== false,
+    useSubjectAsUserId: provider.useSubjectAsUserId === true,
+    syncAdminFromAttribute: provider.syncAdminFromAttribute || null,
 
     buildStartUrl({ state, returnTo }) {
       const url = new URL(provider.startUrl);
@@ -134,6 +137,9 @@ function createHandoffAdapter(provider, { issuer }) {
 
       const subject = String(payload.sub || "").trim();
       if (!subject) throw invalidRequest("The sign-in ticket does not identify a user");
+      if (provider.useSubjectAsUserId && !CANONICAL_UUID.test(subject)) {
+        throw invalidRequest("The sign-in ticket subject is not a canonical account identifier");
+      }
 
       if (payload.username !== undefined && payload.username !== null && typeof payload.username !== "string") {
         throw invalidRequest("The sign-in ticket username is not valid");
@@ -214,6 +220,17 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
     return adapter;
   }
 
+  function externalRoleFor(adapter, claims) {
+    const attribute = adapter.syncAdminFromAttribute;
+    if (!attribute) return accounts.ROLE.USER;
+    return claims.attributes?.[attribute] === true ? accounts.ROLE.ADMIN : accounts.ROLE.USER;
+  }
+
+  function hasBooleanAuthorityAssertion(adapter, claims) {
+    const attribute = adapter.syncAdminFromAttribute;
+    return Boolean(attribute) && typeof claims.attributes?.[attribute] === "boolean";
+  }
+
   /** For the login page. Empty when no provider is configured, which is the default. */
   function list() {
     return [...adapters.values()].map((adapter) => ({
@@ -291,7 +308,17 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
       if (Object.keys(claims.attributes || {}).length || claims.username || account.attributes?.[EXTERNAL_USERNAME_ATTRIBUTE]) {
         await accounts.setAttributes({ userId: account.id, attributes });
       }
-      return { account: await accounts.findById(account.id), created: false };
+      let refreshed = await accounts.findById(account.id);
+      if (hasBooleanAuthorityAssertion(adapter, claims)) {
+        refreshed = await accounts.syncExternalAuthority({
+          userId: account.id,
+          role: externalRoleFor(adapter, claims),
+          provider: adapter.name,
+          ipAddress,
+          userAgent
+        });
+      }
+      return { account: refreshed, created: false };
     }
 
     if (!adapter.autoCreateUsers) {
@@ -311,6 +338,13 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
           "An account already uses that email address. Sign in with your password, then link this provider from your account settings."
         );
       }
+    }
+
+    if (adapter.useSubjectAsUserId && await accounts.findById(claims.subject)) {
+      // A canonical subject already used by another local record must not be
+      // silently adopted by this provider. Linking it is an explicit operator or
+      // authenticated-user action, not an automatic handoff side effect.
+      throw loginRequired("That account identifier is already in use");
     }
 
     const account = await createLinkedAccount(adapter, claims);
@@ -337,7 +371,7 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
   async function createLinkedAccount(adapter, claims) {
     const timestamp = now();
     const email = claims.email || `${adapter.name}-${claims.subject}@external.invalid`;
-    const userId = randomId();
+    const userId = adapter.useSubjectAsUserId ? claims.subject : randomId();
     const attributes = {
       ...(claims.attributes || {}),
       ...(claims.username ? { [EXTERNAL_USERNAME_ATTRIBUTE]: claims.username } : {})
@@ -354,6 +388,7 @@ function createExternalIdentityService({ prisma, config, accounts, auditLog, now
         passwordHash: null,
         name: claims.name,
         picture: claims.picture,
+        role: externalRoleFor(adapter, claims),
         status: accounts.STATUS.ACTIVE,
         attributesJson: Object.keys(attributes).length ? encodeJson(attributes) : null,
         externalIdentities: {

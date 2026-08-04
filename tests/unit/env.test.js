@@ -343,9 +343,47 @@ test("an external identity provider must be verifiable", () => {
   assert.equal(env.externalProviders.length, 1);
   assert.equal(env.externalProviders[0].displayName, "upstream");
   assert.equal(env.externalProviders[0].ticketTtlSeconds, 60);
+  assert.equal(env.externalProviders[0].useSubjectAsUserId, false);
+  assert.equal(env.externalProviders[0].syncAdminFromAttribute, null);
+  assert.throws(
+    () => loadEnv(provider({ ...valid, syncAdminFromAttribute: "Knight Admin" })),
+    /syncAdminFromAttribute must be a lowercase attribute name/
+  );
+  const knight = loadEnv(provider({
+    ...valid,
+    useSubjectAsUserId: true,
+    syncAdminFromAttribute: "knight_admin"
+  }));
+  assert.equal(knight.externalProviders[0].useSubjectAsUserId, true);
+  assert.equal(knight.externalProviders[0].syncAdminFromAttribute, "knight_admin");
   assert.throws(
     () => loadEnv({ OAUTH_EXTERNAL_IDENTITY_PROVIDERS: JSON.stringify([valid, valid]) }),
     /duplicate name/
+  );
+});
+
+test("handoff-only mode disables local login without disabling authorization", () => {
+  const provider = {
+    name: "knight",
+    kind: "handoff",
+    startUrl: "https://www.knightx.asia/oauth2/handoff/start",
+    sharedSecret: SECRET
+  };
+  const base = {
+    OAUTH_EXTERNAL_IDENTITY_PROVIDERS: JSON.stringify([provider]),
+    OAUTH_LOCAL_LOGIN_ENABLED: "false"
+  };
+
+  const env = loadEnv(base);
+  assert.equal(env.accounts.localLoginEnabled, false);
+
+  assert.throws(
+    () => loadEnv({
+      NODE_ENV: "production",
+      PUBLIC_BASE_URL: "https://oauth.example.test",
+      OAUTH_LOCAL_LOGIN_ENABLED: "false"
+    }),
+    /requires at least one OAUTH_EXTERNAL_IDENTITY_PROVIDERS handoff provider/
   );
 });
 

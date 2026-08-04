@@ -812,6 +812,56 @@ describe("local accounts and external identity", () => {
     assert.equal(result.account.attributes.external_preferred_username, "upstream-user");
   });
 
+  it("synchronizes the configured Knight authority without accepting a raw role", async () => {
+    const authorityConfig = loadEnv({
+      OAUTH_EXTERNAL_IDENTITY_PROVIDERS: JSON.stringify([
+        {
+          name: "knight-authority",
+          kind: "handoff",
+          startUrl: "https://knight.test/oauth2/handoff/start",
+          sharedSecret: SHARED_SECRET,
+          useSubjectAsUserId: true,
+          syncAdminFromAttribute: "knight_admin"
+        }
+      ])
+    });
+    const authority = createExternalIdentityService({
+      prisma,
+      config: authorityConfig,
+      accounts,
+      auditLog: createAuditService({ prisma, logger: { error() {} } })
+    });
+    const subject = "12345678-1234-4234-8234-123456789abc";
+    const firstPayload = ticketPayload({
+      iss: "knight-authority",
+      sub: subject,
+      email: "knight-authority@example.com",
+      attributes: { knight_uid: "7090144", knight_admin: true, role: "USER" }
+    });
+    const first = await authority.completeCallback({
+      provider: "knight-authority",
+      ticket: signTicket(firstPayload),
+      state: firstPayload.state
+    });
+    assert.equal(first.account.id, subject);
+    assert.equal(first.account.role, "ADMIN");
+    assert.equal(first.account.attributes.role, "USER", "raw role input was not used as authority");
+
+    const secondPayload = ticketPayload({
+      iss: "knight-authority",
+      sub: subject,
+      email: "knight-authority@example.com",
+      attributes: { knight_uid: "7090144", knight_admin: false }
+    });
+    const second = await authority.completeCallback({
+      provider: "knight-authority",
+      ticket: signTicket(secondPayload),
+      state: secondPayload.state
+    });
+    assert.equal(second.account.id, subject);
+    assert.equal(second.account.role, "USER", "an explicit false capability did not synchronize demotion");
+  });
+
   it("rejects a replayed handoff ticket", async () => {
     const payload = ticketPayload({ sub: "upstream-user-2" });
     const ticket = signTicket(payload);

@@ -28,6 +28,36 @@ function safeNext(value, fallback = "/account") {
 function createAccountController({ config, accounts, sessions, provider, clients, external, logger = console }) {
   const branding = config.branding;
 
+  /**
+   * Builds the only local-login replacement used by a handoff-only issuer.
+   * `next` has already been reduced to an issuer-local path by safeNext, and
+   * the external controller parks it in the issuer session before redirecting
+   * upstream. Keeping this decision here means every login entry point follows
+   * the same policy.
+   */
+  function externalLoginRedirect(next) {
+    const providers = external?.list?.() || [];
+    const provider = providers[0];
+    if (!provider) return null;
+
+    const target = new URL(
+      `/login/external/${encodeURIComponent(provider.name)}`,
+      config.publicBaseUrl
+    );
+    target.searchParams.set("next", safeNext(next, "/account"));
+    return `${target.pathname}${target.search}`;
+  }
+
+  function localLoginUnavailable(res) {
+    return res.status(503).render("error", {
+      branding,
+      title: "Sign-in unavailable",
+      heading: "Sign-in is not configured",
+      message: "This issuer delegates sign-in to its configured account provider.",
+      status: 503
+    });
+  }
+
   function view(res, template, locals = {}) {
     return res.render(template, { branding, ...locals });
   }
@@ -120,6 +150,11 @@ function createAccountController({ config, accounts, sessions, provider, clients
     const reauthenticate = req.query.reauthenticate === "1";
     if (req.currentUser && !reauthenticate) return res.redirect(target);
 
+    if (config.accounts?.localLoginEnabled === false) {
+      const redirect = externalLoginRedirect(target);
+      return redirect ? res.redirect(redirect) : localLoginUnavailable(res);
+    }
+
     return view(res, "login", {
       title: "Sign in",
       identifier: String(req.query.login_hint || ""),
@@ -136,6 +171,13 @@ function createAccountController({ config, accounts, sessions, provider, clients
     const identifier = String(req.body.identifier || "");
     const target = safeNext(req.body.next, "/account");
     try {
+      // A stale form or a direct POST must not become a password-authentication
+      // bypass when the operator has selected handoff-only mode.
+      if (config.accounts?.localLoginEnabled === false) {
+        const redirect = externalLoginRedirect(target);
+        return redirect ? res.redirect(redirect) : localLoginUnavailable(res);
+      }
+
       const result = await accounts.authenticate({
         identifier,
         password: req.body.password,

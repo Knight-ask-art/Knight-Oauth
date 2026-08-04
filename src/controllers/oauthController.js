@@ -24,6 +24,31 @@ function noStore(res) {
   return res;
 }
 
+/**
+ * Builds the browser login hop for a pending authorization request.
+ *
+ * The default self-hosted mode owns its login form and keeps the historical
+ * `/login` route. A handoff-only deployment instead sends the browser through
+ * the configured external provider route; that route parks state in the OAuth
+ * session and immediately sends the browser to the main site's login page.
+ * The opaque authorization request token remains server-side in the parked
+ * request and only travels as the bounded `next` path.
+ */
+function loginPath(config, next, { loginHint, reauthenticate = false } = {}) {
+  const target = String(next || "");
+  const providerName = config.accounts?.localLoginEnabled === false
+    ? String(config.externalProviders?.[0]?.name || "")
+    : "";
+  const providerPath = providerName
+    ? `/login/external/${encodeURIComponent(providerName)}`
+    : "/login";
+  const url = new URL(providerPath, config.publicBaseUrl);
+  url.searchParams.set("next", target);
+  if (!providerName && loginHint) url.searchParams.set("login_hint", String(loginHint));
+  if (reauthenticate) url.searchParams.set("reauthenticate", "1");
+  return `${url.pathname}${url.search}`;
+}
+
 /** Reads a bearer token from the header, or the body/query per OIDC Core 5.3.1. */
 function bearerToken(req) {
   const header = String(req.get("authorization") || "");
@@ -126,14 +151,13 @@ function createOAuthController({ config, provider, clients, scopeRegistry, accou
         // about the client or the scopes can be tampered with between here and
         // consent.
         const next = `/oauth2/authorize/continue?${REQUEST_PARAM}=${encodeURIComponent(requestToken)}`;
-        const loginUrl = new URL("/login", config.publicBaseUrl);
-        loginUrl.searchParams.set("next", next);
-        if (request.loginHint) loginUrl.searchParams.set("login_hint", request.loginHint);
-        // prompt=login means re-authenticate even though a session exists.
-        if (decision.reason === "prompt_login" || decision.reason === "max_age") {
-          loginUrl.searchParams.set("reauthenticate", "1");
-        }
-        return res.redirect(loginUrl.pathname + loginUrl.search);
+        return res.redirect(
+          loginPath(config, next, {
+            loginHint: request.loginHint,
+            // prompt=login means re-authenticate even though a session exists.
+            reauthenticate: decision.reason === "prompt_login" || decision.reason === "max_age"
+          })
+        );
       }
 
       if (decision.action === "consent") {
@@ -195,7 +219,7 @@ function createOAuthController({ config, provider, clients, scopeRegistry, accou
 
       if (decision.action === "login") {
         const next = `/oauth2/authorize/continue?${REQUEST_PARAM}=${encodeURIComponent(requestToken)}`;
-        return res.redirect(`/login?next=${encodeURIComponent(next)}`);
+        return res.redirect(loginPath(config, next));
       }
       if (decision.action === "consent") {
         return res.redirect(`/oauth2/consent?${REQUEST_PARAM}=${encodeURIComponent(requestToken)}`);
@@ -245,7 +269,7 @@ function createOAuthController({ config, provider, clients, scopeRegistry, accou
       }
       if (!req.currentUser) {
         const next = `/oauth2/consent?${REQUEST_PARAM}=${encodeURIComponent(requestToken)}`;
-        return res.redirect(`/login?next=${encodeURIComponent(next)}`);
+        return res.redirect(loginPath(config, next));
       }
 
       const grant = await provider.findActiveGrant({
@@ -277,7 +301,10 @@ function createOAuthController({ config, provider, clients, scopeRegistry, accou
   async function submitConsent(req, res, next) {
     try {
       const requestToken = String(req.body[REQUEST_PARAM] || "");
-      if (!req.currentUser) return res.redirect("/login");
+      if (!req.currentUser) {
+        const next = `/oauth2/consent?${REQUEST_PARAM}=${encodeURIComponent(requestToken)}`;
+        return res.redirect(loginPath(config, next));
+      }
 
       if (String(req.body.decision || "") !== "allow") {
         const { redirectUrl } = await provider.denyAuthorization({ requestToken });
